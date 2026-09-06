@@ -1,23 +1,14 @@
-# ARC-007: Make the work deployment usable and maintainable
+# ARC-007: Deploy locally and to a cloud resource
 
-**Status:** Proposed goal
-
-## Why this matters
-
-A storage service that requires frequent manual rescue adds to the supervision burden Archive is meant to reduce.
+**Status:** MVP
 
 ## Goal
 
-Provide a local daemon, a Docker Compose deployment of the shared service on team-controlled infrastructure, and an API through which authorized consumers can use Archive.
+Make Archive deployable both locally and on a cloud resource, including a Docker Compose deployment path.
 
 ## Desired outcomes
 
-- The team can install and operate the initial deployment using documented steps.
-- Stored experience survives routine service restarts and can be backed up and restored.
-- Capture, sharing, and service failures are visible and understandable.
-- The team can manage retention and remove stored experience deliberately.
-- The initial deployment is useful without the hosted management site or the full Kastle system.
-
-## Questions to resolve
-
-Who will operate the first deployment, and what must be self-service for it to reduce rather than add work?
+- Archive can run on a local machine.
+- Archive can run on a cloud resource and be reached through its URL.
+- Deployment instructions make both options usable without a hosted management site or Kastle.
+- Stored content persists across routine service restarts.

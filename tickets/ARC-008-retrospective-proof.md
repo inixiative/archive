@@ -1,6 +1,6 @@
 # ARC-008: Demonstrate that captured experience supports learning
 
-**Status:** Proposed goal
+**Status:** FF — Future feature; outside MVP
 
 ## Why this matters
 

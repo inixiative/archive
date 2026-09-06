@@ -1,6 +1,6 @@
 # ARC-001: Understand where the useful experience lives
 
-**Status:** Proposed goal
+**Status:** FF — Future feature; outside MVP
 
 ## Why this matters
 

@@ -1,6 +1,6 @@
 # ARC-005: Connect sessions to the work they concern
 
-**Status:** Proposed goal
+**Status:** FF — Future feature; outside MVP
 
 ## Why this matters
 

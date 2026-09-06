@@ -1,6 +1,8 @@
 # ARC-002: Preserve the experience of doing agent work
 
-**Status:** Proposed goal
+**Status:** FF — Future feature; outside MVP
+
+Automatic provider-session discovery and capture are future features. The MVP provides storage, search, sync, and deployment without requiring this collection workflow.
 
 ## Why this matters
 

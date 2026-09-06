@@ -1,34 +1,41 @@
 # Archive goals and tickets
 
-These tickets describe the high-level goals for Archive's first work deployment at UserEvidence. They capture problems, intended outcomes, and unresolved product questions. They are not implementation specifications, and their numbering does not prescribe a build sequence.
+These tickets describe product goals and desired outcomes. They do not specify implementation, storage technologies, API contracts, synchronization protocols, or a build sequence.
 
-## Purpose
+## MVP
 
-Human corrections should become usable experience for future agent work. The first release should make real sessions available locally and to authorized teammates, connect that experience to the work it concerns, and support a simple retrospective with traceable evidence.
+The initial scope is storage locally and in multiple remote Archives, local search, search across all configured remotes, a sync service, and deployment locally and to a cloud resource.
 
-## Initial goals
+**Access model:** Possession of a remote Archive URL grants access for MVP. Accounts, memberships, scoped permissions, and device credential management are future features.
 
 | Ticket | Goal | Status |
 | --- | --- | --- |
-| [ARC-001](ARC-001-source-coverage.md) | Understand where the useful experience lives | Proposed |
-| [ARC-002](ARC-002-session-capture.md) | Preserve the experience of doing agent work | Proposed |
-| [ARC-003](ARC-003-local-retrieval.md) | Make local experience directly useful | Proposed |
-| [ARC-004](ARC-004-shared-sync.md) | Carry selected experience across machines and teammates | Proposed |
-| [ARC-005](ARC-005-work-context.md) | Connect sessions to the work they concern | Proposed |
-| [ARC-006](ARC-006-sharing-and-access.md) | Make sharing intentional and access scoped | Proposed |
-| [ARC-007](ARC-007-self-hosted-operation.md) | Make the work deployment usable and maintainable | Proposed |
-| [ARC-008](ARC-008-retrospective-proof.md) | Demonstrate that captured experience supports learning | Proposed |
+| [ARC-009](ARC-009-local-storage.md) | Store information locally | MVP |
+| [ARC-010](ARC-010-remote-storage.md) | Store information in multiple remote Archives | MVP |
+| [ARC-003](ARC-003-local-retrieval.md) | Search the local Archive | MVP |
+| [ARC-011](ARC-011-remote-search.md) | Search across all configured remotes | MVP |
+| [ARC-004](ARC-004-shared-sync.md) | Sync local and remote Archives | MVP |
+| [ARC-007](ARC-007-self-hosted-operation.md) | Deploy locally and to a cloud resource | MVP |
 
-## First complete demonstration
+## MVP demonstration
 
-A real work session is captured and can be retrieved locally. Selected experience becomes available to an authorized teammate after an offline/reconnect cycle. A retrospective can then cite an actual human correction and relate it to the available task and outcome context.
+Store content locally and in more than one remote Archive. Search the local store independently, search across the configured remotes, and retrieve matching content. Demonstrate synchronization across an interruption and successful operation in both local and cloud deployments.
 
-That demonstrates a useful evidence path. Whether later agents require fewer repeated corrections remains the broader outcome to establish.
+## Future features
 
-## Scope boundary
+**FF = Future feature; outside MVP.** These goals remain useful but are not prerequisites for the initial release.
 
-The work deployment centers on the daemon, a self-hosted shared service distributed through Docker Compose, and programmatic access. The long-term direction includes a Template-based hosted experience within Kastle, with Archive independently useful.
+| Ticket | Goal | Status |
+| --- | --- | --- |
+| [ARC-001](ARC-001-source-coverage.md) | Assess provider-session coverage | FF |
+| [ARC-002](ARC-002-session-capture.md) | Automatically discover and capture provider sessions | FF |
+| [ARC-005](ARC-005-work-context.md) | Associate content with GitHub, Linear, and Atlas-style context | FF |
+| [ARC-006](ARC-006-sharing-and-access.md) | Add sharing policies and scoped access | FF |
+| [ARC-008](ARC-008-retrospective-proof.md) | Demonstrate retrospective usefulness | FF |
+| [ARC-012](ARC-012-operational-lifecycle.md) | Extend backup, retention, deletion, and operational management | FF |
 
-Billing, the hosted management site, multiple storage backends, advanced enrichment, multiple Archive routing, and automated application of lessons are outside this initial goal set. The first deployment does not depend on completing Foundry or Kastle.
+Billing, the Template-based hosted management site, multiple storage technologies, and automated application of lessons also remain future features. Multiple remote Archive destinations are explicitly in MVP; they do not imply multiple storage technologies.
 
-Storage technologies, schemas, API contracts, synchronization protocols, and implementation sequencing remain undecided. These tickets should be refined through product discussion before implementation guidance is added.
+## Longer-term purpose
+
+Archive should make accumulated agent experience useful to future work and support an agent team that needs less repeated human correction. The MVP establishes the storage, search, and synchronization foundation. Session collection, enrichment, and retrospective workflows build on that foundation later.

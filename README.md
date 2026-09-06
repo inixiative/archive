@@ -77,18 +77,21 @@ Storage and retrieval enable this loop; they do not by themselves establish that
 
 Archive should not require Foundry to have launched a session in order to ingest it. Supporting existing agent workflows is central to its usefulness.
 
-## First proof and open questions
+## MVP and future features
 
-The [initial goals and tickets](tickets/README.md) describe the outcomes for the first work deployment, without prescribing implementation.
+The [goals and tickets](tickets/README.md) define the current release boundary. The intended capabilities above describe the broader product direction; they are not all MVP requirements.
 
-The first intended use is a local-first record of real UserEvidence agent work, connected to GitHub and Linear, feeding a simple retrospective process. The test is whether a relevant past correction can be recovered and help avoid repeating it.
+The MVP consists of:
 
-Before implementation, settle:
+- Durable local storage.
+- Remote storage across multiple Archive destinations.
+- Direct local search.
+- Search across all configured remotes.
+- A sync service.
+- Deployment locally and to a cloud resource, including a Docker Compose path.
 
-- The minimum useful event model and the fidelity available from initial providers.
-- Local storage and query interfaces, including agent-facing access.
-- Supported BYO storage backends and the shared server's responsibilities.
-- Sync, deletion, retention, redaction, and personal/work routing semantics.
-- How to distinguish validated lessons from provisional interpretations.
+Possession of a remote Archive URL grants access for MVP. Identity-based access, memberships, scoped permissions, and device credential management are future features.
 
-Archive is the working name. Implementation, licensing, and commercial terms remain undecided.
+Automatic provider-session capture, work-context enrichment, retrospective workflows, expanded operational lifecycle management, billing, and the hosted management site are marked **FF (future features)**. Multiple remote destinations are in scope; support for multiple storage technologies is deferred.
+
+Storage technologies, schemas, API contracts, synchronization protocols, and implementation sequencing remain undecided. Archive is the working name; licensing and commercial terms remain undecided.

@@ -1,6 +1,8 @@
 # ARC-006: Make sharing intentional and access scoped
 
-**Status:** Proposed goal
+**Status:** FF — Future feature; outside MVP
+
+For the MVP, possession of a remote Archive URL grants access. Membership, identity-based permissions, and device credential management are future features.
 
 ## Why this matters
 
