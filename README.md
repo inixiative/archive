@@ -79,6 +79,8 @@ Archive should not require Foundry to have launched a session in order to ingest
 
 ## First proof and open questions
 
+The [initial goals and tickets](tickets/README.md) describe the outcomes for the first work deployment, without prescribing implementation.
+
 The first intended use is a local-first record of real UserEvidence agent work, connected to GitHub and Linear, feeding a simple retrospective process. The test is whether a relevant past correction can be recovered and help avoid repeating it.
 
 Before implementation, settle:
