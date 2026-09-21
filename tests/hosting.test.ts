@@ -232,3 +232,26 @@ test('connect validates credentials before changing configuration and repeated s
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('hosted tag filtering matches exact explicit tags, not transcript mentions', async () => {
+  const store = new LocalArchiveStore(':memory:');
+  try {
+    store.capture({ ...snapshot('inixiative', 'tagged'), tags: ['Agentic'] });
+    store.capture({
+      ...snapshot('inixiative', 'mentioned'),
+      tags: ['Governance'],
+      title: 'Agentic discussion',
+    });
+    const handler = createArchiveHandler(store, token);
+    const result = searchResponse.parse(
+      await (await handler(request('search', { tag: 'Agentic' }))).json(),
+    );
+    expect(result.data.archives).toHaveLength(1);
+    const other = searchResponse.parse(
+      await (await handler(request('search', { tag: 'agentic' }))).json(),
+    );
+    expect(other.data.archives).toHaveLength(0);
+  } finally {
+    store.close();
+  }
+});

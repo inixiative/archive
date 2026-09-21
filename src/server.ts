@@ -12,6 +12,7 @@ const ingestSchema = z.strictObject({
 });
 const searchSchema = z.strictObject({
   query: z.string().max(1000).default(''),
+  tag: z.string().min(1).max(120).optional(),
   budget: z.number().int().min(16).max(32768).default(2048),
   projectId: z.string().max(256).optional(),
   limit: z.number().int().min(1).max(100).default(20),
@@ -75,7 +76,11 @@ export function createArchiveHandler(store: LocalArchiveStore, token: string) {
         let remaining = input.budget;
         const matching = store
           .list()
-          .filter((a) => !input.projectId || a.projectId === input.projectId)
+          .filter(
+            (a) =>
+              (!input.projectId || a.projectId === input.projectId) &&
+              (!input.tag || a.tags.includes(input.tag)),
+          )
           .map((a) => ({
             a,
             selected: selectChunks(store.read(a.id)!.chunks, input.query, input.budget),
