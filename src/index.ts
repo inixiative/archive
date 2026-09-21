@@ -16,7 +16,7 @@ export const archiveSnapshotSchema = z
   .strictObject({
     schemaVersion: z.literal(1),
     sourceId: z.uuid(),
-    source: z.enum(['foundry', 'claude-code', 'codex']),
+    source: z.enum(['foundry', 'claude-code', 'codex', 'chatgpt']),
     sessionId: identifier,
     title: z.string().min(1).max(500),
     projectId: identifier.optional(),

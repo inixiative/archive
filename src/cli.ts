@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'n
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
+import { importChatGPTThread } from './chatgpt';
 import {
   archiveRequest,
   publishArchive,
@@ -142,15 +143,28 @@ export async function runCli(args = Bun.argv.slice(2)) {
   const store = new LocalArchiveStore(storePath);
   try {
     if (command === 'import') {
-      if (!v.file || !['codex', 'claude-code'].includes(v.source ?? '') || !v['project-id'])
-        throw new Error('Import requires --file, --source codex|claude-code and --project-id');
-      const snapshot = importTranscriptFile(v.file, {
-        source: v.source as 'codex' | 'claude-code',
-        sourceId: store.sourceId,
-        projectId: v['project-id'],
-        sessionId: v['session-id'],
-        title: v.title,
-      });
+      if (
+        !v.file ||
+        !['codex', 'claude-code', 'chatgpt'].includes(v.source ?? '') ||
+        !v['project-id']
+      )
+        throw new Error(
+          'Import requires --file, --source codex|claude-code|chatgpt and --project-id',
+        );
+      const snapshot =
+        v.source === 'chatgpt'
+          ? importChatGPTThread(JSON.parse(readFileSync(v.file, 'utf8')), {
+              sourceId: store.sourceId,
+              projectId: v['project-id'],
+              title: v.title,
+            })
+          : importTranscriptFile(v.file, {
+              source: v.source as 'codex' | 'claude-code',
+              sourceId: store.sourceId,
+              projectId: v['project-id'],
+              sessionId: v['session-id'],
+              title: v.title,
+            });
       snapshot.tags = [
         ...new Set([...(store.read(archiveKey(snapshot))?.snapshot.tags ?? []), ...(v.tag ?? [])]),
       ];
