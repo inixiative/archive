@@ -1,97 +1,100 @@
 # Archive
 
-Local-first, portable experience storage for agent work.
+MIT-licensed, local-first session storage for Claude Code, Codex and Foundry. Run it independently or connect through Foundry and Kingdom/Kastles.
 
-**Status: architecture and product exploration.** This repository describes the intended product; the capabilities below are proposed, not implemented here. Private while the architecture takes shape.
+## What runs today
 
-## The problem
+- Public transcript extraction, exact-project collection, immutable SQLite revisions, local lexical search and lossless text chunks.
+- A standalone authenticated HTTP server, Docker image, persistent Compose deployment, Railway configuration and a Render blueprint.
+- Multiple explicit destinations, durable publication receipts/outbox, conflict detection and retry after interruption.
+- Native Foundry capture and context retrieval; Kingdom's existing Archives browser, ownership and sharing APIs.
 
-Agent sessions contain decisions, failed approaches, human corrections, and context that often disappear into provider-specific histories. GitHub preserves the resulting code and review; Linear preserves task intent. Neither alone preserves the full experience of doing the work.
+This is an initial pilot, not a general multi-user standalone hosting service. Each standalone deployment is one ownership boundary with one access token. Kingdom supplies account-based sharing. Use distinct storage and credentials for personal and organization archives.
 
-We want that experience to remain queryable across providers and machines, shareable with a team when appropriate, and useful to future agents. The immediate purpose is to support retrospectives that reduce repeated human correction.
+## Local setup
 
-## The product
+Install Bun 1.4.2 or later, then install the published CLI:
 
-Archive has two cooperating parts:
+```sh
+bun add --global @inixiative/archive
+archive init
+archive serve
+```
 
-- **A local daemon** that discovers and extracts supported agent session logs, preserves source records, associates them with work context, and makes them directly queryable on the machine.
-- **A shared server** that receives selected records when connected, allowing authorized people and agents to use shared experience across machines and teams.
+For development from source:
 
-Users should be able to bring their own storage infrastructure. The proposed distribution includes a native daemon and a working Docker Compose deployment for the shared service. A hosted management application could configure destinations, tags, members, accounts, and device access. A managed service may also be offered; pricing and the free/paid boundary are undecided.
+```sh
+bun install
+bun run archive init
+bun run archive serve
+```
 
-Archive should be useful on its own and serve as a context component of [Kastle](https://github.com/inixiative/kastle).
+`init` creates a local database and a private `server.token` under `~/.local/share/archive`. It prints the token's file path, never its value. `serve` binds to loopback port 4411. The server requires bearer authentication for data endpoints; `/health` has no session data.
 
-## Intended capabilities
+```sh
+bun run archive preview --directory /path/to/history --source codex
+bun run archive import --file /path/to/session.jsonl --source codex --project-id inixiative --tag coding
+bun run archive collect --directory /path/to/history --source codex --project-root /exact/session/cwd --project-id inixiative --watch
+bun run archive list
+bun run archive search --query 'migration'
+```
 
-### Capture and provenance
+Use `--source claude-code` for Claude histories. Collection matches the exact working-directory metadata recorded by the provider. Nested checkouts are separate mappings. Unknown directories, symlinks and sessions without usable metadata are skipped. Incomplete or changing files remain at source and retry on the next scan. The initial collector rescans files every 30 seconds; it deduplicates normalized content rather than maintaining byte-offset ingestion cursors. It retains prior manually assigned tags. It does not upload: run sync separately.
 
-- Import sessions from supported native agent harnesses, starting with Claude Code and Codex.
-- Use provider-specific adapters for available logs, exports, APIs, or session extraction rather than assuming one universal format.
-- Preserve original source records alongside normalized representations and track import provenance and adapter versions.
-- Support incremental ingestion, deduplication, and restart-safe progress tracking.
-- Retain available tool activity, corrections, and artifacts needed to understand how work happened, rather than reducing every session to a summary.
+## Connect to BYO hosting
 
-### Work context
+Deploy the included Dockerfile with a persistent volume mounted at `/data`, HTTPS, and a unique `ARCHIVE_SERVER_TOKEN` of at least 32 characters. Compose binds only to loopback; put an HTTPS reverse proxy in front for remote use. Railway needs a `/data` volume. The Render blueprint provisions a dedicated disk and generated token.
 
-Associate sessions and relevant events with repository identity, branches, commits, pull requests, Linear issues, and Atlas-style structural or concept tags where that information is available.
+Place the destination's token in an environment variable, then run:
 
-Distinguish explicit associations from inferred ones. Preserve evidence for inferred links so they can be reviewed and corrected. GitHub and Linear APIs or MCP interfaces can supply complementary records; access must be configured for each deployment.
+```sh
+bun run archive connect --url https://your-archive.example --project-id inixiative --token-env INIXIATIVE_ARCHIVE_TOKEN
+bun run archive routes
+bun run archive sync
+bun run archive sync --watch
+bun run archive search --remote --query 'migration'
+```
 
-### Local query and selective sync
+`setup` is an alias for `connect`. Setup verifies access before saving configuration and does not upload. The URL locates the server; the token grants access. Configuration stores only the environment variable name. Secrets must be available in the collector/sync process environment. Redirects are refused; only HTTPS or loopback HTTP is allowed.
 
-Local data should be directly queryable without requiring the shared server. Capture should continue offline, with selected records synced when connectivity returns.
+`--home PATH`, `--store FILE` and `--config FILE` support custom paths. Keep the database with its source UUID when moving machines. Back up the entire database; a new store creates a new source identity.
 
-A machine may connect to personal and work Archives. A session's destination may be neither, either, or both, subject to explicit routing and access policies. Source selection for queries and destination selection for writes are separate decisions.
+## Connect through Kingdom
 
-The sync protocol needs stable identities, idempotent uploads, and clear behavior for edits, deletion, retention, and conflicts. Those semantics are design work still to be completed.
+Use Kingdom's existing runtime enrollment for a user who manages the destination Kastle, then:
 
-### Access and ownership
+```sh
+bun run archive connect --kind kingdom --url https://your-kingdom.example --kastle-id UUID --project-id inixiative --token-env KINGDOM_ARCHIVE_TOKEN
+```
 
-Shared deployments need membership, scoped query and write access, revocable device credentials, and deliberate handling of sensitive session content. Secret storage and encryption need an explicit design before implementation; sharing a destination must not require distributing an unrestricted administrator credential.
+Optional repeated `--keep-id UUID` places sessions in Keeps owned by that Kastle. A Kingdom runtime credential is distinct from a standalone Archive token. Kingdom retains responsibility for user memberships, shares, revocation and hosted browsing. Connecting directly to Archive does not automatically register that server as a Kastle resource or mirror it into Kingdom; these are separate destinations.
 
-The content path and management service should have a clear boundary. Sending records directly to a user's own server is a desired deployment option.
+Foundry exposes the same commands through `bun run archive`. Its defaults remain `.foundry/archives/archives.sqlite` and `.foundry/archives.json`. Its durable journal capture automatically publishes matching projects once destination credentials are in the viewer's environment. Restart the viewer after changing destination configuration.
 
-## From records to useful experience
+## Routing, tagging and Jev
 
-Archive stores the evidence used by an improvement process. It may also store derived lessons, summaries, and retrospective results, separately from original records and with their own provenance, scope, and versions.
+Only explicit `projectId` matches authorize publication. An archive with no matching destination stays local. Multiple matches create deliberate separate copies. `routes` previews these destinations before upload.
 
-For example:
+```sh
+bun run archive tag --id ARCHIVE_ID --tag reviewed
+```
 
-1. A person corrects an agent for copying an incorrectly placed implementation.
-2. The session is linked to the task, pull request, and resulting placement rule.
-3. A retrospective derives a contextual lesson and cites those records.
-4. A later task retrieves that lesson and receives it in its working context.
-5. Subsequent review checks whether the same correction was needed again.
+Tags and heuristic category suggestions do not change ownership or routing. Jev integration is not enabled: the next step is labeled, shadow-mode tag/destination proposals, scored for accuracy and cross-organization mistakes before any automatic action. Session content must not be sent to Jev without selecting that service for the relevant ownership boundary.
 
-Storage and retrieval enable this loop; they do not by themselves establish that the agent improved.
+## Limits
 
-## Relationship to the rest of Inixiative
+- Public text/tool records only; no reconstruction of private reasoning or unsupported media. Coverage accompanies each snapshot.
+- No automatic secret scrubber. Publication includes recorded public session content.
+- Sync currently publishes local records to destinations; it does not mirror remote records locally or propagate deletions.
+- Local search budgets are per session; hosted search budgets are across a response. Remote search queries every configured route; each response identifies its destination.
+- No automatic remote deletion when routing changes. Existing copies keep their original owner's access rules.
+- Deployment credentials, operational receipts and machine-specific routing belong outside the repository.
 
-| Component | Relationship to Archive |
-| --- | --- |
-| **[Kastle](https://github.com/inixiative/kastle)** | Connects personal and team Archives to capacity, policies, and improvement processes. |
-| **[Foundry](https://github.com/inixiative/foundry)** | Produces agent executions and consumes relevant context while preserving native harness capabilities. |
-| **[agent-session](https://github.com/inixiative/agent-session)** | Existing session execution and event work to evaluate for reuse; passive ingestion has additional requirements. |
-| **[Atlas](https://github.com/inixiative/atlas)** | Provides structural and conceptual context that can help associate experience with the code it concerns. |
-| **Signets** | The proposed scoped access layer for use within a Kastle. |
+## Development
 
-Archive should not require Foundry to have launched a session in order to ingest it. Supporting existing agent workflows is central to its usefulness.
+```sh
+bun test
+bun run typecheck
+```
 
-## MVP and future features
-
-The [goals and tickets](tickets/README.md) define the current release boundary. The intended capabilities above describe the broader product direction; they are not all MVP requirements.
-
-The MVP consists of:
-
-- Durable local storage.
-- Remote storage across multiple Archive destinations.
-- Direct local search.
-- Search across all configured remotes.
-- A sync service.
-- Deployment locally and to a cloud resource, including a Docker Compose path.
-
-Possession of a remote Archive URL grants access for MVP. Identity-based access, memberships, scoped permissions, and device credential management are future features.
-
-Automatic provider-session capture, work-context enrichment, retrospective workflows, expanded operational lifecycle management, billing, and the hosted management site are marked **FF (future features)**. Multiple remote destinations are in scope; support for multiple storage technologies is deferred.
-
-Storage technologies, schemas, API contracts, synchronization protocols, and implementation sequencing remain undecided. Archive is the working name; licensing and commercial terms remain undecided.
+See [provenance](docs/PROVENANCE.md), [license](LICENSE), and [goals](tickets/README.md). The historical tickets describe earlier scope; this implementation now includes explicit provider collection and authenticated standalone hosting.

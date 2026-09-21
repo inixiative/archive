@@ -22,3 +22,7 @@ Capture supported agent sessions through the local daemon and retain the availab
 ## Questions to resolve
 
 What information must remain available for someone to understand a correction, and what limitations do the source histories impose?
+
+## 2026-09-20 implementation update
+
+Explicit Claude/Codex import and exact-working-directory collection now run in standalone Archive, with a 30-second watch mode. Changed source files are re-read and deduplicated into immutable revisions. Partial files retry without replacing stored evidence. Native Foundry journal capture remains an integration. Automatic universal discovery and byte-offset ingestion checkpoints remain future work.

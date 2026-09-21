@@ -1,0 +1,57 @@
+{
+  "name": "@inixiative/archive",
+  "version": "0.2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./local": "./src/local.ts",
+    "./import": "./src/import.ts",
+    "./client": "./src/client.ts",
+    "./config": "./src/config.ts",
+    "./server": "./src/server.ts",
+    "./import-file": "./src/import-file.ts",
+    "./preview": "./src/preview.ts",
+    "./cli": "./src/cli.ts",
+    "./collector": "./src/collector.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "test": "bun test tests",
+    "typecheck": "tsc --noEmit",
+    "archive": "bun run src/cli.ts",
+    "start": "bun run src/cli.ts serve",
+    "check": "bun run typecheck && bun run lint && bun run test",
+    "prepublishOnly": "bun run check",
+    "lint": "biome check .",
+    "prepare": "lefthook install"
+  },
+  "dependencies": {
+    "js-tiktoken": "1.0.21",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "6.0.3",
+    "@biomejs/biome": "2.5.2",
+    "@inixiative/config": "^0.5.33",
+    "lefthook": "2.1.9"
+  },
+  "bin": {
+    "archive": "src/cli.ts"
+  },
+  "license": "MIT",
+  "description": "Portable Claude Code, Codex and Foundry session archives: extraction, local storage, search and hosted sync",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inixiative/archive.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "bun": ">=1.4.2"
+  },
+  "packageManager": "bun@1.4.2"
+}

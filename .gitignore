@@ -1,0 +1,5 @@
+node_modules/
+.archive/
+*.sqlite*
+*.tgz
+.env*

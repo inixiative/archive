@@ -1,0 +1,17 @@
+services:
+  archive:
+    build: .
+    ports:
+      - "127.0.0.1:4411:4411"
+    environment:
+      ARCHIVE_SERVER_TOKEN: ${ARCHIVE_SERVER_TOKEN:?Set a unique random token of at least 32 characters}
+    volumes:
+      - archive-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:4411/health').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  archive-data:

@@ -1,12 +1,12 @@
 # Archive goals and tickets
 
-These tickets describe product goals and desired outcomes. They do not specify implementation, storage technologies, API contracts, synchronization protocols, or a build sequence.
+These tickets began as product goals. As of 2026-09-20, a standalone MIT implementation exists; see the README and `docs/PILOT-2026-09-20.md` for verified scope. Historical FF labels are not a statement that all collection remains unimplemented. Full incremental ingestion, remote mirroring and lifecycle features remain future work.
 
 ## MVP
 
 The initial scope is storage locally and in multiple remote Archives, local search, search across all configured remotes, a sync service, and deployment locally and to a cloud resource.
 
-**Access model:** Possession of a remote Archive URL grants access for MVP. Accounts, memberships, scoped permissions, and device credential management are future features.
+**Current access model:** Standalone remotes require a URL plus a bearer credential. Each deployment is one ownership boundary. Kingdom supplies account-based membership and sharing. This supersedes the original URL-only proposal.
 
 | Ticket | Goal | Status |
 | --- | --- | --- |
