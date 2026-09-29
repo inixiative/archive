@@ -1,6 +1,5 @@
-import { createReadStream, lstatSync, readdirSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve } from 'node:path';
-import { createInterface } from 'node:readline';
+import { closeSync, lstatSync, openSync, readdirSync, readSync } from 'node:fs';
+import { isAbsolute, join, resolve } from 'node:path';
 import { importTranscriptFile } from './import-file';
 import { archiveKey } from './index';
 import type { LocalArchiveStore } from './local';
@@ -8,8 +7,10 @@ import type { LocalArchiveStore } from './local';
 export interface CollectionSource {
   directory: string;
   source: 'codex' | 'claude-code';
-  projectRoot: string;
+  projectRoots: string[];
   projectId: string;
+  /** Also match the git worktrees of each root; nested checkouts stay separate. */
+  worktrees?: boolean;
   tags?: string[];
 }
 
@@ -26,35 +27,55 @@ function files(directory: string): string[] {
 }
 
 /** Match provider metadata, never text/tags/model suggestions. No implicit parent-directory routing. */
-async function sessionDirectory(file: string, source: CollectionSource['source']) {
-  const input = createReadStream(file, { encoding: 'utf8', end: 1_000_000 });
-  const lines = createInterface({ input, crlfDelay: Infinity });
+function sessionDirectory(file: string, source: CollectionSource['source']) {
+  // A bounded synchronous read: streamed readline could leave a watch loop waiting forever.
+  const buffer = Buffer.alloc(Math.min(lstatSync(file).size, 1_000_000));
+  const fd = openSync(file, 'r');
   try {
-    for await (const line of lines) {
-      let row: any;
-      try {
-        row = JSON.parse(line);
-      } catch {
-        return undefined;
-      }
-      const cwd =
-        source === 'codex' ? (row.type === 'session_meta' ? row.payload?.cwd : undefined) : row.cwd;
-      if (typeof cwd === 'string' && isAbsolute(cwd)) return resolve(cwd);
-    }
+    readSync(fd, buffer, 0, buffer.length, 0);
   } finally {
-    lines.close();
-    input.destroy();
+    closeSync(fd);
+  }
+  for (const line of buffer.toString('utf8').split('\n')) {
+    if (!line) continue;
+    let row: any;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      return undefined;
+    }
+    const cwd =
+      source === 'codex' ? (row.type === 'session_meta' ? row.payload?.cwd : undefined) : row.cwd;
+    if (typeof cwd === 'string' && isAbsolute(cwd)) return resolve(cwd);
   }
 }
 
+function worktreesOf(root: string): string[] {
+  const listed = Bun.spawnSync(['git', '-C', root, 'worktree', 'list', '--porcelain'], {
+    stderr: 'ignore',
+  });
+  if (!listed.success) return [];
+  return listed.stdout
+    .toString()
+    .split('\n')
+    .filter((line) => line.startsWith('worktree '))
+    .map((line) => resolve(line.slice('worktree '.length)));
+}
+
+/** Exact directories this collection accepts, re-read each scan so new worktrees join. */
+export function collectionRoots(config: CollectionSource): Set<string> {
+  const roots = config.projectRoots.map((root) => resolve(root));
+  return new Set(config.worktrees ? [...roots, ...roots.flatMap(worktreesOf)] : roots);
+}
+
 export async function collectSessions(store: LocalArchiveStore, config: CollectionSource) {
-  const root = resolve(config.projectRoot);
+  const roots = collectionRoots(config);
   const result = { imported: 0, unchanged: 0, skipped: 0, failed: 0 };
   for (const file of files(config.directory)) {
     try {
-      const cwd = await sessionDirectory(file, config.source);
+      const cwd = sessionDirectory(file, config.source);
       // Exact root selection avoids sweeping nested checkouts belonging to another organization.
-      if (!cwd || relative(root, cwd) !== '') {
+      if (!cwd || !roots.has(cwd)) {
         result.skipped++;
         continue;
       }
