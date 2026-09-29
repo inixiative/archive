@@ -39,7 +39,7 @@ bun run archive list
 bun run archive search --query 'migration'
 ```
 
-Use `--source claude-code` for Claude histories. Collection matches the exact working-directory metadata recorded by the provider. Nested checkouts are separate mappings. Unknown directories, symlinks and sessions without usable metadata are skipped. Incomplete or changing files remain at source and retry on the next scan. The initial collector rescans files every 30 seconds; it deduplicates normalized content rather than maintaining byte-offset ingestion cursors. It retains prior manually assigned tags. It does not upload: run sync separately.
+Use `--source claude-code` for Claude histories. Collection matches the exact working-directory metadata recorded by the provider. Repeat `--project-root` to map several checkouts to one project; `--worktrees` also accepts every current git worktree of each root, re-read on each scan. Nested checkouts are separate mappings. Unknown directories, symlinks and sessions without usable metadata are skipped. Incomplete or changing files remain at source and retry on the next scan. The initial collector rescans files every 30 seconds; it deduplicates normalized content rather than maintaining byte-offset ingestion cursors. It retains prior manually assigned tags. It does not upload: run sync separately.
 
 ## Connect to BYO hosting
 
