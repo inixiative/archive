@@ -40,8 +40,13 @@ export function importTranscriptLines(
       sessionId ??= id;
     }
     if (options.source === 'claude-code' && row.sessionId) {
-      if (sessionId && sessionId !== row.sessionId) throw new Error('Mixed transcript sessions');
-      sessionId = row.sessionId;
+      // Subagent transcripts reuse their parent's sessionId; each is its own archive.
+      const id =
+        row.isSidechain && typeof row.agentId === 'string'
+          ? `${row.sessionId}/agent-${row.agentId}`
+          : row.sessionId;
+      if (sessionId && sessionId !== id) throw new Error('Mixed transcript sessions');
+      sessionId = id;
     }
     const timestamp = typeof row.timestamp === 'number' ? row.timestamp : Date.parse(row.timestamp);
     const add = (kind: ArchiveEntry['kind'], content: unknown, suffix: string, callId?: string) => {

@@ -149,6 +149,24 @@ describe('session archives', () => {
       ),
     ).toThrow('Mixed');
   });
+  test('Claude subagent transcripts archive apart from their parent session and each other', () => {
+    const row = (agentId?: string) =>
+      JSON.stringify({
+        sessionId: 'parent',
+        uuid: `u-${agentId ?? 'main'}`,
+        type: 'user',
+        message: { content: 'Work' },
+        ...(agentId && { isSidechain: true, agentId }),
+      });
+    const id = (line: string) =>
+      importTranscript(line, { source: 'claude-code', sourceId: snapshot().sourceId }).sessionId;
+    expect([id(row()), id(row('a1')), id(row('a2'))]).toEqual([
+      'parent',
+      'parent/agent-a1',
+      'parent/agent-a2',
+    ]);
+    expect(() => id(`${row('a1')}\n${row('a2')}`)).toThrow('Mixed');
+  });
 });
 
 test('a pending upload and source identity survive closing and reopening the archive store', () => {
