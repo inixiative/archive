@@ -47,6 +47,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       query: { type: 'string', default: '' },
       'project-root': { type: 'string', multiple: true },
       worktrees: { type: 'boolean', default: false },
+      atlas: { type: 'boolean', default: false },
       tag: { type: 'string', multiple: true },
       limit: { type: 'string', default: '100' },
       port: { type: 'string', default: process.env.PORT ?? '4411' },
@@ -67,7 +68,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       'Archive: init | serve | connect (setup) | preview | import | collect | list | export | tag | routes | sync | search\n' +
         'connect --url HTTPS_URL --project-id ID --token-env ENV [--kind kingdom [--connection-id ID] [--owner-model M --organization-id UUID --space-id UUID]]\n' +
         'import --file PATH --source codex|claude-code --project-id ID [--tag TAG]\n' +
-        'collect --directory HISTORY --source codex|claude-code --project-root EXACT_CWD [--project-root ...] [--worktrees] --project-id ID [--watch]\n' +
+        'collect --directory HISTORY --source codex|claude-code --project-root EXACT_CWD [--project-root ...] [--worktrees] [--atlas] --project-id ID [--watch]\n' +
         'sync [--watch] | routes | search --query TEXT [--remote]\n' +
         'serve --home PATH [--port 4411 --hostname 127.0.0.1]\n' +
         'All commands accept --home PATH; integrations may use --store FILE --config FILE.',
@@ -208,6 +209,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
             source: v.source as 'codex' | 'claude-code',
             projectRoots: v['project-root']!,
             worktrees: v.worktrees,
+            atlas: v.atlas,
             projectId: v['project-id']!,
             tags: v.tag,
           });

@@ -65,6 +65,7 @@ test('Claude cwd metadata is collected without treating a destination name in te
       JSON.stringify({
         sessionId: 'claude-1',
         cwd: '/work/ue',
+        gitBranch: 'feat/tags',
         type: 'user',
         uuid: 'msg-1',
         message: { content: 'Please share this with personal' },
@@ -78,6 +79,7 @@ test('Claude cwd metadata is collected without treating a destination name in te
     });
     expect(result.imported).toBe(1);
     expect(store.list()[0].projectId).toBe('userevidence');
+    expect(store.list()[0].tags).toEqual(['branch:feat/tags']);
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
