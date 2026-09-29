@@ -61,13 +61,19 @@ bun run archive search --remote --query 'migration'
 
 ## Connect through Kingdom
 
-Use Kingdom's existing runtime enrollment for a user who manages the destination Kastle, then:
+Pair a runtime with Kingdom (Foundry: Settings → Kingdom) and expose its `kastle_runtime_` credential in an environment variable, then either let Kingdom store the archives:
 
 ```sh
-bun run archive connect --kind kingdom --url https://your-kingdom.example --kastle-id UUID --project-id inixiative --token-env KINGDOM_ARCHIVE_TOKEN
+bun run archive connect --kind kingdom --url https://your-kingdom.example --project-id inixiative --token-env KINGDOM_ARCHIVE_TOKEN
 ```
 
-Optional repeated `--keep-id UUID` places sessions in Keeps owned by that Kastle. A Kingdom runtime credential is distinct from a standalone Archive token. Kingdom retains responsibility for user memberships, shares, revocation and hosted browsing. Connecting directly to Archive does not automatically register that server as a Kastle resource or mirror it into Kingdom; these are separate destinations.
+or forward them through Kingdom to a hosted Archive it has bound for that project:
+
+```sh
+bun run archive connect --kind kingdom --url https://your-kingdom.example --connection-id inixiative --project-id inixiative --token-env KINGDOM_ARCHIVE_TOKEN
+```
+
+Kingdom takes the owner from the runtime credential; `--owner-model`, `--organization-id` and `--space-id` narrow it to an organization or space that owner manages. A forwarding connection accepts only its bound `projectId`, and the hosted Archive's own token stays in Kingdom's server environment. A Kingdom runtime credential is distinct from a standalone Archive token. Kingdom retains responsibility for memberships, shares, revocation and hosted browsing.
 
 Foundry exposes the same commands through `bun run archive`. Its defaults remain `.foundry/archives/archives.sqlite` and `.foundry/archives.json`. Its durable journal capture automatically publishes matching projects once destination credentials are in the viewer's environment. Restart the viewer after changing destination configuration.
 

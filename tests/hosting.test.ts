@@ -255,3 +255,62 @@ test('hosted tag filtering matches exact explicit tags, not transcript mentions'
     store.close();
   }
 });
+
+test('Kingdom destinations name an owner and optional forwarding connection, never a Kastle', async () => {
+  const local = new LocalArchiveStore(':memory:');
+  const id = local.capture(snapshot()).id;
+  const sent: { path: string; body: any }[] = [];
+  const kingdom = (async (url: any, options: any) => {
+    const body = JSON.parse(options.body);
+    sent.push({ path: new URL(url).pathname, body });
+    return Response.json({ data: { digest: local.read(id)!.digest } });
+  }) as unknown as typeof fetch;
+  const destination = (fields: object) =>
+    ({
+      kind: 'kingdom',
+      projectId: 'inixiative',
+      url: 'https://kingdom.example/',
+      tokenEnv: 'KINGDOM_TEST_RUNTIME',
+      ...fields,
+    }) as ArchiveDestination;
+  process.env.KINGDOM_TEST_RUNTIME = 'kastle_runtime_synthetic';
+  try {
+    const organizationId = '1ae3ac76-faa8-4498-8072-425ab35f453c';
+    await publishArchive(
+      local,
+      id,
+      destination({ ownerModel: 'Organization', organizationId }),
+      kingdom,
+    );
+    await publishArchive(local, id, destination({ connectionId: 'inixiative' }), kingdom);
+    expect(sent.map(({ path }) => path)).toEqual([
+      '/api/v1/archive/ingest',
+      '/api/v1/archive/remote/ingest',
+    ]);
+    expect(Object.keys(sent[0].body).sort()).toEqual([
+      'organizationId',
+      'ownerModel',
+      'previousDigest',
+      'snapshot',
+    ]);
+    expect(Object.keys(sent[1].body).sort()).toEqual([
+      'connectionId',
+      'previousDigest',
+      'snapshot',
+    ]);
+    expect(
+      routingPreview(local, [destination({ connectionId: 'inixiative' })])[0]
+        .destinations as unknown,
+    ).toEqual([{ kind: 'kingdom', url: 'https://kingdom.example/', connectionId: 'inixiative' }]);
+    await expect(
+      publishArchive(local, id, destination({ kastleId: organizationId }), kingdom),
+    ).rejects.toThrow();
+    process.env.KINGDOM_TEST_RUNTIME = 'not-a-runtime-credential';
+    await expect(publishArchive(local, id, destination({}), kingdom)).rejects.toThrow(
+      'credential unavailable',
+    );
+  } finally {
+    local.close();
+    delete process.env.KINGDOM_TEST_RUNTIME;
+  }
+});

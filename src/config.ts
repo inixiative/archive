@@ -8,17 +8,28 @@ const common = {
   url: z.url(),
   tokenEnv: z.string().regex(/^[A-Z][A-Z0-9_]+$/),
 };
+/** Kingdom derives the owner from the runtime credential; these narrow it to a space or organization it manages. */
+export const kingdomOwnerFields = {
+  ownerModel: z.enum(['User', 'OrganizationUser', 'Organization', 'Space', 'SpaceUser']).optional(),
+  organizationId: z.uuid().optional(),
+  spaceId: z.uuid().optional(),
+};
 export const archiveDestinationSchema = z.union([
   z.strictObject({
     ...common,
     kind: z.literal('archive'),
-    keepIds: z.array(z.string()).max(0).default([]),
+    keepIds: z.array(z.string()).max(0).optional(),
   }),
   z.strictObject({
     ...common,
-    kind: z.literal('kingdom').optional(),
-    kastleId: z.uuid(),
-    keepIds: z.array(z.uuid()).max(50).default([]),
+    kind: z.literal('kingdom'),
+    /** A hosted Archive that Kingdom forwards to; omitted, Kingdom stores the archive itself. */
+    connectionId: z
+      .string()
+      .regex(/^[a-z0-9-]+$/)
+      .max(120)
+      .optional(),
+    ...kingdomOwnerFields,
   }),
 ]);
 export type ArchiveDestination = z.infer<typeof archiveDestinationSchema>;
@@ -52,7 +63,14 @@ export function destinationIdentity(destination: ArchiveDestination) {
   return JSON.stringify([
     url.origin,
     new URL(destination.url).pathname,
-    destination.kind === 'archive' ? 'standalone' : destination.kastleId,
+    destination.kind === 'archive'
+      ? 'standalone'
+      : [
+          destination.connectionId ?? 'kingdom',
+          destination.ownerModel ?? null,
+          destination.organizationId ?? null,
+          destination.spaceId ?? null,
+        ],
   ]);
 }
 export function connectDestination(file: string, input: unknown) {
@@ -72,7 +90,7 @@ export function connectDestination(file: string, input: unknown) {
   chmodSync(file, 0o600);
   return {
     configured: true,
-    kind: destination.kind ?? 'kingdom',
+    kind: destination.kind,
     projectId: destination.projectId,
     url: destination.url,
     tokenEnv: destination.tokenEnv,

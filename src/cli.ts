@@ -7,6 +7,7 @@ import { parseArgs } from 'node:util';
 import { importChatGPTThread } from './chatgpt';
 import {
   archiveRequest,
+  kingdomFields,
   publishArchive,
   routingPreview,
   searchRemotes,
@@ -31,8 +32,10 @@ export async function runCli(args = Bun.argv.slice(2)) {
       url: { type: 'string' },
       kind: { type: 'string', default: 'archive' },
       'project-id': { type: 'string' },
-      'kastle-id': { type: 'string' },
-      'keep-id': { type: 'string', multiple: true },
+      'connection-id': { type: 'string' },
+      'owner-model': { type: 'string' },
+      'organization-id': { type: 'string' },
+      'space-id': { type: 'string' },
       'token-env': { type: 'string', default: 'ARCHIVE_TOKEN' },
       'token-file': { type: 'string' },
       file: { type: 'string' },
@@ -63,7 +66,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
   if (v.help || !command) {
     console.log(
       'Archive: init | serve | connect (setup) | preview | import | collect | list | export | tag | routes | sync | search\n' +
-        'connect --url HTTPS_URL --project-id ID --token-env ENV [--kind kingdom --kastle-id UUID]\n' +
+        'connect --url HTTPS_URL --project-id ID --token-env ENV [--kind kingdom [--connection-id ID] [--owner-model M --organization-id UUID --space-id UUID]]\n' +
         'import --file PATH --source codex|claude-code --project-id ID [--tag TAG]\n' +
         'collect --directory HISTORY --source codex|claude-code --project-root EXACT_CWD [--project-root ...] [--worktrees] [--atlas] --project-id ID [--watch]\n' +
         'sync [--watch] | routes | search --query TEXT [--remote]\n' +
@@ -109,7 +112,14 @@ export async function runCli(args = Bun.argv.slice(2)) {
       url: v.url,
       tokenEnv: v['token-env'],
       kind: v.kind,
-      ...(v.kind === 'kingdom' ? { kastleId: v['kastle-id'], keepIds: v['keep-id'] ?? [] } : {}),
+      ...(v.kind === 'kingdom'
+        ? {
+            connectionId: v['connection-id'],
+            ownerModel: v['owner-model'],
+            organizationId: v['organization-id'],
+            spaceId: v['space-id'],
+          }
+        : {}),
     });
     // Verify credentials and protocol before saving; no records uploaded by setup.
     const probe = await archiveRequest(destination, 'search', {
@@ -118,7 +128,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       limit: 1,
       ...(destination.kind === 'archive'
         ? { projectId: destination.projectId }
-        : { kastleId: destination.kastleId }),
+        : kingdomFields(destination)),
     });
     if (!Array.isArray(probe.data?.archives))
       throw new Error('Destination is not an Archive-compatible endpoint');
