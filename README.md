@@ -79,7 +79,9 @@ Only explicit `projectId` matches authorize publication. An archive with no matc
 bun run archive tag --id ARCHIVE_ID --tag reviewed
 ```
 
-Tags and heuristic category suggestions do not change ownership or routing. Jev integration is not enabled: the next step is labeled, shadow-mode tag/destination proposals, scored for accuracy and cross-organization mistakes before any automatic action. Session content must not be sent to Jev without selecting that service for the relevant ownership boundary.
+Collectors add explicit tags from recorded session metadata: `repo:owner/name` and `branch:name` from git context, and with `--atlas` the `atlas:<concept>` of repository files the session's tool calls touched (from `atlas graph --json` in the session's checkout). Suggestions are computed on read and never stored: heuristic categories, plus `reference` suggestions for linked GitHub pull requests, issues and commits (`github:owner/repo#24`, `github:owner/repo@sha`) and Linear issues (`linear:KEY-12`). A link is a mention, not proof of work, so references stay suggestions.
+
+Tags and suggestions do not change ownership or routing. Jev integration is not enabled: the next step is labeled, shadow-mode tag/destination proposals, scored for accuracy and cross-organization mistakes before any automatic action. Session content must not be sent to Jev without selecting that service for the relevant ownership boundary.
 
 ## Limits
 

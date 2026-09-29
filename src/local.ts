@@ -7,11 +7,11 @@ import {
   type ArchiveSnapshot,
   archiveKey,
   archiveSnapshotSchema,
-  categorySuggestions,
   chunkArchive,
   selectChunks,
   snapshotDigest,
 } from './index';
+import { suggestTags } from './tags';
 
 export class LocalArchiveStore {
   private readonly db: Database;
@@ -94,7 +94,7 @@ export class LocalArchiveStore {
         digest: archive.digest,
         ...snapshot,
         entries: entries.length,
-        suggestedTags: categorySuggestions(archive.snapshot),
+        suggestedTags: suggestTags(archive.snapshot),
       };
     });
   }
