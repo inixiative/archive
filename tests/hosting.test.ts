@@ -111,7 +111,7 @@ test('hosted auth, immutable revisions, concurrent-write conflicts and bounded s
         await (await handler(request('search', { query: 'userevidence' }))).json(),
       ).data.archives,
     ).toHaveLength(2);
-    expect((await handler(request('search', { kastleId: 'not-standalone' }))).status).toBe(400);
+    expect((await handler(request('search', { connectionId: 'not-standalone' }))).status).toBe(400);
   } finally {
     store.close();
   }
@@ -131,7 +131,6 @@ test('three destinations stay isolated; tags never authorize a destination; unkn
       projectId,
       kind: 'archive',
       url: instance.server.url.href,
-      keepIds: [],
       tokenEnv: 'ARCHIVE_ROUTING_TEST_TOKEN',
     }));
     const routes = routingPreview(local, destinations);
@@ -163,7 +162,6 @@ test('lost acknowledgement replays old revision before new content after client 
     kind: 'archive',
     projectId: 'inixiative',
     url: 'http://localhost:4411/',
-    keepIds: [],
     tokenEnv: 'ARCHIVE_RESTART_TEST_TOKEN',
   };
   try {
@@ -256,7 +254,7 @@ test('hosted tag filtering matches exact explicit tags, not transcript mentions'
   }
 });
 
-test('Kingdom destinations name an owner and optional forwarding connection, never a Kastle', async () => {
+test('Kingdom destinations name an owner and optional forwarding connection', async () => {
   const local = new LocalArchiveStore(':memory:');
   const id = local.capture(snapshot()).id;
   const sent: { path: string; body: any }[] = [];
@@ -273,7 +271,7 @@ test('Kingdom destinations name an owner and optional forwarding connection, nev
       tokenEnv: 'KINGDOM_TEST_RUNTIME',
       ...fields,
     }) as ArchiveDestination;
-  process.env.KINGDOM_TEST_RUNTIME = 'kastle_runtime_synthetic';
+  process.env.KINGDOM_TEST_RUNTIME = 'kingdom_runtime_synthetic';
   try {
     const organizationId = '1ae3ac76-faa8-4498-8072-425ab35f453c';
     await publishArchive(
@@ -303,7 +301,7 @@ test('Kingdom destinations name an owner and optional forwarding connection, nev
         .destinations as unknown,
     ).toEqual([{ kind: 'kingdom', url: 'https://kingdom.example/', connectionId: 'inixiative' }]);
     await expect(
-      publishArchive(local, id, destination({ kastleId: organizationId }), kingdom),
+      publishArchive(local, id, destination({ ownerId: organizationId }), kingdom),
     ).rejects.toThrow();
     process.env.KINGDOM_TEST_RUNTIME = 'not-a-runtime-credential';
     await expect(publishArchive(local, id, destination({}), kingdom)).rejects.toThrow(

@@ -1,6 +1,6 @@
 # Archive
 
-MIT-licensed, local-first session storage for Claude Code, Codex and Foundry. Run it independently or connect through Foundry and Kingdom/Kastles.
+MIT-licensed, local-first session storage for Claude Code, Codex and Foundry. Run it independently or connect through Foundry and Kingdom.
 
 ## What runs today
 
@@ -82,7 +82,7 @@ Docker Compose is the alternative for the server: `docker compose up -d` bind-mo
 
 ## Connect through Kingdom
 
-Pair a runtime with Kingdom (Foundry: Settings → Kingdom) and expose its `kastle_runtime_` credential in an environment variable, then either let Kingdom store the archives:
+Pair a runtime with Kingdom (Foundry: Settings → Kingdom) and expose its `kingdom_runtime_` credential in an environment variable, then either let Kingdom store the archives:
 
 ```sh
 bun run archive connect --kind kingdom --url https://your-kingdom.example --project-id inixiative --token-env KINGDOM_ARCHIVE_TOKEN
