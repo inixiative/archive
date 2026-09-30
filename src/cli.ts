@@ -1,9 +1,18 @@
 #!/usr/bin/env bun
 import { randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
+import {
+  agentStatus,
+  defaultHistoryDirectory,
+  defaultHome,
+  installAgents,
+  readAgents,
+  uninstallAgents,
+  upsertCollector,
+  writeAgents,
+} from './agents';
 import { importChatGPTThread } from './chatgpt';
 import {
   archiveRequest,
@@ -26,7 +35,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
     args,
     allowPositionals: true,
     options: {
-      home: { type: 'string', default: join(homedir(), '.local/share/archive') },
+      home: { type: 'string', default: defaultHome() },
       store: { type: 'string' },
       config: { type: 'string' },
       url: { type: 'string' },
@@ -36,7 +45,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       'owner-model': { type: 'string' },
       'organization-id': { type: 'string' },
       'space-id': { type: 'string' },
-      'token-env': { type: 'string', default: 'ARCHIVE_TOKEN' },
+      'token-env': { type: 'string' },
       'token-file': { type: 'string' },
       file: { type: 'string' },
       directory: { type: 'string' },
@@ -50,7 +59,8 @@ export async function runCli(args = Bun.argv.slice(2)) {
       atlas: { type: 'boolean', default: false },
       tag: { type: 'string', multiple: true },
       limit: { type: 'string', default: '100' },
-      port: { type: 'string', default: process.env.PORT ?? '4411' },
+      port: { type: 'string' },
+      name: { type: 'string' },
       hostname: { type: 'string', default: '127.0.0.1' },
       watch: { type: 'boolean', default: false },
       remote: { type: 'boolean', default: false },
@@ -65,12 +75,14 @@ export async function runCli(args = Bun.argv.slice(2)) {
   const command = positionals[0];
   if (v.help || !command) {
     console.log(
-      'Archive: init | serve | connect (setup) | preview | import | collect | list | export | tag | routes | sync | search\n' +
-        'connect --url HTTPS_URL --project-id ID --token-env ENV [--kind kingdom [--connection-id ID] [--owner-model M --organization-id UUID --space-id UUID]]\n' +
+      'Archive: init | serve | connect (setup) | preview | import | collect | list | export | tag | routes | sync | search | agents\n' +
+        'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH) [--kind kingdom [--connection-id ID] [--owner-model M --organization-id UUID --space-id UUID]]\n' +
         'import --file PATH --source codex|claude-code --project-id ID [--tag TAG]\n' +
         'collect --directory HISTORY --source codex|claude-code --project-root EXACT_CWD [--project-root ...] [--worktrees] [--atlas] --project-id ID [--watch]\n' +
         'sync [--watch] | routes | search --query TEXT [--remote]\n' +
         'serve --home PATH [--port 4411 --hostname 127.0.0.1]\n' +
+        'agents add-collector --name N --source codex|claude-code --project-id ID --project-root DIR [--project-root ...] [--directory HISTORY] [--worktrees] [--atlas]\n' +
+        'agents remove-collector --name N | serve on|off [--port P] | sync on|off | install | uninstall | status\n' +
         'All commands accept --home PATH; integrations may use --store FILE --config FILE.',
     );
     return;
@@ -94,7 +106,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
     const instance = startArchiveServer({
       store: storePath,
       token,
-      port: Number(v.port),
+      port: Number(v.port ?? process.env.PORT ?? 4411),
       hostname: v.hostname,
     });
     output({ listening: instance.server.url.href, store: storePath });
@@ -107,10 +119,12 @@ export async function runCli(args = Bun.argv.slice(2)) {
     return;
   }
   if (command === 'connect' || command === 'setup') {
+    const tokenFile = v['token-file'] && resolve(v['token-file']);
     const destination = archiveDestinationSchema.parse({
       projectId: v['project-id'],
       url: v.url,
-      tokenEnv: v['token-env'],
+      tokenEnv: v['token-env'] ?? (tokenFile ? undefined : 'ARCHIVE_TOKEN'),
+      tokenFile,
       kind: v.kind,
       ...(v.kind === 'kingdom'
         ? {
@@ -133,6 +147,58 @@ export async function runCli(args = Bun.argv.slice(2)) {
     if (!Array.isArray(probe.data?.archives))
       throw new Error('Destination is not an Archive-compatible endpoint');
     output(connectDestination(config, destination));
+    return;
+  }
+  if (command === 'agents') {
+    const file = join(home, 'agents.json');
+    const current = readAgents(file);
+    const [action, state] = positionals.slice(1);
+    const toggle = () => {
+      if (state !== 'on' && state !== 'off') throw new Error(`agents ${action} requires on|off`);
+      return state === 'on';
+    };
+    const base = { collectors: [], ...current };
+    if (action === 'add-collector') {
+      if (!v.name || !v['project-id'] || !v['project-root'] || !v.source)
+        throw new Error('add-collector requires --name, --source, --project-id and --project-root');
+      const source = v.source as 'codex' | 'claude-code';
+      output(
+        writeAgents(
+          file,
+          upsertCollector(current, {
+            name: v.name,
+            source,
+            directory: resolve(v.directory ?? defaultHistoryDirectory(source)),
+            projectId: v['project-id'],
+            projectRoots: v['project-root'].map((root) => resolve(root)),
+            ...(v.worktrees ? { worktrees: true } : {}),
+            ...(v.atlas ? { atlas: true } : {}),
+          }),
+        ),
+      );
+    } else if (action === 'remove-collector') {
+      if (!v.name) throw new Error('remove-collector requires --name');
+      output(
+        writeAgents(file, {
+          ...base,
+          collectors: base.collectors.filter((c) => c.name !== v.name),
+        }),
+      );
+    } else if (action === 'serve') {
+      const { serve: _, ...rest } = base;
+      output(
+        writeAgents(
+          file,
+          toggle() ? { ...rest, serve: v.port ? { port: Number(v.port) } : {} } : rest,
+        ),
+      );
+    } else if (action === 'sync') output(writeAgents(file, { ...base, sync: toggle() }));
+    else if (action === 'install') {
+      if (!current) throw new Error('No agents.json; declare agents first');
+      output(installAgents(current, { home }));
+    } else if (action === 'uninstall') output(uninstallAgents({ home }));
+    else if (action === 'status') output(agentStatus(current, { home }));
+    else throw new Error('Unknown agents command; use --help');
     return;
   }
   if (command === 'preview') {

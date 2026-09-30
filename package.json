@@ -1,6 +1,6 @@
 {
   "name": "@inixiative/archive",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
@@ -14,7 +14,8 @@
     "./cli": "./src/cli.ts",
     "./collector": "./src/collector.ts",
     "./chatgpt": "./src/chatgpt.ts",
-    "./tags": "./src/tags.ts"
+    "./tags": "./src/tags.ts",
+    "./agents": "./src/agents.ts"
   },
   "files": [
     "src"

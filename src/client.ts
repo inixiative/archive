@@ -2,6 +2,7 @@ import {
   type ArchiveDestination,
   archiveDestinationSchema,
   destinationIdentity,
+  destinationToken,
   destinationUrl,
 } from './config';
 import type { LocalArchiveStore } from './local';
@@ -26,7 +27,7 @@ export async function archiveRequest(
   transport: typeof fetch = fetch,
 ) {
   const url = destinationUrl(destination.url);
-  const token = process.env[destination.tokenEnv];
+  const token = destinationToken(destination);
   if (!token || (destination.kind === 'kingdom' && !token.startsWith('kastle_runtime_')))
     throw new Error('Archive runtime credential unavailable');
   const path =
