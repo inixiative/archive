@@ -45,19 +45,40 @@ Use `--source claude-code` for Claude histories. Collection matches the exact wo
 
 Deploy the included Dockerfile with a persistent volume mounted at `/data`, HTTPS, and a unique `ARCHIVE_SERVER_TOKEN` of at least 32 characters. Compose bind-mounts `./data` (or `ARCHIVE_DATA_DIR`) at `/data`, so the store survives rebuilds, `down -v` and volume prunes, and binds only to loopback on port 4411 (or `ARCHIVE_PORT`); put an HTTPS reverse proxy in front for remote use. Railway needs a `/data` volume. The Render blueprint provisions a dedicated disk and generated token.
 
-Place the destination's token in an environment variable, then run:
+Place the destination's token in a private file (`chmod 600`, owned by you) or an environment variable, then run:
 
 ```sh
-bun run archive connect --url https://your-archive.example --project-id inixiative --token-env INIXIATIVE_ARCHIVE_TOKEN
+bun run archive connect --url https://your-archive.example --project-id inixiative --token-file ~/.local/share/archive/credentials/inixiative.token
 bun run archive routes
 bun run archive sync
 bun run archive sync --watch
 bun run archive search --remote --query 'migration'
 ```
 
-`setup` is an alias for `connect`. Setup verifies access before saving configuration and does not upload. The URL locates the server; the token grants access. Configuration stores only the environment variable name. Secrets must be available in the collector/sync process environment. Redirects are refused; only HTTPS or loopback HTTP is allowed.
+`setup` is an alias for `connect`. Setup verifies access before saving configuration and does not upload. The URL locates the server; the token grants access. Configuration stores only the token file path (`tokenFile`) or environment variable name (`--token-env`, `tokenEnv`), never the token. A token file is read on every request, so rotating it needs no restart; symlinks and files readable by group or others are refused. An environment variable must be set in the sync process environment. Redirects are refused; only HTTPS or loopback HTTP is allowed.
 
 `--home PATH`, `--store FILE` and `--config FILE` support custom paths. Keep the database with its source UUID when moving machines. Back up the entire database; a new store creates a new source identity.
+
+## Always-on local archiving
+
+`archive agents` declares long-running agents in `~/.local/share/archive/agents.json` and installs them as launchd agents (macOS) or systemd user units (Linux):
+
+```sh
+archive init
+archive connect --url https://your-archive.example --project-id inixiative --token-file ~/.local/share/archive/credentials/inixiative.token
+archive agents add-collector --name claude-code.inixiative --source claude-code --project-id inixiative --project-root ~/code/inixiative --worktrees
+archive agents add-collector --name codex.inixiative --source codex --project-id inixiative --project-root ~/code/inixiative --worktrees
+archive agents serve on
+archive agents sync on
+archive agents install
+archive agents status
+```
+
+`add-collector` upserts by `--name` (lowercase letters, digits, `.` and `-`); `--directory` defaults to `~/.claude/projects` or `~/.codex/sessions`, and `--project-root`, `--worktrees` and `--atlas` behave as for `collect`. `remove-collector --name N`, `serve on|off [--port P]` and `sync on|off` edit the same file. `install` writes one unit per agent: `com.inixiative.archive.local` (serve), `com.inixiative.archive.sync` (`sync --watch`) and `com.inixiative.archive.collect.<name>`. Each runs the current Bun with this package's own `src/cli.ts`, restarts on exit (30 second throttle), works in the archive home and logs to `logs/<label>.{out,err}.log` there. Re-running `install` reloads only changed or stopped units and removes Archive units no longer declared; other launchd agents are untouched. `uninstall` removes every Archive unit; `status` reports each unit's load state, PID and last log entry. One archive home per user account: units are named by agent, not by home. Sync reads destination token files itself, so no wrapper script is needed. Re-run `install` after upgrading the package if its install path changes.
+
+Docker Compose is the alternative for the server: `docker compose up -d` bind-mounts `./data` (or `ARCHIVE_DATA_DIR`) at `/data` and binds loopback port 4411. It is a separate store, so connect it as a destination and let the `sync` agent publish to it; do not bind-mount the store the host agents are writing, since SQLite locking across the Docker VM boundary is unreliable. Collectors run on the host, where the session histories are.
+
+`@inixiative/archive/agents` exports the pure pieces for integrations: `agentsConfigSchema`, `agentUnits`, `renderPlist`, `renderSystemdUnit` and `planAgents`, plus `installAgents`, `uninstallAgents` and `agentStatus` with an injectable command runner and supervisor directory.
 
 ## Connect through Kingdom
 
