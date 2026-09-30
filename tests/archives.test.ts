@@ -175,17 +175,14 @@ test('a pending upload and source identity survive closing and reopening the arc
   const original = new LocalArchiveStore(path);
   const sourceId = original.sourceId;
   const archive = original.capture(snapshot());
-  original.enqueue(archive.id, 'destination', { revision: 1, keepIds: ['keep-a'] });
+  original.enqueue(archive.id, 'destination', { revision: 1 });
   original.close();
   const reopened = new LocalArchiveStore(path);
   try {
     expect(reopened.sourceId).toBe(sourceId);
-    expect(reopened.pending(archive.id, 'destination')).toEqual({
-      revision: 1,
-      keepIds: ['keep-a'],
-    });
+    expect(reopened.pending(archive.id, 'destination')).toEqual({ revision: 1 });
     expect(reopened.read(archive.id, 1)?.digest).toBe(archive.digest);
-    reopened.delivered(archive.id, 'destination', archive.digest, '["keep-a"]');
+    reopened.delivered(archive.id, 'destination', archive.digest);
     expect(reopened.pending(archive.id, 'destination')).toBeNull();
     expect(reopened.receipt(archive.id, 'destination')).toBe(archive.digest);
   } finally {

@@ -126,21 +126,20 @@ export class LocalArchiveStore {
       )
       .run(id, destination, hash);
   }
-  pending(id: string, destination: string): { revision: number; keepIds: string[] } | null {
+  pending(id: string, destination: string): { revision: number } | null {
     const row = this.db
       .query('SELECT pending FROM outbox WHERE archive_id=? AND destination=?')
       .get(id, destination) as { pending: string } | null;
     return row ? JSON.parse(row.pending) : null;
   }
-  enqueue(id: string, destination: string, pending: { revision: number; keepIds: string[] }) {
+  enqueue(id: string, destination: string, pending: { revision: number }) {
     this.db
       .query('INSERT OR IGNORE INTO outbox VALUES (?, ?, ?)')
       .run(id, destination, JSON.stringify(pending));
   }
-  delivered(id: string, destination: string, hash: string, placement: string) {
+  delivered(id: string, destination: string, hash: string) {
     this.db.transaction(() => {
       this.acknowledge(id, destination, hash);
-      this.acknowledge(id, `${destination}:keeps`, placement);
       this.db.query('DELETE FROM outbox WHERE archive_id=? AND destination=?').run(id, destination);
     })();
   }
