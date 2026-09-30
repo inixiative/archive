@@ -43,7 +43,7 @@ Use `--source claude-code` for Claude histories. Collection matches the exact wo
 
 ## Connect to BYO hosting
 
-Deploy the included Dockerfile with a persistent volume mounted at `/data`, HTTPS, and a unique `ARCHIVE_SERVER_TOKEN` of at least 32 characters. Compose binds only to loopback; put an HTTPS reverse proxy in front for remote use. Railway needs a `/data` volume. The Render blueprint provisions a dedicated disk and generated token.
+Deploy the included Dockerfile with a persistent volume mounted at `/data`, HTTPS, and a unique `ARCHIVE_SERVER_TOKEN` of at least 32 characters. Compose bind-mounts `./data` (or `ARCHIVE_DATA_DIR`) at `/data`, so the store survives rebuilds, `down -v` and volume prunes, and binds only to loopback on port 4411 (or `ARCHIVE_PORT`); put an HTTPS reverse proxy in front for remote use. Railway needs a `/data` volume. The Render blueprint provisions a dedicated disk and generated token.
 
 Place the destination's token in an environment variable, then run:
 
