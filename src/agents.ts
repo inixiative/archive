@@ -357,7 +357,9 @@ function lastEntry(file: string) {
     const buffer = Buffer.alloc(Math.min(size, 65_536));
     readSync(fd, buffer, 0, buffer.length, size - buffer.length);
     const lines = buffer.toString('utf8').trimEnd().split('\n');
-    const start = lines.findLastIndex((line) => line === '{' || line === '[');
+    // Source ships to consumers compiled against older libs, so no findLastIndex.
+    let start = lines.length - 1;
+    while (start >= 0 && lines[start] !== '{' && lines[start] !== '[') start--;
     if (start >= 0)
       try {
         return JSON.stringify(JSON.parse(lines.slice(start).join('\n'))).slice(0, 500);
