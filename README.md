@@ -131,11 +131,11 @@ Filters are `projectId`, `source`, `tag`, `actorId`, `model`, `effort` and `refe
 
 ## Development
 
-Tests need Postgres with pgvector, by default the archive block's port:
+Tests create their own databases (`archive_test_*`) in the machine's Archive Postgres, so run `archive up` (or `docker compose up -d postgres`) first, or point `ARCHIVE_TEST_DATABASE_URL` at another pgvector Postgres:
 
 ```sh
-docker run -d --name archive-test-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=archive_test -p 127.0.0.1:6132:5432 pgvector/pgvector:pg17
-bun run check        # or set ARCHIVE_TEST_DATABASE_URL
+archive up
+bun run check
 ```
 
 Schema changes go in `prisma/schema.prisma` with a migration (`bunx prisma migrate dev --name <change>` against a development database).

@@ -3,7 +3,7 @@ import { ArchiveStore } from '../src/store';
 const base = new URL(
   process.env.ARCHIVE_TEST_DATABASE_URL ??
     // The archive block's Postgres port from @inixiative/config.
-    'postgresql://postgres:postgres@127.0.0.1:6132/archive_test',
+    'postgresql://archive:archive@127.0.0.1:6132/archive_test',
 );
 
 /** A test database per name, so stores (and their extensions) never share one. */
