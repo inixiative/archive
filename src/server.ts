@@ -23,6 +23,8 @@ const filterFields = {
   tag: z.string().min(1).max(120).optional(),
   actorId: z.string().min(1).max(256).optional(),
   reference: archiveReferenceSchema.optional(),
+  model: z.string().min(1).max(200).optional(),
+  effort: z.string().min(1).max(40).optional(),
   limit: z.number().int().min(1).max(100).default(20),
   beforeId: archiveId.optional(),
 };
@@ -132,6 +134,7 @@ export function createArchiveHandler(store: LocalArchiveStore, token: string) {
             title: a.title,
             projectId: a.projectId,
             actor: a.actor,
+            models: a.models,
             tags: a.tags,
             suggestedTags: a.suggestedTags,
             references: a.references,

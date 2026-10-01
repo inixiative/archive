@@ -113,7 +113,7 @@ The archive owns its tag system. It keeps two different things apart:
 bun run archive tag --id ARCHIVE_ID --tag reviewed --untag debugging
 ```
 
-Tag edits apply to that archive without a new revision, survive re-capture, and do not sync. Offered tags are defined archive-wide or for one actor. Each session can name its **actor**: a `user`, or a `service` such as an API-key run. An organization's archive mostly holds its members' work, filterable per person.
+Tag edits apply to that archive without a new revision, survive re-capture, and do not sync. Offered tags are defined archive-wide or for one actor. Each session can name its **actor**: a `user`, or a `service` such as an API-key run. An organization's archive mostly holds its members' work, filterable per person. Entries the model produced record its `model` and `effort` (from Claude Code assistant records and Codex turn context, per turn); listings summarize them per session as `models` and filter by `model` and `effort`.
 
 The **retention** setting (`retentionDays`, off by default) deletes archives whose latest capture is older than that, at server start and hourly. It deletes only from the archive it is set on; deletions never sync.
 
@@ -132,7 +132,7 @@ All data endpoints are `POST /api/v1/archive/<action>` with a JSON body and `Aut
 | `settings/read`, `settings/update` | `integrations?`, `retentionDays?` | settings |
 | `tags/list`, `tags/define`, `tags/remove` | `tag`, `actorId?`, `description?` | offered tags with usage counts |
 
-Filters are `projectId`, `source`, `tag`, `actorId` and `reference` (`{integration, ref}`). Jev integration is not enabled. Session content must not be sent to Jev without selecting that service for the relevant ownership boundary.
+Filters are `projectId`, `source`, `tag`, `actorId`, `model`, `effort` and `reference` (`{integration, ref}`). Jev integration is not enabled. Session content must not be sent to Jev without selecting that service for the relevant ownership boundary.
 
 ## Limits
 

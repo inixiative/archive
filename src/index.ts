@@ -11,6 +11,9 @@ export const archiveEntrySchema = z.strictObject({
   text: z.string().max(2_000_000),
   timestamp: z.number().finite().nonnegative().nullable(),
   sourceRef: z.string().min(1).max(512),
+  /** The model that produced the entry, and its effort level as the harness names it. */
+  model: z.string().min(1).max(200).optional(),
+  effort: z.string().min(1).max(40).optional(),
 });
 /** Who did the work: a person, or a service such as an API-key run. */
 export const archiveActorSchema = z.strictObject({

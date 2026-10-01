@@ -21,6 +21,8 @@ export function importTranscriptLines(
   const seen = new Map<string, string>();
   let index = -1;
   let contentBytes = 0;
+  // Codex states the model per turn; Claude Code per assistant record.
+  let turn: { model?: string; effort?: string } = {};
   for (const rawLine of lines) {
     index++;
     const line = rawLine.trim();
@@ -48,6 +50,15 @@ export function importTranscriptLines(
       if (sessionId && sessionId !== id) throw new Error('Mixed transcript sessions');
       sessionId = id;
     }
+    const text = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
+    if (options.source === 'codex' && row.type === 'turn_context')
+      turn = { model: text(row.payload?.model), effort: text(row.payload?.effort) };
+    const producer =
+      options.source === 'codex'
+        ? turn
+        : row.type === 'assistant'
+          ? { model: text(row.message?.model), effort: text(row.effort) }
+          : {};
     const timestamp = typeof row.timestamp === 'number' ? row.timestamp : Date.parse(row.timestamp);
     const add = (kind: ArchiveEntry['kind'], content: unknown, suffix: string, callId?: string) => {
       if (typeof content !== 'string' || !content.length) return;
@@ -71,6 +82,12 @@ export function importTranscriptLines(
         timestamp: Number.isFinite(timestamp) ? timestamp : null,
         sourceRef: `line:${index + 1}`,
         ...(callId ? { callId } : {}),
+        ...(['assistant', 'tool-call', 'reasoning-summary'].includes(kind)
+          ? {
+              ...(producer.model ? { model: producer.model } : {}),
+              ...(producer.effort ? { effort: producer.effort } : {}),
+            }
+          : {}),
       });
     };
     if (options.source === 'codex') {

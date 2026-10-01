@@ -49,6 +49,8 @@ export interface ArchiveFilter {
   tag?: string;
   actorId?: string;
   reference?: { integration: string; ref: string };
+  model?: string;
+  effort?: string;
 }
 
 export class LocalArchiveStore {
@@ -135,10 +137,23 @@ export class LocalArchiveStore {
       .get(id, revision) as { snapshot: string };
     const full = archiveSnapshotSchema.parse(JSON.parse(row.snapshot));
     const { entries, tags, ...snapshot } = full;
+    const models = new Map<string, { model: string; effort?: string; entries: number }>();
+    for (const entry of entries) {
+      if (!entry.model) continue;
+      const key = JSON.stringify([entry.model, entry.effort]);
+      const current = models.get(key) ?? {
+        model: entry.model,
+        ...(entry.effort ? { effort: entry.effort } : {}),
+        entries: 0,
+      };
+      current.entries++;
+      models.set(key, current);
+    }
     return {
       snapshot,
       capturedTags: tags,
       entries: entries.length,
+      models: [...models.values()],
       suggestedTags: suggestTags(full),
       references: archiveReferences(full, this.settings().integrations),
     };
@@ -154,7 +169,7 @@ export class LocalArchiveStore {
         summary = { ...this.summarize(id, revision), digest };
         this.summaries.set(id, summary);
       }
-      const { snapshot, references } = summary;
+      const { snapshot, references, models } = summary;
       const tags = this.tags(id, summary.capturedTags);
       const reference = filter.reference;
       if (
@@ -162,6 +177,11 @@ export class LocalArchiveStore {
         (filter.source && snapshot.source !== filter.source) ||
         (filter.tag && !tags.includes(filter.tag)) ||
         (filter.actorId && snapshot.actor?.id !== filter.actorId) ||
+        (filter.model && !models.some((m) => m.model === filter.model)) ||
+        (filter.effort &&
+          !models.some(
+            (m) => m.effort === filter.effort && (!filter.model || m.model === filter.model),
+          )) ||
         (reference &&
           !references.some(
             (r) => r.integration === reference.integration && r.ref === reference.ref,
@@ -176,6 +196,7 @@ export class LocalArchiveStore {
           ...snapshot,
           tags,
           entries: summary.entries,
+          models,
           suggestedTags: summary.suggestedTags,
           references,
         },
