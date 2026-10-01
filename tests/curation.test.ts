@@ -159,7 +159,7 @@ test('retention deletes expired archives with their edits and receipts; delete r
     const old = await store.capture(snapshot('old'));
     const fresh = await store.capture({ ...snapshot('fresh'), capturedAt: 10 * 86_400_000 });
     await store.tag(old.id, { add: ['x'] });
-    store.delivered(old.id, 'remote', old.digest);
+    await store.delivered(old.id, 'remote', old.digest);
     expect(await store.prune(10 * 86_400_000)).toEqual([]);
     await store.updateSettings({ retentionDays: 5 });
     expect(await store.prune(10 * 86_400_000)).toEqual([old.id]);
