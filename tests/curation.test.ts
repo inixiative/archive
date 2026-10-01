@@ -19,7 +19,7 @@ const snapshot = (sessionId: string, extra: Record<string, unknown> = {}) =>
       {
         id: 'e1',
         kind: 'user',
-        text: 'Ship JIRA-7 and https://github.com/inixiative/archive/pull/9',
+        text: 'Ship https://acme.atlassian.net/browse/JIRA-7 and https://github.com/inixiative/archive/pull/9',
         timestamp: 1,
         sourceRef: 'line:1',
       },
@@ -120,7 +120,7 @@ test('the archive owns its integrations: references follow settings, duplicates 
     ]);
     expect(defaults.retentionDays).toBeNull();
     const updated = await call(handler, 'settings/update', {
-      integrations: [{ key: 'jira', name: 'Jira', pattern: '\\b(JIRA-\\d+)\\b' }],
+      integrations: [{ key: 'jira', name: 'Jira', prefix: 'https://acme.atlassian.net/browse/' }],
     });
     expect(updated.body.data.retentionDays).toBeNull();
     expect(store.list()[0].references).toEqual([
@@ -136,7 +136,7 @@ test('the archive owns its integrations: references follow settings, duplicates 
     expect(
       (
         await call(handler, 'settings/update', {
-          integrations: [{ key: 'x', name: 'X', pattern: '(' }],
+          integrations: [{ key: 'x', name: 'X', prefix: 'ab' }],
         })
       ).status,
     ).toBe(400);

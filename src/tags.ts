@@ -6,24 +6,13 @@ export type TagSuggestion = { tag: string; origin: 'heuristic' };
 
 /**
  * An integration whose items sessions can reference. GitHub and Linear links are recognized
- * natively; any other integration supplies a pattern whose first group (or whole match) is the item.
+ * natively; any other integration names the link prefix of its items, and the item is what
+ * follows. A literal prefix keeps matching linear in the text, whatever settings say.
  */
 export const archiveIntegrationSchema = z.strictObject({
   key: z.string().regex(/^[a-z0-9-]{1,64}$/),
   name: z.string().min(1).max(100),
-  pattern: z
-    .string()
-    .min(1)
-    .max(500)
-    .refine((pattern) => {
-      try {
-        new RegExp(pattern, 'g');
-        return true;
-      } catch {
-        return false;
-      }
-    }, 'Invalid pattern')
-    .optional(),
+  prefix: z.string().min(3).max(300).optional(),
 });
 export type ArchiveIntegration = z.infer<typeof archiveIntegrationSchema>;
 
@@ -48,8 +37,13 @@ const nativeExtractors: Record<string, Extractor[]> = {
 };
 
 function extractors(integration: ArchiveIntegration): Extractor[] {
-  if (integration.pattern)
-    return [[new RegExp(integration.pattern, 'g'), (m) => (m[1] ?? m[0]).slice(0, 300)]];
+  if (integration.prefix)
+    return [
+      [
+        new RegExp(`${RegExp.escape(integration.prefix)}([\\w.~#/-]{1,300})`, 'g'),
+        (m) => m[1].replace(/[./]+$/, ''),
+      ],
+    ];
   return nativeExtractors[integration.key] ?? [];
 }
 

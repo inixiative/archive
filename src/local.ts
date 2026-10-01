@@ -124,16 +124,38 @@ export class LocalArchiveStore {
         }
       : undefined;
   }
+  /** Computed per revision: references and suggestions scan the whole transcript. */
+  private summaries = new Map<
+    string,
+    ReturnType<LocalArchiveStore['summarize']> & { digest: string }
+  >();
+  private summarize(id: string, revision: number) {
+    const row = this.db
+      .query('SELECT snapshot FROM revisions WHERE archive_id=? AND revision=?')
+      .get(id, revision) as { snapshot: string };
+    const full = archiveSnapshotSchema.parse(JSON.parse(row.snapshot));
+    const { entries, tags, ...snapshot } = full;
+    return {
+      snapshot,
+      capturedTags: tags,
+      entries: entries.length,
+      suggestedTags: suggestTags(full),
+      references: archiveReferences(full, this.settings().integrations),
+    };
+  }
   /** Archive metadata, newest first. Tags are the captured tags with this archive's edits applied. */
   list(filter: ArchiveFilter = {}) {
-    const { integrations } = this.settings();
-    return (
-      this.db.query('SELECT id FROM archives ORDER BY rowid DESC').all() as { id: string }[]
-    ).flatMap(({ id }) => {
-      const archive = this.read(id)!;
-      const { entries, tags: _, ...snapshot } = archive.snapshot;
-      const tags = this.tags(id, archive.snapshot.tags);
-      const references = archiveReferences(archive.snapshot, integrations);
+    const rows = this.db
+      .query('SELECT id, revision, digest FROM archives ORDER BY rowid DESC')
+      .all() as { id: string; revision: number; digest: string }[];
+    return rows.flatMap(({ id, revision, digest }) => {
+      let summary = this.summaries.get(id);
+      if (summary?.digest !== digest) {
+        summary = { ...this.summarize(id, revision), digest };
+        this.summaries.set(id, summary);
+      }
+      const { snapshot, references } = summary;
+      const tags = this.tags(id, summary.capturedTags);
       const reference = filter.reference;
       if (
         (filter.projectId && snapshot.projectId !== filter.projectId) ||
@@ -149,12 +171,12 @@ export class LocalArchiveStore {
       return [
         {
           id,
-          revision: archive.revision,
-          digest: archive.digest,
+          revision,
+          digest,
           ...snapshot,
           tags,
-          entries: entries.length,
-          suggestedTags: suggestTags(archive.snapshot),
+          entries: summary.entries,
+          suggestedTags: summary.suggestedTags,
           references,
         },
       ];
@@ -199,6 +221,7 @@ export class LocalArchiveStore {
     return this.db.transaction(() => {
       for (const table of ['tag_edits', 'receipts', 'outbox', 'revisions'])
         this.db.query(`DELETE FROM ${table} WHERE archive_id=?`).run(id);
+      this.summaries.delete(id);
       return this.db.query('DELETE FROM archives WHERE id=?').run(id).changes > 0;
     })();
   }
@@ -226,6 +249,7 @@ export class LocalArchiveStore {
         "INSERT INTO settings VALUES ('archive', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
       )
       .run(JSON.stringify(next));
+    this.summaries.clear();
     return next;
   }
   /** Offered tags with how many archives carry each; an actor sees archive-wide and their own. */

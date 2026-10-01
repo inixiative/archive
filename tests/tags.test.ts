@@ -50,13 +50,18 @@ test('linked pull requests, issues, commits and Linear issues become references,
   expect(archiveReferences(archive, defaultIntegrations, 1)).toHaveLength(1);
 });
 
-test("only the archive's integrations are referenced; others match their own pattern", () => {
+test("only the archive's integrations are referenced; others match their link prefix", () => {
   const archive = snapshot([
-    { kind: 'user', text: 'See JIRA-7, jira-8 and https://linear.app/x/issue/ARC-1/t' },
+    {
+      kind: 'user',
+      text: 'See https://acme.atlassian.net/browse/JIRA-7. and https://linear.app/x/issue/ARC-1/t',
+    },
   ]);
   archive.references = [{ integration: 'notion', ref: 'page' }];
   expect(
-    archiveReferences(archive, [{ key: 'jira', name: 'Jira', pattern: '\\b(JIRA-\\d+)\\b' }]),
+    archiveReferences(archive, [
+      { key: 'jira', name: 'Jira', prefix: 'https://acme.atlassian.net/browse/' },
+    ]),
   ).toEqual([{ integration: 'jira', ref: 'JIRA-7', recorded: false, mentions: 1 }]);
 });
 
