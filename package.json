@@ -18,7 +18,8 @@
     "./agents": "./src/agents.ts"
   },
   "files": [
-    "src"
+    "src",
+    "compose.yaml"
   ],
   "scripts": {
     "test": "bun test tests",

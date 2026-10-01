@@ -1,7 +1,9 @@
 services:
   - type: web
     name: archive
-    runtime: docker
+    runtime: image
+    image:
+      url: ghcr.io/inixiative/archive:latest
     plan: starter
     healthCheckPath: /health
     autoDeployTrigger: off

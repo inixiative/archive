@@ -29,7 +29,7 @@ bun run archive init
 bun run archive serve
 ```
 
-`init` creates a local database and a private `server.token` under `~/.local/share/archive`. It prints the token's file path, never its value. `serve` binds to loopback port 4411. The server requires bearer authentication for data endpoints; `/health` has no session data.
+`init` creates a local database and a private `server.token` under `~/.local/share/archive`. It prints the token's file path, never its value. `serve` binds to loopback port 4411; with `--sync` it also publishes to its destinations every 30 seconds from the same process. The server requires bearer authentication for data endpoints; `/health` has no session data.
 
 ```sh
 bun run archive preview --directory /path/to/history --source codex
@@ -43,7 +43,7 @@ Use `--source claude-code` for Claude histories. Collection matches the exact wo
 
 ## Connect to BYO hosting
 
-Deploy the included Dockerfile with a persistent volume mounted at `/data`, HTTPS, and a unique `ARCHIVE_SERVER_TOKEN` of at least 32 characters. Compose bind-mounts `./data` (or `ARCHIVE_DATA_DIR`) at `/data`, so the store survives rebuilds, `down -v` and volume prunes, and binds only to loopback on port 4411 (or `ARCHIVE_PORT`); put an HTTPS reverse proxy in front for remote use. Railway needs a `/data` volume. The Render blueprint provisions a dedicated disk and generated token.
+Every deployment runs the published image `ghcr.io/inixiative/archive` (tags: version, `latest`, commit SHA), built from main for amd64 and arm64. Give it a persistent volume at `/data`, HTTPS, and a unique `ARCHIVE_SERVER_TOKEN` of at least 32 characters; it needs nothing else and creates its store on first start. Compose (`compose.yaml`, also shipped in the npm package) bind-mounts `./data` (or `ARCHIVE_DATA_DIR`) at `/data`, so the store survives rebuilds, `down -v` and volume prunes, and binds only to loopback on port 4411 (or `ARCHIVE_PORT`); put an HTTPS reverse proxy in front for remote use. Pin a version with `ARCHIVE_VERSION`; build from a checkout with `docker compose -f compose.yaml -f compose.build.yaml up -d --build`. The Render blueprint runs the image with a dedicated disk and generated token. Railway deploys the image as a service with a `/data` volume (`railway.json` builds the Dockerfile when deploying from the repository instead).
 
 Place the destination's token in a private file (`chmod 600`, owned by you) or an environment variable, then run:
 
@@ -76,7 +76,7 @@ archive agents status
 
 `add-collector` upserts by `--name` (lowercase letters, digits, `.` and `-`); `--directory` defaults to `~/.claude/projects` or `~/.codex/sessions`, and `--project-root`, `--worktrees` and `--atlas` behave as for `collect`. `remove-collector --name N`, `serve on|off [--port P]` and `sync on|off` edit the same file. `install` writes one unit per agent: `com.inixiative.archive.local` (serve), `com.inixiative.archive.sync` (`sync --watch`) and `com.inixiative.archive.collect.<name>`. Each runs the current Bun with this package's own `src/cli.ts`, restarts on exit (30 second throttle), works in the archive home and logs to `logs/<label>.{out,err}.log` there. Re-running `install` reloads only changed or stopped units and removes Archive units no longer declared; other launchd agents are untouched. `uninstall` removes every Archive unit; `status` reports each unit's load state, PID and last log entry. One archive home per user account: units are named by agent, not by home. Sync reads destination token files itself, so no wrapper script is needed. Re-run `install` after upgrading the package if its install path changes.
 
-Docker Compose is the alternative for the server: `docker compose up -d` bind-mounts `./data` (or `ARCHIVE_DATA_DIR`) at `/data` and binds loopback port 4411. It is a separate store, so connect it as a destination and let the `sync` agent publish to it; do not bind-mount the store the host agents are writing, since SQLite locking across the Docker VM boundary is unreliable. Collectors run on the host, where the session histories are.
+Docker Compose is the alternative for the server: `docker compose up -d` runs `serve --sync`, so the container publishes to the destinations in its own `/data/destinations.json` (token files must live under `/data` too). It is a separate store from the host agents': connect it as a destination and let the `sync` agent publish to it; do not bind-mount the store the host agents are writing, since SQLite locking across the Docker VM boundary is unreliable. Collectors run on the host, where the session histories are.
 
 `@inixiative/archive/agents` exports the pure pieces for integrations: `agentsConfigSchema`, `agentUnits`, `renderPlist`, `renderSystemdUnit` and `planAgents`, plus `installAgents`, `uninstallAgents` and `agentStatus` with an injectable command runner and supervisor directory.
 
