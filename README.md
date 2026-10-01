@@ -4,79 +4,65 @@ MIT-licensed, local-first session storage for Claude Code, Codex and Foundry. Ru
 
 ## What runs today
 
-- Public transcript extraction, exact-project collection, immutable SQLite revisions, local lexical search and lossless text chunks.
-- A standalone authenticated HTTP server, Docker image, persistent Compose deployment, Railway configuration and a Render blueprint.
+- Public transcript extraction, exact-project collection, immutable revisions in Postgres (pgvector and pg_trgm enabled), lexical search and lossless text chunks.
+- An authenticated HTTP server, published image, Compose deployment with its own Postgres, Railway configuration and a Render blueprint.
+- An HTTP client the CLI, collectors and Foundry write through; only the server holds the database.
 - Multiple explicit destinations, durable publication receipts/outbox, conflict detection and retry after interruption.
-- Native Foundry capture and context retrieval; Kingdom's existing Archives browser, ownership and sharing APIs.
 
-This is an initial pilot, not a general multi-user standalone hosting service. Each standalone deployment is one ownership boundary with one access token. Kingdom supplies account-based sharing. Use distinct storage and credentials for personal and organization archives.
+Each deployment is one ownership boundary with one access token. Kingdom supplies account-based sharing. Use distinct deployments and credentials for personal and organization archives.
 
 ## Local setup
 
-Install Bun 1.4.2 or later, then install the published CLI:
+Run one Archive per machine with Docker Compose. It runs the published image with its own Postgres, on the `archive` block of the shared port registry (`bunx @inixiative/config ports archive`): HTTP on loopback 4700, Postgres on loopback 6132.
 
 ```sh
 bun add --global @inixiative/archive
-archive init
-archive serve
+archive up      # creates ~/.local/share/archive/server.token, then docker compose up
+archive down
 ```
 
-For development from source:
+`up` runs the `compose.yaml` that ships in the package (project `archive`) with `ARCHIVE_DATA_DIR` set to the archive home and the server token from its `server.token`. Postgres data lives in `$ARCHIVE_DATA_DIR/postgres` and the server's destinations in `$ARCHIVE_DATA_DIR/config`, so both survive rebuilds and volume prunes. Pin a version with `ARCHIVE_VERSION`; build from a checkout with `docker compose -f compose.yaml -f compose.build.yaml up -d --build`.
+
+The server applies its schema migrations on start and requires bearer authentication for data endpoints; `/health` has no session data. Every other command talks to it over HTTP at `--url` (default `http://127.0.0.1:4700`) with the token in `--token-file` (default `~/.local/share/archive/server.token`) or `ARCHIVE_TOKEN`:
 
 ```sh
-bun install
-bun run archive init
-bun run archive serve
+archive preview --directory /path/to/history --source codex
+archive import --file /path/to/session.jsonl --source codex --project-id inixiative --tag coding
+archive collect --directory /path/to/history --source codex --project-root /exact/session/cwd --project-id inixiative --watch
+archive list
+archive search --query 'migration'
 ```
 
-`init` creates a local database and a private `server.token` under `~/.local/share/archive`. It prints the token's file path, never its value. `serve` binds to loopback port 4411; with `--sync` it also publishes to its destinations every 30 seconds from the same process. The server requires bearer authentication for data endpoints; `/health` has no session data.
+Use `--source claude-code` for Claude histories. Collection matches the exact working-directory metadata recorded by the provider. Repeat `--project-root` to map several checkouts to one project; `--worktrees` also accepts every current git worktree of each root, re-read on each scan. Nested checkouts are separate mappings. Unknown directories, symlinks and sessions without usable metadata are skipped. Incomplete or changing files remain at source and retry on the next scan. The collector rescans files every 30 seconds; it deduplicates normalized content rather than maintaining byte-offset ingestion cursors. A watching collector waits out a server that is still starting.
 
-```sh
-bun run archive preview --directory /path/to/history --source codex
-bun run archive import --file /path/to/session.jsonl --source codex --project-id inixiative --tag coding
-bun run archive collect --directory /path/to/history --source codex --project-root /exact/session/cwd --project-id inixiative --watch
-bun run archive list
-bun run archive search --query 'migration'
-```
-
-Use `--source claude-code` for Claude histories. Collection matches the exact working-directory metadata recorded by the provider. Repeat `--project-root` to map several checkouts to one project; `--worktrees` also accepts every current git worktree of each root, re-read on each scan. Nested checkouts are separate mappings. Unknown directories, symlinks and sessions without usable metadata are skipped. Incomplete or changing files remain at source and retry on the next scan. The initial collector rescans files every 30 seconds; it deduplicates normalized content rather than maintaining byte-offset ingestion cursors. It keeps tags captured earlier. It does not upload: run sync separately.
+To run the server without Docker, point `DATABASE_URL` at a Postgres with the `vector` and `pg_trgm` extensions available and run `archive serve [--port 4700] [--sync]`. Set `ARCHIVE_DEBUG=1` to see the underlying error when a command fails.
 
 ## Connect to BYO hosting
 
-Every deployment runs the published image `ghcr.io/inixiative/archive` (tags: version, `latest`, commit SHA), built from main for amd64 and arm64. Give it a persistent volume at `/data`, HTTPS, and a unique `ARCHIVE_SERVER_TOKEN` of at least 32 characters; it needs nothing else and creates its store on first start. Compose (`compose.yaml`, also shipped in the npm package) bind-mounts `./data` (or `ARCHIVE_DATA_DIR`) at `/data`, so the store survives rebuilds, `down -v` and volume prunes, and binds only to loopback on port 4411 (or `ARCHIVE_PORT`); put an HTTPS reverse proxy in front for remote use. Pin a version with `ARCHIVE_VERSION`; build from a checkout with `docker compose -f compose.yaml -f compose.build.yaml up -d --build`. The Render blueprint runs the image with a dedicated disk and generated token. Railway deploys the image as a service with a `/data` volume (`railway.json` builds the Dockerfile when deploying from the repository instead).
+Every deployment runs the published image `ghcr.io/inixiative/archive` (tags: version, `latest`, commit SHA), built from main for amd64 and arm64, with `DATABASE_URL` pointing at Postgres 15 or later with pgvector, HTTPS in front, and a unique `ARCHIVE_SERVER_TOKEN` of at least 32 characters. It needs nothing else. The Render blueprint provisions the database, the image and a generated token together. On Railway, add a pgvector Postgres service and the image as a service with `DATABASE_URL` referencing it (`railway.json` builds the Dockerfile when deploying from the repository instead).
 
-Place the destination's token in a private file (`chmod 600`, owned by you) or an environment variable, then run:
+The local Archive publishes onward to destinations. Place the destination's token in a private file under the server's config directory (`chmod 600`, owned by you) or an environment variable, then run:
 
 ```sh
-bun run archive connect --url https://your-archive.example --project-id inixiative --token-file ~/.local/share/archive/credentials/inixiative.token
-bun run archive routes
-bun run archive sync
-bun run archive sync --watch
-bun run archive search --remote --query 'migration'
+archive connect --home ~/.local/share/archive/config --url https://your-archive.example --project-id inixiative --token-file ~/.local/share/archive/config/credentials/inixiative.token
+archive search --remote --home ~/.local/share/archive/config --query 'migration'
 ```
 
-`setup` is an alias for `connect`. Setup verifies access before saving configuration and does not upload. The URL locates the server; the token grants access. Configuration stores only the token file path (`tokenFile`) or environment variable name (`--token-env`, `tokenEnv`), never the token. A token file is read on every request, so rotating it needs no restart; symlinks and files readable by group or others are refused. An environment variable must be set in the sync process environment. Redirects are refused; only HTTPS or loopback HTTP is allowed.
-
-`--home PATH`, `--store FILE` and `--config FILE` support custom paths. Keep the database with its source UUID when moving machines. Back up the entire database; a new store creates a new source identity.
+`setup` is an alias for `connect`. Setup verifies access before saving `destinations.json` and does not upload; the Compose server (`serve --sync`) reads it and publishes every 30 seconds. `sync` and `routes` run the same publication, or preview it, once against `DATABASE_URL`. The URL locates the server; the token grants access. Configuration stores only the token file path (`tokenFile`) or environment variable name (`--token-env`, `tokenEnv`), never the token. A token file is read on every request, so rotating it needs no restart; symlinks and files readable by group or others are refused. Redirects are refused; only HTTPS or loopback HTTP is allowed.
 
 ## Always-on local archiving
 
-`archive agents` declares long-running agents in `~/.local/share/archive/agents.json` and installs them as launchd agents (macOS) or systemd user units (Linux):
+`archive agents` declares collectors in `~/.local/share/archive/agents.json` and installs them as launchd agents (macOS) or systemd user units (Linux). They run on the host, where the session histories are, and write to the local Archive server:
 
 ```sh
-archive init
-archive connect --url https://your-archive.example --project-id inixiative --token-file ~/.local/share/archive/credentials/inixiative.token
 archive agents add-collector --name claude-code.inixiative --source claude-code --project-id inixiative --project-root ~/code/inixiative --worktrees
 archive agents add-collector --name codex.inixiative --source codex --project-id inixiative --project-root ~/code/inixiative --worktrees
-archive agents serve on
-archive agents sync on
+archive agents server --url http://127.0.0.1:4700   # only when not the default
 archive agents install
 archive agents status
 ```
 
-`add-collector` upserts by `--name` (lowercase letters, digits, `.` and `-`); `--directory` defaults to `~/.claude/projects` or `~/.codex/sessions`, and `--project-root`, `--worktrees` and `--atlas` behave as for `collect`. `remove-collector --name N`, `serve on|off [--port P]` and `sync on|off` edit the same file. `install` writes one unit per agent: `com.inixiative.archive.local` (serve), `com.inixiative.archive.sync` (`sync --watch`) and `com.inixiative.archive.collect.<name>`. Each runs the current Bun with this package's own `src/cli.ts`, restarts on exit (30 second throttle), works in the archive home and logs to `logs/<label>.{out,err}.log` there. Re-running `install` reloads only changed or stopped units and removes Archive units no longer declared; other launchd agents are untouched. `uninstall` removes every Archive unit; `status` reports each unit's load state, PID and last log entry. One archive home per user account: units are named by agent, not by home. Sync reads destination token files itself, so no wrapper script is needed. Re-run `install` after upgrading the package if its install path changes.
-
-Docker Compose is the alternative for the server: `docker compose up -d` runs `serve --sync`, so the container publishes to the destinations in its own `/data/destinations.json` (token files must live under `/data` too). It is a separate store from the host agents': connect it as a destination and let the `sync` agent publish to it; do not bind-mount the store the host agents are writing, since SQLite locking across the Docker VM boundary is unreliable. Collectors run on the host, where the session histories are.
+`add-collector` upserts by `--name` (lowercase letters, digits, `.` and `-`); `--directory` defaults to `~/.claude/projects` or `~/.codex/sessions`, and `--project-root`, `--worktrees` and `--atlas` behave as for `collect`. `remove-collector --name N` and `server --url URL` edit the same file. `install` writes one unit per collector, `com.inixiative.archive.collect.<name>`. Each runs the current Bun with this package's own `src/cli.ts`, restarts on exit (30 second throttle), works in the archive home and logs to `logs/<label>.{out,err}.log` there. Re-running `install` reloads only changed or stopped units and removes Archive units no longer declared (including the retired `local` and `sync` units); other launchd agents are untouched. `uninstall` removes every Archive unit; `status` reports each unit's load state, PID and last log entry. Re-run `install` after upgrading the package if its install path changes.
 
 `@inixiative/archive/agents` exports the pure pieces for integrations: `agentsConfigSchema`, `agentUnits`, `renderPlist`, `renderSystemdUnit` and `planAgents`, plus `installAgents`, `uninstallAgents` and `agentStatus` with an injectable command runner and supervisor directory.
 
@@ -96,7 +82,7 @@ bun run archive connect --kind kingdom --url https://your-kingdom.example --conn
 
 Kingdom takes the owner from the runtime credential; `--owner-model`, `--organization-id` and `--space-id` narrow it to an organization or space that owner manages. A forwarding connection accepts only its bound `projectId`, and the hosted Archive's own token stays in Kingdom's server environment. A Kingdom runtime credential is distinct from a standalone Archive token. Kingdom retains responsibility for memberships, shares, revocation and hosted browsing.
 
-Foundry exposes the same commands through `bun run archive`. Its defaults remain `.foundry/archives/archives.sqlite` and `.foundry/archives.json`. Its durable journal capture automatically publishes matching projects once destination credentials are in the viewer's environment. Restart the viewer after changing destination configuration.
+Foundry writes its captures to the local Archive server through `@inixiative/archive/remote`.
 
 ## Routing
 
@@ -145,10 +131,14 @@ Filters are `projectId`, `source`, `tag`, `actorId`, `model`, `effort` and `refe
 
 ## Development
 
+Tests need Postgres with pgvector, by default the archive block's port:
+
 ```sh
-bun test
-bun run typecheck
+docker run -d --name archive-test-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=archive_test -p 127.0.0.1:6132:5432 pgvector/pgvector:pg17
+bun run check        # or set ARCHIVE_TEST_DATABASE_URL
 ```
+
+Schema changes go in `prisma/schema.prisma` with a migration (`bunx prisma migrate dev --name <change>` against a development database).
 
 See [provenance](docs/PROVENANCE.md), [license](LICENSE), and [goals](tickets/README.md). The historical tickets describe earlier scope; this implementation now includes explicit provider collection and authenticated standalone hosting.
 

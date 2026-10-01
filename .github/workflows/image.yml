@@ -2,9 +2,9 @@ name: image
 on:
   push:
     branches: [main]
-    paths: [src/**, Dockerfile, package.json, bun.lock, .github/workflows/image.yml]
+    paths: [src/**, prisma/**, Dockerfile, package.json, bun.lock, .github/workflows/image.yml]
   pull_request:
-    paths: [src/**, Dockerfile, package.json, bun.lock, .github/workflows/image.yml]
+    paths: [src/**, prisma/**, Dockerfile, package.json, bun.lock, .github/workflows/image.yml]
 permissions:
   contents: read
   packages: write

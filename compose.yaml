@@ -1,16 +1,37 @@
+# Ports are the archive block of @inixiative/config ports: HTTP 4700, Postgres 6132.
 services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: archive
+      POSTGRES_PASSWORD: ${ARCHIVE_POSTGRES_PASSWORD:-archive}
+      POSTGRES_DB: archive
+    ports:
+      - "127.0.0.1:${ARCHIVE_POSTGRES_PORT:-6132}:5432"
+    volumes:
+      - ${ARCHIVE_DATA_DIR:-./data}/postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "archive"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
   archive:
     image: ghcr.io/inixiative/archive:${ARCHIVE_VERSION:-latest}
     command: ["bun", "run", "src/cli.ts", "serve", "--home", "/data", "--hostname", "0.0.0.0", "--sync"]
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
-      - "127.0.0.1:${ARCHIVE_PORT:-4411}:4411"
+      - "127.0.0.1:${ARCHIVE_PORT:-4700}:4700"
     environment:
       ARCHIVE_SERVER_TOKEN: ${ARCHIVE_SERVER_TOKEN:?Set a unique random token of at least 32 characters}
+      DATABASE_URL: postgresql://archive:${ARCHIVE_POSTGRES_PASSWORD:-archive}@postgres:5432/archive
     volumes:
-      - ${ARCHIVE_DATA_DIR:-./data}:/data
+      - ${ARCHIVE_DATA_DIR:-./data}/config:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:4411/health').then(r=>{if(!r.ok)process.exit(1)})"]
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:4700/health').then(r=>{if(!r.ok)process.exit(1)})"]
       interval: 30s
       timeout: 5s
       retries: 3

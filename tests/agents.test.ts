@@ -30,6 +30,7 @@ import { runCli } from '../src/cli';
 import { archiveRequest } from '../src/client';
 import { archiveDestinationSchema, readTokenFile } from '../src/config';
 import { startArchiveServer } from '../src/server';
+import { freshStore, testDatabaseUrl } from './db';
 
 const dirs: string[] = [];
 const temp = () => {
@@ -50,7 +51,17 @@ const collector = {
   worktrees: true,
   atlas: true,
 };
-const config: AgentsConfig = { serve: {}, sync: true, collectors: [collector] };
+const codex = {
+  name: 'codex.kingdom',
+  source: 'codex' as const,
+  directory: '/Users/me/.codex/sessions',
+  projectId: 'kingdom',
+  projectRoots: ['/Users/me/code/kingdom'],
+};
+const config: AgentsConfig = {
+  server: { url: 'http://127.0.0.1:4700' },
+  collectors: [collector, codex],
+};
 const unitOptions = (home: string) => ({ home, execPath: '/bin/bun', cliPath: '/pkg/src/cli.ts' });
 
 function fakeRunner(
@@ -84,24 +95,15 @@ test('agents schema requires slug names, absolute paths and unique collectors', 
 test('units run this package CLI with the runtime and add --home only when non-default', () => {
   expect(packageCliPath()).toBe(join(import.meta.dir, '..', 'src', 'cli.ts'));
   const home = '/tmp/archive-home';
-  const units = agentUnits({ ...config, serve: { port: 4500 } }, unitOptions(home));
+  const units = agentUnits(config, unitOptions(home));
   expect(units.map((u) => u.label)).toEqual([
-    'com.inixiative.archive.local',
-    'com.inixiative.archive.sync',
     'com.inixiative.archive.collect.claude-code.kingdom',
+    'com.inixiative.archive.collect.codex.kingdom',
   ]);
-  expect(units[0]!.args).toEqual([
-    '/bin/bun',
-    '/pkg/src/cli.ts',
-    'serve',
-    '--port',
-    '4500',
-    '--home',
-    home,
-  ]);
-  expect(units[1]!.args.slice(2)).toEqual(['sync', '--watch', '--home', home]);
-  expect(units[2]!.args.slice(2)).toEqual([
+  expect(units[0]!.args.slice(2)).toEqual([
     'collect',
+    '--url',
+    'http://127.0.0.1:4700',
     '--directory',
     '/Users/me/.claude/projects',
     '--source',
@@ -118,18 +120,27 @@ test('units run this package CLI with the runtime and add --home only when non-d
     '--home',
     home,
   ]);
-  expect(units[2]!.stdout).toBe(
+  expect(units[0]!.stdout).toBe(
     `${home}/logs/com.inixiative.archive.collect.claude-code.kingdom.out.log`,
   );
-  expect(agentUnits({ serve: {}, collectors: [] }, unitOptions(defaultHome()))[0]!.args).toEqual([
+  expect(agentUnits({ collectors: [codex] }, unitOptions(defaultHome()))[0]!.args).toEqual([
     '/bin/bun',
     '/pkg/src/cli.ts',
-    'serve',
+    'collect',
+    '--directory',
+    '/Users/me/.codex/sessions',
+    '--source',
+    'codex',
+    '--project-root',
+    '/Users/me/code/kingdom',
+    '--project-id',
+    'kingdom',
+    '--watch',
   ]);
 });
 
 test('plist and systemd unit rendering', () => {
-  const [, , unit] = agentUnits(config, unitOptions('/tmp/h'));
+  const [unit] = agentUnits(config, unitOptions('/tmp/h'));
   const plist = renderPlist(unit!);
   expect(plist).toContain(
     '<key>Label</key>\n  <string>com.inixiative.archive.collect.claude-code.kingdom</string>',
@@ -163,18 +174,20 @@ test('planning writes changed units, keeps identical ones and removes only undec
   const plan = planAgents(
     units,
     [
-      { label: 'com.inixiative.archive.local', content: renderPlist(units[0]!) },
-      { label: 'com.inixiative.archive.sync', content: 'old' },
+      {
+        label: 'com.inixiative.archive.collect.claude-code.kingdom',
+        content: renderPlist(units[0]!),
+      },
+      { label: 'com.inixiative.archive.collect.codex.kingdom', content: 'old' },
       { label: 'com.inixiative.archive.collect.gone' },
       { label: 'com.inixiative.foundry' },
     ],
     'darwin',
     '/LA',
   );
-  expect(plan.unchanged).toEqual(['com.inixiative.archive.local']);
+  expect(plan.unchanged).toEqual(['com.inixiative.archive.collect.claude-code.kingdom']);
   expect(plan.write.map((w) => w.file)).toEqual([
-    '/LA/com.inixiative.archive.sync.plist',
-    '/LA/com.inixiative.archive.collect.claude-code.kingdom.plist',
+    '/LA/com.inixiative.archive.collect.codex.kingdom.plist',
   ]);
   expect(plan.remove).toEqual(['com.inixiative.archive.collect.gone']);
 });
@@ -187,7 +200,7 @@ test('launchd install writes plists, reloads with I/O error retry, prunes and un
   writeFileSync(join(dir, 'com.inixiative.foundry.plist'), 'other');
   let failures = 1;
   const { calls, run } = fakeRunner((argv) => {
-    if (argv[1] === 'bootstrap' && argv[3]!.endsWith('sync.plist') && failures-- > 0)
+    if (argv[1] === 'bootstrap' && argv[3]!.endsWith('codex.kingdom.plist') && failures-- > 0)
       return { code: 5, stderr: 'Bootstrap failed: 5: Input/output error' };
     if (argv[1] === 'print') return { stdout: 'state = running\n\tpid = 4242\n' };
     return {};
@@ -202,30 +215,34 @@ test('launchd install writes plists, reloads with I/O error retry, prunes and un
   };
   const result = installAgents(config, options);
   expect(result.removed).toEqual(['com.inixiative.archive.collect.gone']);
-  expect(result.loaded).toHaveLength(3);
+  expect(result.loaded).toHaveLength(2);
   expect(existsSync(join(dir, 'com.inixiative.archive.collect.gone.plist'))).toBe(false);
   expect(existsSync(join(dir, 'com.inixiative.foundry.plist'))).toBe(true);
-  expect(readFileSync(join(dir, 'com.inixiative.archive.sync.plist'), 'utf8')).toContain(
-    '<string>sync</string>',
-  );
+  expect(
+    readFileSync(join(dir, 'com.inixiative.archive.collect.codex.kingdom.plist'), 'utf8'),
+  ).toContain('<string>collect</string>');
   expect(existsSync(join(home, 'logs'))).toBe(true);
   const commands = calls.map((c) => c.slice(0, 3).join(' '));
   expect(commands[0]).toBe('launchctl bootout gui/501/com.inixiative.archive.collect.gone');
-  expect(commands.filter((c) => c === 'launchctl bootstrap gui/501')).toHaveLength(4);
-  expect(calls).toContainEqual(['launchctl', 'bootout', 'gui/501/com.inixiative.archive.sync']);
+  expect(commands.filter((c) => c === 'launchctl bootstrap gui/501')).toHaveLength(3);
+  expect(calls).toContainEqual([
+    'launchctl',
+    'bootout',
+    'gui/501/com.inixiative.archive.collect.codex.kingdom',
+  ]);
 
   calls.length = 0;
   const again = installAgents(config, options);
   expect(again).toMatchObject({ loaded: [], removed: [] });
-  expect(again.unchanged).toHaveLength(3);
+  expect(again.unchanged).toHaveLength(2);
   expect(calls.every((c) => c[1] === 'print')).toBe(true);
 
   writeFileSync(
-    join(home, 'logs', 'com.inixiative.archive.sync.out.log'),
+    join(home, 'logs', 'com.inixiative.archive.collect.codex.kingdom.out.log'),
     'one\n{\n  "imported": 1\n}\n',
   );
   const status = agentStatus(config, options);
-  expect(status.find((s) => s.label.endsWith('.sync'))).toMatchObject({
+  expect(status.find((s) => s.label.endsWith('.codex.kingdom'))).toMatchObject({
     declared: true,
     installed: true,
     loaded: true,
@@ -242,9 +259,9 @@ test('launchd install writes plists, reloads with I/O error retry, prunes and un
     }),
   ).toThrow('bootstrap failed');
 
-  expect(uninstallAgents(options).removed).toHaveLength(3);
+  expect(uninstallAgents(options).removed).toHaveLength(2);
   expect(existsSync(join(dir, 'com.inixiative.foundry.plist'))).toBe(true);
-  expect(existsSync(join(dir, 'com.inixiative.archive.local.plist'))).toBe(false);
+  expect(existsSync(join(dir, 'com.inixiative.archive.collect.codex.kingdom.plist'))).toBe(false);
 });
 
 test('systemd install reloads the daemon and enables units', () => {
@@ -254,19 +271,18 @@ test('systemd install reloads the daemon and enables units', () => {
     argv[2] === 'show' ? { stdout: 'ActiveState=active\nMainPID=7\n' } : {},
   );
   const options = { dir, run, platform: 'linux' as const, ...unitOptions(home) };
-  installAgents({ sync: true, collectors: [] }, options);
-  expect(existsSync(join(dir, 'com.inixiative.archive.sync.service'))).toBe(true);
+  const service = 'com.inixiative.archive.collect.codex.kingdom';
+  installAgents({ collectors: [codex] }, options);
+  expect(existsSync(join(dir, `${service}.service`))).toBe(true);
   expect(calls).toEqual([
     ['systemctl', '--user', 'daemon-reload'],
-    ['systemctl', '--user', 'enable', 'com.inixiative.archive.sync.service'],
-    ['systemctl', '--user', 'restart', 'com.inixiative.archive.sync.service'],
+    ['systemctl', '--user', 'enable', `${service}.service`],
+    ['systemctl', '--user', 'restart', `${service}.service`],
   ]);
   calls.length = 0;
-  expect(installAgents({ collectors: [] }, options).removed).toEqual([
-    'com.inixiative.archive.sync',
-  ]);
+  expect(installAgents({ collectors: [] }, options).removed).toEqual([service]);
   expect(calls).toEqual([
-    ['systemctl', '--user', 'disable', '--now', 'com.inixiative.archive.sync.service'],
+    ['systemctl', '--user', 'disable', '--now', `${service}.service`],
     ['systemctl', '--user', 'daemon-reload'],
   ]);
 });
@@ -313,12 +329,10 @@ test('agents CLI edits agents.json declaratively', async () => {
     '--project-root',
     '/w/archive',
   );
-  await cli('serve', 'on', '--port', '4500');
-  await cli('sync', 'on');
+  await cli('server', '--url', 'http://127.0.0.1:4799');
   const file = join(home, 'agents.json');
   expect(readAgents(file)).toEqual({
-    serve: { port: 4500 },
-    sync: true,
+    server: { url: 'http://127.0.0.1:4799' },
     collectors: [
       {
         name: 'claude',
@@ -338,11 +352,8 @@ test('agents CLI edits agents.json declaratively', async () => {
     ],
   });
   await cli('remove-collector', '--name', 'claude');
-  await cli('serve', 'off');
-  await cli('sync', 'off');
-  expect(readAgents(file)).toMatchObject({ sync: false, collectors: [{ name: 'codex.archive' }] });
-  expect(readAgents(file)!.serve).toBeUndefined();
-  await expect(cli('sync', 'maybe')).rejects.toThrow('on|off');
+  expect(readAgents(file)).toMatchObject({ collectors: [{ name: 'codex.archive' }] });
+  await expect(cli('server')).rejects.toThrow('--url');
   await expect(runCli(['agents', 'install', '--home', temp()])).rejects.toThrow('agents.json');
 });
 
@@ -368,7 +379,12 @@ test('token files: exactly one credential source, private regular file, read at 
   symlinkSync(file, link);
   expect(() => readTokenFile(link)).toThrow();
 
-  const instance = startArchiveServer({ store: ':memory:', token, port: 0 });
+  await freshStore('serve');
+  const instance = await startArchiveServer({
+    databaseUrl: testDatabaseUrl('serve'),
+    token,
+    port: 0,
+  });
   try {
     const destination = archiveDestinationSchema.parse({
       ...base,

@@ -1,13 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
-import {
-  archiveKey,
-  archiveReferenceSchema,
-  archiveSnapshotSchema,
-  selectChunks,
-  snapshotDigest,
-} from './index';
-import { archiveSettingsSchema, LocalArchiveStore, tagDefinitionSchema } from './local';
+import { archiveReferenceSchema, archiveSnapshotSchema, selectChunks } from './index';
+import { ArchiveConflict, ArchiveStore, archiveSettingsSchema, tagDefinitionSchema } from './store';
 
 const ingestSchema = z.strictObject({
   snapshot: archiveSnapshotSchema,
@@ -43,19 +37,8 @@ const tagSchema = z.strictObject({
 const tagListSchema = z.strictObject({ actorId: z.string().min(1).max(256).optional() });
 const tagRemoveSchema = tagDefinitionSchema.pick({ tag: true, actorId: true });
 
-/** Cursor paging over newest-first archives. */
-function page<T extends { id: string }>(items: T[], limit: number, beforeId?: string) {
-  const cursor = beforeId ? items.findIndex((item) => item.id === beforeId) : -1;
-  if (beforeId && cursor < 0) return undefined;
-  const slice = items.slice(cursor + 1, cursor + 1 + limit);
-  return {
-    items: slice,
-    nextCursor: items.length > cursor + 1 + slice.length ? (slice.at(-1)?.id ?? null) : null,
-  };
-}
-
 /** One deployment, one ownership boundary. No shared cross-tenant database or admin API. */
-export function createArchiveHandler(store: LocalArchiveStore, token: string) {
+export function createArchiveHandler(store: ArchiveStore, token: string) {
   if (token.length < 32)
     throw new Error('ARCHIVE_SERVER_TOKEN must contain at least 32 characters');
   const expected = Buffer.from(`Bearer ${token}`);
@@ -86,48 +69,53 @@ export function createArchiveHandler(store: LocalArchiveStore, token: string) {
         chunks.push(item.value);
       }
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      if (path === '/api/v1/archive/info') {
+        z.strictObject({}).parse(body);
+        return json({ data: { sourceId: await store.sourceId(), protocol: 2 } });
+      }
       if (path === '/api/v1/archive/ingest') {
         const { snapshot, previousDigest } = ingestSchema.parse(body);
-        const id = archiveKey(snapshot),
-          old = store.read(id),
-          next = snapshotDigest(snapshot);
-        if (old?.digest !== next && (old?.digest ?? null) !== previousDigest)
-          return json({ error: 'Revision conflict' }, 409);
-        if (old && old.digest !== next && old.snapshot.capturedAt > snapshot.capturedAt)
-          return json({ error: 'Stale capture' }, 409);
-        return json({ data: store.capture(snapshot) });
+        return json({ data: await store.capture(snapshot, { previousDigest }) });
+      }
+      if (path === '/api/v1/archive/head') {
+        const head = await store.head(readSchema.pick({ archiveId: true }).parse(body).archiveId);
+        return head ? json({ data: head }) : json({ error: 'Archive unavailable' }, 404);
       }
       if (path === '/api/v1/archive/read') {
         const input = readSchema.parse(body),
-          archive = store.read(input.archiveId, input.revision);
+          archive = await store.read(input.archiveId, input.revision);
         return archive ? json({ data: archive }) : json({ error: 'Archive unavailable' }, 404);
       }
       if (path === '/api/v1/archive/list') {
         const { limit, beforeId, ...filter } = listSchema.parse(body);
-        const result = page(store.list(filter), limit, beforeId);
+        const result = await store.page(filter, limit, beforeId);
         if (!result) return json({ error: 'Invalid cursor' }, 400);
         return json({ data: { archives: result.items, nextCursor: result.nextCursor } });
       }
       if (path === '/api/v1/archive/search') {
         const { query, budget, limit, beforeId, ...filter } = searchSchema.parse(body);
-        let remaining = budget;
-        const matching = store
-          .list(filter)
-          .filter(
-            (a) =>
-              !query ||
-              selectChunks(store.read(a.id)!.chunks, query, budget).matchingChunks > 0 ||
-              [a.title, ...a.tags].some((text) => text.toLowerCase().includes(query.toLowerCase())),
+        const lower = query.toLowerCase();
+        const result = await store.page(filter, limit, beforeId, async (listings) => {
+          if (!query) return new Set(listings.map((a) => a.id));
+          const hits = await store.matching(
+            listings.map((a) => a.id),
+            query,
           );
-        const result = page(matching, limit, beforeId);
+          for (const a of listings)
+            if ([a.title, ...a.tags].some((text) => text.toLowerCase().includes(lower)))
+              hits.add(a.id);
+          return hits;
+        });
         if (!result) return json({ error: 'Invalid cursor' }, 400);
-        const archives = result.items.map((a) => {
+        let remaining = budget;
+        const archives = [];
+        for (const a of result.items) {
           const selected =
             remaining >= 16
-              ? selectChunks(store.read(a.id)!.chunks, query, remaining)
+              ? selectChunks((await store.read(a.id))!.chunks, query, remaining)
               : { chunks: [], tokenCount: 0 };
           remaining -= selected.tokenCount;
-          return {
+          archives.push({
             archiveId: a.id,
             revision: a.revision,
             digest: a.digest,
@@ -140,37 +128,43 @@ export function createArchiveHandler(store: LocalArchiveStore, token: string) {
             references: a.references,
             coverage: a.coverage,
             ...selected,
-          };
-        });
+          });
+        }
         return json({
           data: { archives, tokenCount: budget - remaining, nextCursor: result.nextCursor },
         });
       }
       if (path === '/api/v1/archive/tag') {
         const input = tagSchema.parse(body);
-        if (!store.read(input.archiveId)) return json({ error: 'Archive unavailable' }, 404);
-        return json({ data: store.tag(input.archiveId, input) });
+        if (!(await store.read(input.archiveId)))
+          return json({ error: 'Archive unavailable' }, 404);
+        return json({ data: await store.tag(input.archiveId, input) });
       }
       if (path === '/api/v1/archive/delete') {
         const input = readSchema.pick({ archiveId: true }).parse(body);
-        return store.delete(input.archiveId)
+        return (await store.delete(input.archiveId))
           ? json({ data: { archiveId: input.archiveId, deleted: true } })
           : json({ error: 'Archive unavailable' }, 404);
       }
       if (path === '/api/v1/archive/settings/read') {
         z.strictObject({}).parse(body);
-        return json({ data: store.settings() });
+        return json({ data: await store.settings() });
       }
       if (path === '/api/v1/archive/settings/update')
-        return json({ data: store.updateSettings(archiveSettingsSchema.partial().parse(body)) });
+        return json({
+          data: await store.updateSettings(archiveSettingsSchema.partial().parse(body)),
+        });
       if (path === '/api/v1/archive/tags/list')
-        return json({ data: { tags: store.tagDefinitions(tagListSchema.parse(body).actorId) } });
+        return json({
+          data: { tags: await store.tagDefinitions(tagListSchema.parse(body).actorId) },
+        });
       if (path === '/api/v1/archive/tags/define')
-        return json({ data: store.defineTag(tagDefinitionSchema.parse(body)) });
+        return json({ data: await store.defineTag(tagDefinitionSchema.parse(body)) });
       if (path === '/api/v1/archive/tags/remove')
-        return json({ data: { removed: store.undefineTag(tagRemoveSchema.parse(body)) } });
+        return json({ data: { removed: await store.undefineTag(tagRemoveSchema.parse(body)) } });
       return json({ error: 'Not found' }, 404);
     } catch (error) {
+      if (error instanceof ArchiveConflict) return json({ error: error.message }, 409);
       if (error instanceof z.ZodError || error instanceof SyntaxError)
         return json({ error: 'Invalid archive request' }, 400);
       return json({ error: 'Archive operation failed' }, 500);
@@ -178,20 +172,20 @@ export function createArchiveHandler(store: LocalArchiveStore, token: string) {
   };
 }
 
-export function startArchiveServer(options: {
-  store: string;
+export async function startArchiveServer(options: {
+  databaseUrl: string;
   token: string;
   port?: number;
   hostname?: string;
 }) {
-  const store = new LocalArchiveStore(options.store);
-  // Retention runs at start and hourly; it only ever deletes from this archive.
-  store.prune();
-  const retention = setInterval(() => store.prune(), 3_600_000);
-  retention.unref();
+  const store = new ArchiveStore(options.databaseUrl);
   try {
+    // Retention runs at start and hourly; it only ever deletes from this archive.
+    await store.prune();
+    const retention = setInterval(() => void store.prune().catch(() => {}), 3_600_000);
+    retention.unref();
     const server = Bun.serve({
-      port: options.port ?? 4411,
+      port: options.port ?? 4700,
       hostname: options.hostname ?? '127.0.0.1',
       maxRequestBodySize: 65_000_000,
       fetch: createArchiveHandler(store, options.token),
@@ -202,12 +196,11 @@ export function startArchiveServer(options: {
       async close() {
         clearInterval(retention);
         await server.stop(true);
-        store.close();
+        await store.close();
       },
     };
   } catch (error) {
-    clearInterval(retention);
-    store.close();
+    await store.close();
     throw error;
   }
 }

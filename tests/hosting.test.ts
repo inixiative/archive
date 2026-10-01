@@ -7,8 +7,9 @@ import { runCli } from '../src/cli';
 import { publishArchive, routingPreview, syncArchives } from '../src/client';
 import { type ArchiveDestination, connectDestination, readDestinations } from '../src/config';
 import { archiveSnapshotSchema } from '../src/index';
-import { LocalArchiveStore } from '../src/local';
 import { createArchiveHandler, startArchiveServer } from '../src/server';
+import { ArchiveStore } from '../src/store';
+import { freshStore, testDatabaseUrl } from './db';
 
 const captureResponse = z.object({
   data: z.object({ id: z.string(), digest: z.string(), revision: z.number() }),
@@ -51,7 +52,7 @@ const request = (action: string, body: unknown, auth = token) =>
   });
 
 test('hosted auth, immutable revisions, concurrent-write conflicts and bounded search', async () => {
-  const store = new LocalArchiveStore(':memory:');
+  const store = await freshStore();
   const handler = createArchiveHandler(store, token);
   try {
     expect((await handler(request('search', {}, 'wrong'))).status).toBe(401);
@@ -113,27 +114,34 @@ test('hosted auth, immutable revisions, concurrent-write conflicts and bounded s
     ).toHaveLength(2);
     expect((await handler(request('search', { connectionId: 'not-standalone' }))).status).toBe(400);
   } finally {
-    store.close();
   }
 });
 
 test('three destinations stay isolated; tags never authorize a destination; unknown projects remain local', async () => {
-  const local = new LocalArchiveStore(':memory:');
-  const instances = ['personal', 'inixiative', 'userevidence'].map((projectId) => ({
-    projectId,
-    instance: startArchiveServer({ store: ':memory:', token, port: 0 }),
-  }));
+  const local = await freshStore();
+  const instances = [];
+  for (const projectId of ['personal', 'inixiative', 'userevidence'] as const) {
+    await freshStore(projectId);
+    instances.push({
+      projectId,
+      instance: await startArchiveServer({
+        databaseUrl: testDatabaseUrl(projectId),
+        token,
+        port: 0,
+      }),
+    });
+  }
   process.env.ARCHIVE_ROUTING_TEST_TOKEN = token;
   try {
     for (const projectId of ['personal', 'inixiative', 'userevidence', 'unknown'])
-      local.capture(snapshot(projectId, projectId));
+      await local.capture(snapshot(projectId, projectId));
     const destinations: ArchiveDestination[] = instances.map(({ projectId, instance }) => ({
       projectId,
       kind: 'archive',
       url: instance.server.url.href,
       tokenEnv: 'ARCHIVE_ROUTING_TEST_TOKEN',
     }));
-    const routes = routingPreview(local, destinations);
+    const routes = await routingPreview(local, destinations);
     expect(routes.find((r) => r.projectId === 'unknown')?.destinations).toHaveLength(0);
     expect(routes.find((r) => r.projectId === 'inixiative')?.destinations).toHaveLength(1);
     expect((await syncArchives(local, destinations)).map((r) => r.status)).toEqual([
@@ -142,21 +150,19 @@ test('three destinations stay isolated; tags never authorize a destination; unkn
       'published',
     ]);
     for (const { projectId, instance } of instances)
-      expect(instance.store.list().map((a) => a.projectId)).toEqual([projectId]);
+      expect((await instance.store.list()).map((a) => a.projectId)).toEqual([projectId]);
     expect((await syncArchives(local, destinations)).every((r) => r.status === 'unchanged')).toBe(
       true,
     );
   } finally {
-    local.close();
     delete process.env.ARCHIVE_ROUTING_TEST_TOKEN;
     for (const { instance } of instances) await instance.close();
   }
 });
 
 test('lost acknowledgement replays old revision before new content after client and server restart', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'archive-restart-'));
-  let local = new LocalArchiveStore(join(dir, 'local.sqlite'));
-  let remote = new LocalArchiveStore(join(dir, 'remote.sqlite'));
+  let local = await freshStore();
+  let remote = await freshStore('remote');
   process.env.ARCHIVE_RESTART_TEST_TOKEN = token;
   const destination: ArchiveDestination = {
     kind: 'archive',
@@ -165,35 +171,37 @@ test('lost acknowledgement replays old revision before new content after client 
     tokenEnv: 'ARCHIVE_RESTART_TEST_TOKEN',
   };
   try {
-    const first = local.capture(snapshot());
+    const first = await local.capture(snapshot());
     let handler = createArchiveHandler(remote, token);
     const lost = (async (url: any, options: any) => {
       await handler(new Request(url, options));
       throw new Error('lost ack');
     }) as unknown as typeof fetch;
     await expect(publishArchive(local, first.id, destination, lost)).rejects.toThrow('lost ack');
-    local.capture({ ...snapshot(), title: 'Second', capturedAt: 2 });
-    local.close();
-    remote.close();
-    local = new LocalArchiveStore(join(dir, 'local.sqlite'));
-    remote = new LocalArchiveStore(join(dir, 'remote.sqlite'));
+    await local.capture({ ...snapshot(), title: 'Second', capturedAt: 2 });
+    local = new ArchiveStore(testDatabaseUrl('main'));
+    remote = new ArchiveStore(testDatabaseUrl('remote'));
     handler = createArchiveHandler(remote, token);
     await publishArchive(local, first.id, destination, ((url: any, options: any) =>
       handler(new Request(url, options))) as typeof fetch);
-    expect(remote.read(first.id)?.revision).toBe(2);
-    expect(remote.read(first.id, 1)?.snapshot.title).toBe('Routing test');
-    expect(remote.read(first.id)?.snapshot.title).toBe('Second');
+    expect((await remote.read(first.id))?.revision).toBe(2);
+    expect((await remote.read(first.id, 1))?.snapshot.title).toBe('Routing test');
+    expect((await remote.read(first.id))?.snapshot.title).toBe('Second');
   } finally {
-    local.close();
-    remote.close();
+    await local.close();
+    await remote.close();
     delete process.env.ARCHIVE_RESTART_TEST_TOKEN;
-    rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test('connect validates credentials before changing configuration and repeated setup is idempotent', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'archive-connect-'));
-  const instance = startArchiveServer({ store: ':memory:', token, port: 0 });
+  await freshStore('serve');
+  const instance = await startArchiveServer({
+    databaseUrl: testDatabaseUrl('serve'),
+    token,
+    port: 0,
+  });
   const config = join(dir, 'destinations.json');
   const args = [
     'connect',
@@ -232,10 +240,10 @@ test('connect validates credentials before changing configuration and repeated s
 });
 
 test('hosted tag filtering matches exact explicit tags, not transcript mentions', async () => {
-  const store = new LocalArchiveStore(':memory:');
+  const store = await freshStore();
   try {
-    store.capture({ ...snapshot('inixiative', 'tagged'), tags: ['Agentic'] });
-    store.capture({
+    await store.capture({ ...snapshot('inixiative', 'tagged'), tags: ['Agentic'] });
+    await store.capture({
       ...snapshot('inixiative', 'mentioned'),
       tags: ['Governance'],
       title: 'Agentic discussion',
@@ -250,18 +258,17 @@ test('hosted tag filtering matches exact explicit tags, not transcript mentions'
     );
     expect(other.data.archives).toHaveLength(0);
   } finally {
-    store.close();
   }
 });
 
 test('Kingdom destinations name an owner and optional forwarding connection', async () => {
-  const local = new LocalArchiveStore(':memory:');
-  const id = local.capture(snapshot()).id;
+  const local = await freshStore();
+  const id = (await local.capture(snapshot())).id;
   const sent: { path: string; body: any }[] = [];
   const kingdom = (async (url: any, options: any) => {
     const body = JSON.parse(options.body);
     sent.push({ path: new URL(url).pathname, body });
-    return Response.json({ data: { digest: local.read(id)!.digest } });
+    return Response.json({ data: { digest: (await local.read(id))!.digest } });
   }) as unknown as typeof fetch;
   const destination = (fields: object) =>
     ({
@@ -297,7 +304,7 @@ test('Kingdom destinations name an owner and optional forwarding connection', as
       'snapshot',
     ]);
     expect(
-      routingPreview(local, [destination({ connectionId: 'inixiative' })])[0]
+      (await routingPreview(local, [destination({ connectionId: 'inixiative' })]))[0]
         .destinations as unknown,
     ).toEqual([{ kind: 'kingdom', url: 'https://kingdom.example/', connectionId: 'inixiative' }]);
     await expect(
@@ -308,7 +315,6 @@ test('Kingdom destinations name an owner and optional forwarding connection', as
       'credential unavailable',
     );
   } finally {
-    local.close();
     delete process.env.KINGDOM_TEST_RUNTIME;
   }
 });

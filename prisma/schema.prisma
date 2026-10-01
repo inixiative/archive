@@ -1,0 +1,125 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector, pg_trgm]
+}
+
+/// Archive-wide values: the source identity, and the settings (integrations, retention).
+model Setting {
+  key   String @id
+  value Json
+
+  @@map("settings")
+}
+
+/// One session. `summary` is its listing (snapshot metadata, tags as captured, models,
+/// references, suggestions), recomputed on capture and when settings change.
+model Archive {
+  id         String @id
+  /// Insertion order: listings are newest first.
+  seq        BigInt @unique @default(autoincrement())
+  digest     String
+  revision   Int
+  source     String
+  projectId  String?
+  actorId    String?
+  capturedAt Float
+  summary    Json
+
+  revisions Revision[]
+  tagEdits  TagEdit[]
+  receipts  Receipt[]
+  outbox    Outbox[]
+
+  @@index([projectId])
+  @@index([actorId])
+  @@map("archives")
+}
+
+/// An immutable revision of a session.
+model Revision {
+  archiveId String
+  revision  Int
+  digest    String
+  snapshot  Json
+
+  archive Archive @relation(fields: [archiveId], references: [id], onDelete: Cascade)
+  chunks  Chunk[]
+
+  @@id([archiveId, revision])
+  @@map("revisions")
+}
+
+/// Lossless text chunks of a revision, in order, for search.
+model Chunk {
+  archiveId  String
+  revision   Int
+  position   Int
+  id         String
+  entryId    String
+  sourceRef  String
+  kind       String
+  start      Int
+  end        Int
+  text       String
+  tokenCount Int
+  /// Reserved for semantic search; nothing writes it yet.
+  embedding  Unsupported("vector(1536)")?
+
+  revisionRef Revision @relation(fields: [archiveId, revision], references: [archiveId, revision], onDelete: Cascade)
+
+  @@id([archiveId, revision, position])
+  @@index([text(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@map("chunks")
+}
+
+/// A tag added (added = true) or removed from what the session was captured with.
+model TagEdit {
+  archiveId String
+  tag       String
+  added     Boolean
+
+  archive Archive @relation(fields: [archiveId], references: [id], onDelete: Cascade)
+
+  @@id([archiveId, tag])
+  @@map("tag_edits")
+}
+
+/// A tag this archive offers: archive-wide (actorId "") or for one actor.
+model TagDefinition {
+  actorId     String
+  tag         String
+  description String?
+
+  @@id([actorId, tag])
+  @@map("tag_definitions")
+}
+
+/// The digest a destination last acknowledged.
+model Receipt {
+  archiveId   String
+  destination String
+  digest      String
+
+  archive Archive @relation(fields: [archiveId], references: [id], onDelete: Cascade)
+
+  @@id([archiveId, destination])
+  @@map("receipts")
+}
+
+/// A revision queued for a destination.
+model Outbox {
+  archiveId   String
+  destination String
+  revision    Int
+
+  archive Archive @relation(fields: [archiveId], references: [id], onDelete: Cascade)
+
+  @@id([archiveId, destination])
+  @@map("outbox")
+}

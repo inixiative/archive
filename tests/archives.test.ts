@@ -1,10 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { importTranscript } from '../src/import';
 import { archiveSnapshotSchema, chunkArchive, selectChunks, snapshotDigest } from '../src/index';
-import { LocalArchiveStore } from '../src/local';
+import { ArchiveStore } from '../src/store';
+import { freshStore, testDatabaseUrl } from './db';
 
 const snapshot = () =>
   archiveSnapshotSchema.parse({
@@ -42,22 +40,18 @@ describe('session archives', () => {
     for (const chunk of small.chunks)
       expect(s.entries[0].text.slice(chunk.start, chunk.end)).toBe(chunk.text);
   });
-  test('capture is idempotent, retains prior versions and rejects older replacements', () => {
-    const store = new LocalArchiveStore(':memory:');
-    try {
-      const s = snapshot(),
-        first = store.capture(s);
-      expect(store.capture({ ...s, capturedAt: 2 }).changed).toBe(false);
-      const edited = { ...s, title: 'Changed', capturedAt: 3 };
-      expect(store.capture(edited).revision).toBe(2);
-      expect(store.read(first.id, 1)?.snapshot.title).toBe(s.title);
-      expect(() => store.capture({ ...s, capturedAt: 2 })).toThrow('Older capture');
-      expect(store.receipt(first.id, 'destination')).toBeNull();
-      store.acknowledge(first.id, 'destination', snapshotDigest(edited));
-      expect(store.receipt(first.id, 'destination')).toBe(snapshotDigest(edited));
-    } finally {
-      store.close();
-    }
+  test('capture is idempotent, retains prior versions and rejects older replacements', async () => {
+    const store = await freshStore();
+    const s = snapshot(),
+      first = await store.capture(s);
+    expect((await store.capture({ ...s, capturedAt: 2 })).changed).toBe(false);
+    const edited = { ...s, title: 'Changed', capturedAt: 3 };
+    expect((await store.capture(edited)).revision).toBe(2);
+    expect((await store.read(first.id, 1))?.snapshot.title).toBe(s.title);
+    expect(store.capture({ ...s, capturedAt: 2 })).rejects.toThrow('Stale capture');
+    expect(await store.receipt(first.id, 'destination')).toBeNull();
+    await store.delivered(first.id, 'destination', snapshotDigest(edited));
+    expect(await store.receipt(first.id, 'destination')).toBe(snapshotDigest(edited));
   });
   test('Codex imports public messages, tool results and summaries once, without private payloads', () => {
     const lines = [
@@ -169,25 +163,21 @@ describe('session archives', () => {
   });
 });
 
-test('a pending upload and source identity survive closing and reopening the archive store', () => {
-  const directory = mkdtempSync(join(tmpdir(), 'archive-outbox-test-'));
-  const path = join(directory, 'archives.sqlite');
-  const original = new LocalArchiveStore(path);
-  const sourceId = original.sourceId;
-  const archive = original.capture(snapshot());
-  original.enqueue(archive.id, 'destination', { revision: 1 });
-  original.close();
-  const reopened = new LocalArchiveStore(path);
+test('a pending upload and source identity survive reconnecting to the database', async () => {
+  const original = await freshStore();
+  const sourceId = await original.sourceId();
+  const archive = await original.capture(snapshot());
+  await original.enqueue(archive.id, 'destination', { revision: 1 });
+  const reopened = new ArchiveStore(testDatabaseUrl('main'));
   try {
-    expect(reopened.sourceId).toBe(sourceId);
-    expect(reopened.pending(archive.id, 'destination')).toEqual({ revision: 1 });
-    expect(reopened.read(archive.id, 1)?.digest).toBe(archive.digest);
-    reopened.delivered(archive.id, 'destination', archive.digest);
-    expect(reopened.pending(archive.id, 'destination')).toBeNull();
-    expect(reopened.receipt(archive.id, 'destination')).toBe(archive.digest);
+    expect(await reopened.sourceId()).toBe(sourceId);
+    expect(await reopened.pending(archive.id, 'destination')).toEqual({ revision: 1 });
+    expect((await reopened.read(archive.id, 1))?.digest).toBe(archive.digest);
+    await reopened.delivered(archive.id, 'destination', archive.digest);
+    expect(await reopened.pending(archive.id, 'destination')).toBeNull();
+    expect(await reopened.receipt(archive.id, 'destination')).toBe(archive.digest);
   } finally {
-    reopened.close();
-    rmSync(directory, { recursive: true, force: true });
+    await reopened.close();
   }
 });
 

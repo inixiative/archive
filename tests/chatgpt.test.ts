@@ -1,10 +1,10 @@
 import { expect, test } from 'bun:test';
 import { importChatGPTThread } from '../src/chatgpt';
-import { LocalArchiveStore } from '../src/local';
 import { createArchiveHandler } from '../src/server';
+import { freshStore } from './db';
 
 test('ChatGPT reader export preserves source, chronology, tags and partial coverage through hosted ingest', async () => {
-  const store = new LocalArchiveStore(':memory:');
+  const store = await freshStore();
   try {
     const snapshot = importChatGPTThread(
       {
@@ -27,7 +27,7 @@ test('ChatGPT reader export preserves source, chronology, tags and partial cover
           },
         ],
       },
-      { sourceId: store.sourceId, projectId: 'personal' },
+      { sourceId: await store.sourceId(), projectId: 'personal' },
     );
     expect(snapshot.entries.map((e) => e.text)).toEqual(['Question', 'Answer']);
     expect(snapshot.entries[0]?.timestamp).toBe(1000);
@@ -44,11 +44,9 @@ test('ChatGPT reader export preserves source, chronology, tags and partial cover
       }),
     );
     expect(response.status).toBe(200);
-    expect(store.list()[0]?.tags).toEqual(['personal']);
-    expect(() =>
-      importChatGPTThread({ thread: { kind: 'codex' } }, { sourceId: store.sourceId }),
-    ).toThrow();
+    expect((await store.list())[0]?.tags).toEqual(['personal']);
+    const sourceId = await store.sourceId();
+    expect(() => importChatGPTThread({ thread: { kind: 'codex' } }, { sourceId })).toThrow();
   } finally {
-    store.close();
   }
 });

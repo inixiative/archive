@@ -2,7 +2,7 @@ import { closeSync, existsSync, lstatSync, openSync, readdirSync, readSync } fro
 import { isAbsolute, join, resolve } from 'node:path';
 import { importTranscriptFile } from './import-file';
 import { archiveKey } from './index';
-import type { LocalArchiveStore } from './local';
+import type { ArchiveClient } from './remote';
 import { type AtlasFileConcepts, atlasTags, provenanceReferences } from './tags';
 
 export interface CollectionSource {
@@ -100,7 +100,11 @@ export function collectionRoots(config: CollectionSource): Set<string> {
   return new Set(config.worktrees ? [...roots, ...roots.flatMap(worktreesOf)] : roots);
 }
 
-export async function collectSessions(store: LocalArchiveStore, config: CollectionSource) {
+/** Where collected sessions go: an Archive server, or a store in-process. */
+export type ArchiveWriter = Pick<ArchiveClient, 'sourceId' | 'head' | 'capture'>;
+
+export async function collectSessions(archive: ArchiveWriter, config: CollectionSource) {
+  const sourceId = await archive.sourceId();
   const roots = collectionRoots(config);
   const result = { imported: 0, unchanged: 0, skipped: 0, failed: 0 };
   // Per scan: checkouts change between scans.
@@ -117,7 +121,7 @@ export async function collectSessions(store: LocalArchiveStore, config: Collecti
       const before = lstatSync(file);
       const snapshot = importTranscriptFile(file, {
         source: config.source,
-        sourceId: store.sourceId,
+        sourceId,
         projectId: config.projectId,
       });
       const after = lstatSync(file);
@@ -125,8 +129,8 @@ export async function collectSessions(store: LocalArchiveStore, config: Collecti
         result.skipped++;
         continue;
       }
-      const old = store.read(archiveKey(snapshot));
-      if (old && old.snapshot.projectId !== config.projectId) {
+      const old = await archive.head(archiveKey(snapshot));
+      if (old && old.projectId !== config.projectId) {
         result.failed++;
         continue;
       }
@@ -135,18 +139,14 @@ export async function collectSessions(store: LocalArchiveStore, config: Collecti
       if (config.atlas && !graphs.has(cwd)) graphs.set(cwd, atlasGraph(cwd));
       const graph = graphs.get(cwd);
       snapshot.tags = [
-        ...new Set([
-          ...(old?.snapshot.tags ?? []),
-          ...(config.tags ?? []),
-          ...(graph ? atlasTags(snapshot, graph, roots) : []),
-        ]),
+        ...new Set([...(config.tags ?? []), ...(graph ? atlasTags(snapshot, graph, roots) : [])]),
       ].slice(0, 100);
       const references = provenanceReferences({
         branch: meta.branch,
         repository: meta.repository ?? repositories.get(cwd),
       });
       if (references.length) snapshot.references = references;
-      if (store.capture(snapshot).changed) result.imported++;
+      if ((await archive.capture(snapshot)).changed) result.imported++;
       else result.unchanged++;
     } catch {
       result.failed++;

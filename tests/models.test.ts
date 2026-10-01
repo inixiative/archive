@@ -1,11 +1,11 @@
 import { expect, test } from 'bun:test';
 import { importTranscript } from '../src/import';
-import { LocalArchiveStore } from '../src/local';
+import { freshStore } from './db';
 
 const sourceId = '1ae3ac76-faa8-4498-8072-425ab35f453c';
 const lines = (...rows: unknown[]) => rows.map((row) => JSON.stringify(row)).join('\n');
 
-test('Codex turns stamp model and effort on what the model produced, per turn', () => {
+test('Codex turns stamp model and effort on what the model produced, per turn', async () => {
   const message = (role: string, text: string, id: string) => ({
     type: 'response_item',
     payload: { type: 'message', role, id, content: [{ type: 'output_text', text }] },
@@ -31,8 +31,8 @@ test('Codex turns stamp model and effort on what the model produced, per turn', 
   ]);
 });
 
-test('Claude records stamp their own model and effort; sessions list and filter by them', () => {
-  const store = new LocalArchiveStore(':memory:');
+test('Claude records stamp their own model and effort; sessions list and filter by them', async () => {
+  const store = await freshStore();
   try {
     const record = (type: string, uuid: string, model?: string, effort?: string) => ({
       type,
@@ -53,15 +53,14 @@ test('Claude records stamp their own model and effort; sessions list and filter 
       ),
       { source: 'claude-code', sourceId, projectId: 'inixiative' },
     );
-    store.capture(snapshot);
-    expect(store.list()[0].models).toEqual([
+    await store.capture(snapshot);
+    expect((await store.list())[0].models).toEqual([
       { model: 'claude-opus-5-5', effort: 'medium', entries: 2 },
       { model: 'claude-sonnet-5', effort: 'high', entries: 1 },
     ]);
-    expect(store.list({ model: 'claude-sonnet-5' })).toHaveLength(1);
-    expect(store.list({ model: 'claude-sonnet-5', effort: 'medium' })).toHaveLength(0);
-    expect(store.list({ effort: 'medium' })).toHaveLength(1);
+    expect(await store.list({ model: 'claude-sonnet-5' })).toHaveLength(1);
+    expect(await store.list({ model: 'claude-sonnet-5', effort: 'medium' })).toHaveLength(0);
+    expect(await store.list({ effort: 'medium' })).toHaveLength(1);
   } finally {
-    store.close();
   }
 });

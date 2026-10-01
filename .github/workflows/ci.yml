@@ -4,5 +4,24 @@ on:
     branches: [main]
   pull_request:
 jobs:
-  ci:
-    uses: inixiative/config/.github/workflows/lib-ci.yml@main
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: archive_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      ARCHIVE_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/archive_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+      - run: bun install --frozen-lockfile
+      - run: bunx inixiative-config check .
+      - run: bun run check

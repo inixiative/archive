@@ -39,8 +39,8 @@ export const collectorAgentSchema = z.strictObject({
 });
 export const agentsConfigSchema = z
   .strictObject({
-    serve: z.strictObject({ port: z.number().int().min(1).max(65535).optional() }).optional(),
-    sync: z.boolean().optional(),
+    /** The Archive server collectors write to; the token is the home's `server.token`. */
+    server: z.strictObject({ url: z.url() }).optional(),
     collectors: z.array(collectorAgentSchema).max(100),
   })
   .refine(
@@ -82,9 +82,10 @@ export interface AgentUnitOptions {
 }
 export const packageCliPath = () => fileURLToPath(new URL('./cli.ts', import.meta.url));
 
-export function collectorArgs(c: CollectorAgent) {
+export function collectorArgs(c: CollectorAgent, server?: { url: string }) {
   return [
     'collect',
+    ...(server ? ['--url', server.url] : []),
     '--directory',
     c.directory,
     '--source',
@@ -113,18 +114,7 @@ export function agentUnits(config: AgentsConfig, options: AgentUnitOptions): Age
       stderr: join(home, 'logs', `${label}.err.log`),
     };
   };
-  return [
-    ...(config.serve
-      ? [
-          unit('local', [
-            'serve',
-            ...(config.serve.port ? ['--port', String(config.serve.port)] : []),
-          ]),
-        ]
-      : []),
-    ...(config.sync ? [unit('sync', ['sync', '--watch'])] : []),
-    ...config.collectors.map((c) => unit(`collect.${c.name}`, collectorArgs(c))),
-  ];
+  return config.collectors.map((c) => unit(`collect.${c.name}`, collectorArgs(c, config.server)));
 }
 
 const xml = (value: string) =>

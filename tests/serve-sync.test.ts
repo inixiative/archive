@@ -4,15 +4,27 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { archiveSnapshotSchema } from '../src/index';
 import { startArchiveServer } from '../src/server';
+import { freshStore, MIGRATED_DATABASE, testDatabaseUrl } from './db';
 
 const token = 'synthetic-archive-test-token-0000000000';
 const hostedToken = 'synthetic-hosted-archive-token-000000000';
 
 test('serve --sync publishes what it receives to its destinations from the same process', async () => {
   const home = mkdtempSync(join(tmpdir(), 'archive-serve-sync-'));
-  const hosted = startArchiveServer({ store: ':memory:', token: hostedToken, port: 0 });
+  await freshStore('remote');
+  const hosted = await startArchiveServer({
+    databaseUrl: testDatabaseUrl('remote'),
+    token: hostedToken,
+    port: 0,
+  });
   const local = Bun.spawn(['bun', 'src/cli.ts', 'serve', '--home', home, '--port', '0', '--sync'], {
-    env: { ...process.env, ARCHIVE_SERVER_TOKEN: token, HOSTED_TOKEN: hostedToken },
+    env: {
+      ...process.env,
+      ARCHIVE_SERVER_TOKEN: token,
+      HOSTED_TOKEN: hostedToken,
+      DATABASE_URL: testDatabaseUrl(MIGRATED_DATABASE),
+      ARCHIVE_DEBUG: '1',
+    },
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -30,7 +42,11 @@ test('serve --sync publishes what it receives to its destinations from the same 
     );
     const reader = local.stdout.getReader();
     let printed = '';
-    while (!printed.includes('}')) printed += new TextDecoder().decode((await reader.read()).value);
+    while (!printed.includes('}')) {
+      const chunk = await reader.read();
+      if (chunk.done) throw new Error(`serve exited: ${await new Response(local.stderr).text()}`);
+      printed += new TextDecoder().decode(chunk.value);
+    }
     const url = JSON.parse(printed).listening as string;
     const snapshot = archiveSnapshotSchema.parse({
       schemaVersion: 1,
@@ -51,8 +67,8 @@ test('serve --sync publishes what it receives to its destinations from the same 
     });
     expect(ingested.status).toBe(200);
     const deadline = Date.now() + 40_000;
-    while (!hosted.store.list().length && Date.now() < deadline) await Bun.sleep(250);
-    expect(hosted.store.list().map((a) => a.title)).toEqual(['Synced']);
+    while (!(await hosted.store.list()).length && Date.now() < deadline) await Bun.sleep(250);
+    expect((await hosted.store.list()).map((a) => a.title)).toEqual(['Synced']);
   } finally {
     local.kill('SIGTERM');
     await local.exited;

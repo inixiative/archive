@@ -1,10 +1,9 @@
 {
   "name": "@inixiative/archive",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./local": "./src/local.ts",
     "./import": "./src/import.ts",
     "./client": "./src/client.ts",
     "./config": "./src/config.ts",
@@ -15,10 +14,13 @@
     "./collector": "./src/collector.ts",
     "./chatgpt": "./src/chatgpt.ts",
     "./tags": "./src/tags.ts",
-    "./agents": "./src/agents.ts"
+    "./agents": "./src/agents.ts",
+    "./store": "./src/store.ts",
+    "./remote": "./src/remote.ts"
   },
   "files": [
     "src",
+    "prisma",
     "compose.yaml"
   ],
   "scripts": {
@@ -29,10 +31,12 @@
     "check": "bun run typecheck && bun run lint && bun run test",
     "prepublishOnly": "bun run check",
     "lint": "biome check .",
-    "prepare": "lefthook install"
+    "prepare": "lefthook install && prisma generate"
   },
   "dependencies": {
+    "@prisma/client": "^6.6.0",
     "js-tiktoken": "1.0.21",
+    "prisma": "^6.6.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {

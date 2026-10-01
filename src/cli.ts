@@ -2,6 +2,7 @@
 import { randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import {
   agentStatus,
@@ -17,7 +18,6 @@ import { importChatGPTThread } from './chatgpt';
 import {
   archiveRequest,
   kingdomFields,
-  publishArchive,
   routingPreview,
   searchRemotes,
   syncArchives,
@@ -25,10 +25,23 @@ import {
 import { collectSessions } from './collector';
 import { archiveDestinationSchema, connectDestination, readDestinations } from './config';
 import { importTranscriptFile } from './import-file';
-import { archiveKey } from './index';
-import { LocalArchiveStore } from './local';
 import { previewImports } from './preview';
+import { ArchiveClient } from './remote';
 import { startArchiveServer } from './server';
+import { ArchiveStore } from './store';
+
+/** The local Archive server's default address (the `archive` block in @inixiative/config ports). */
+export const DEFAULT_URL = 'http://127.0.0.1:4700';
+
+/** Applies pending schema migrations to the archive database. */
+export function migrate(databaseUrl: string) {
+  const schema = fileURLToPath(new URL('../prisma/schema.prisma', import.meta.url));
+  const run = Bun.spawnSync(
+    [process.execPath, 'x', 'prisma', 'migrate', 'deploy', '--schema', schema],
+    { env: { ...process.env, DATABASE_URL: databaseUrl }, stdout: 'ignore', stderr: 'pipe' },
+  );
+  if (!run.success) throw new Error(`Archive migration failed: ${run.stderr.toString().trim()}`);
+}
 
 export async function runCli(args = Bun.argv.slice(2)) {
   const { values: v, positionals } = parseArgs({
@@ -36,7 +49,6 @@ export async function runCli(args = Bun.argv.slice(2)) {
     allowPositionals: true,
     options: {
       home: { type: 'string', default: defaultHome() },
-      store: { type: 'string' },
       config: { type: 'string' },
       url: { type: 'string' },
       kind: { type: 'string', default: 'archive' },
@@ -66,55 +78,89 @@ export async function runCli(args = Bun.argv.slice(2)) {
       watch: { type: 'boolean', default: false },
       sync: { type: 'boolean', default: false },
       remote: { type: 'boolean', default: false },
-      destination: { type: 'string' },
       help: { type: 'boolean' },
     },
   });
   const home = resolve(v.home!),
-    config = v.config ?? join(home, 'destinations.json');
-  const storePath = v.store ?? join(home, 'archives.sqlite');
+    config = v.config ?? join(home, 'destinations.json'),
+    tokenFile = v['token-file'] ? resolve(v['token-file']) : join(home, 'server.token');
   const output = (value: unknown) => console.log(JSON.stringify(value, null, 2));
   const command = positionals[0];
   if (v.help || !command) {
     console.log(
-      'Archive: init | serve | connect (setup) | preview | import | collect | list | export | tag | routes | sync | search | agents\n' +
-        'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH) [--kind kingdom [--connection-id ID] [--owner-model M --organization-id UUID --space-id UUID]]\n' +
-        'import --file PATH --source codex|claude-code --project-id ID [--tag TAG]\n' +
-        'tag --id ID [--tag TAG ...] [--untag TAG ...]\n' +
+      'Archive: init | up | down | serve | connect (setup) | preview | import | collect | list | export | tag | routes | sync | search | agents\n' +
+        'up | down   (the local Archive: bundled compose.yaml with Postgres, data in --home)\n' +
+        'serve [--port 4700 --hostname 127.0.0.1] [--sync]   (DATABASE_URL; token from ARCHIVE_SERVER_TOKEN or --token-file)\n' +
+        'import --file PATH --source codex|claude-code|chatgpt --project-id ID [--tag TAG]\n' +
         'collect --directory HISTORY --source codex|claude-code --project-root EXACT_CWD [--project-root ...] [--worktrees] [--atlas] --project-id ID [--watch]\n' +
-        'sync [--watch] | routes | search --query TEXT [--remote]\n' +
-        'serve --home PATH [--port 4411 --hostname 127.0.0.1] [--sync]\n' +
+        'list | export --id ID | tag --id ID [--tag TAG ...] [--untag TAG ...] | search --query TEXT [--remote]\n' +
+        'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH) [--kind kingdom ...]   (destinations for serve --sync)\n' +
+        'sync | routes   (DATABASE_URL: publish to, or preview, destinations once)\n' +
         'agents add-collector --name N --source codex|claude-code --project-id ID --project-root DIR [--project-root ...] [--directory HISTORY] [--worktrees] [--atlas]\n' +
-        'agents remove-collector --name N | serve on|off [--port P] | sync on|off | install | uninstall | status\n' +
-        'All commands accept --home PATH; integrations may use --store FILE --config FILE.',
+        'agents remove-collector --name N | server --url URL | install | uninstall | status\n' +
+        `Data commands talk to the Archive server at --url (default ${DEFAULT_URL}) with the token in --token-file (default <home>/server.token) or ARCHIVE_TOKEN.`,
     );
     return;
   }
-  if (command === 'init') {
+  const readToken = () =>
+    existsSync(tokenFile) ? readFileSync(tokenFile, 'utf8').trim() : undefined;
+  const init = () => {
     mkdirSync(home, { recursive: true, mode: 0o700 });
-    const tokenFile = join(home, 'server.token');
     if (!existsSync(tokenFile))
-      writeFileSync(tokenFile, randomBytes(32).toString('hex') + '\n', { mode: 0o600, flag: 'wx' });
+      writeFileSync(tokenFile, `${randomBytes(32).toString('hex')}\n`, { mode: 0o600, flag: 'wx' });
     chmodSync(tokenFile, 0o600);
-    const store = new LocalArchiveStore(storePath);
-    store.close();
-    output({ initialized: true, home, store: storePath, tokenFile });
+  };
+  if (command === 'init') {
+    init();
+    output({ initialized: true, home, tokenFile });
     return;
   }
+  if (command === 'up' || command === 'down') {
+    // The machine's one local Archive: the bundled compose file, with its data in the home.
+    if (command === 'up') init();
+    const compose = fileURLToPath(new URL('../compose.yaml', import.meta.url));
+    const run = Bun.spawnSync(
+      [
+        'docker',
+        'compose',
+        '--project-name',
+        'archive',
+        '--file',
+        compose,
+        ...(command === 'up' ? ['up', '--detach', '--wait'] : ['down']),
+      ],
+      {
+        env: {
+          ...process.env,
+          ARCHIVE_DATA_DIR: home,
+          // Compose requires the variable even to stop; down never needs the real token.
+          ARCHIVE_SERVER_TOKEN: readToken() ?? 'x'.repeat(32),
+        },
+        stdout: 'inherit',
+        stderr: 'inherit',
+      },
+    );
+    if (!run.success) throw new Error(`docker compose ${command} failed`);
+    output(command === 'up' ? { running: DEFAULT_URL, home } : { stopped: true });
+    return;
+  }
+  const databaseUrl = () => {
+    const url = process.env.DATABASE_URL;
+    if (!url) throw new Error('DATABASE_URL is required');
+    return url;
+  };
   if (command === 'serve') {
-    const tokenFile = v['token-file'] ?? join(home, 'server.token');
-    const token =
-      process.env.ARCHIVE_SERVER_TOKEN ??
-      (existsSync(tokenFile) ? readFileSync(tokenFile, 'utf8').trim() : '');
-    const instance = startArchiveServer({
-      store: storePath,
-      token,
-      port: Number(v.port ?? process.env.PORT ?? 4411),
+    const url = databaseUrl();
+    migrate(url);
+    const instance = await startArchiveServer({
+      databaseUrl: url,
+      token: process.env.ARCHIVE_SERVER_TOKEN ?? readToken() ?? '',
+      port: Number(v.port ?? process.env.PORT ?? 4700),
       hostname: v.hostname,
     });
-    output({ listening: instance.server.url.href, store: storePath, sync: v.sync });
+    output({ listening: instance.server.url.href, sync: v.sync });
     let stopped = false;
-    // One process owns the store: the server and its sync share it, as in a container.
+    // One process owns the database connection: the server and its sync share it.
     const sync = (async () => {
       while (v.sync && !stopped) {
         try {
@@ -138,12 +184,12 @@ export async function runCli(args = Bun.argv.slice(2)) {
     return;
   }
   if (command === 'connect' || command === 'setup') {
-    const tokenFile = v['token-file'] && resolve(v['token-file']);
+    const destinationTokenFile = v['token-file'] && resolve(v['token-file']);
     const destination = archiveDestinationSchema.parse({
       projectId: v['project-id'],
       url: v.url,
-      tokenEnv: v['token-env'] ?? (tokenFile ? undefined : 'ARCHIVE_TOKEN'),
-      tokenFile,
+      tokenEnv: v['token-env'] ?? (destinationTokenFile ? undefined : 'ARCHIVE_TOKEN'),
+      tokenFile: destinationTokenFile,
       kind: v.kind,
       ...(v.kind === 'kingdom'
         ? {
@@ -171,11 +217,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
   if (command === 'agents') {
     const file = join(home, 'agents.json');
     const current = readAgents(file);
-    const [action, state] = positionals.slice(1);
-    const toggle = () => {
-      if (state !== 'on' && state !== 'off') throw new Error(`agents ${action} requires on|off`);
-      return state === 'on';
-    };
+    const action = positionals[1];
     const base = { collectors: [], ...current };
     if (action === 'add-collector') {
       if (!v.name || !v['project-id'] || !v['project-root'] || !v.source)
@@ -203,16 +245,10 @@ export async function runCli(args = Bun.argv.slice(2)) {
           collectors: base.collectors.filter((c) => c.name !== v.name),
         }),
       );
-    } else if (action === 'serve') {
-      const { serve: _, ...rest } = base;
-      output(
-        writeAgents(
-          file,
-          toggle() ? { ...rest, serve: v.port ? { port: Number(v.port) } : {} } : rest,
-        ),
-      );
-    } else if (action === 'sync') output(writeAgents(file, { ...base, sync: toggle() }));
-    else if (action === 'install') {
+    } else if (action === 'server') {
+      if (!v.url) throw new Error('agents server requires --url');
+      output(writeAgents(file, { ...base, server: { url: v.url } }));
+    } else if (action === 'install') {
       if (!current) throw new Error('No agents.json; declare agents first');
       output(installAgents(current, { home }));
     } else if (action === 'uninstall') output(uninstallAgents({ home }));
@@ -237,110 +273,118 @@ export async function runCli(args = Bun.argv.slice(2)) {
     if (results.some((r) => 'error' in r)) process.exitCode = 1;
     return;
   }
-  const store = new LocalArchiveStore(storePath);
-  try {
-    if (command === 'import') {
-      if (
-        !v.file ||
-        !['codex', 'claude-code', 'chatgpt'].includes(v.source ?? '') ||
-        !v['project-id']
-      )
-        throw new Error(
-          'Import requires --file, --source codex|claude-code|chatgpt and --project-id',
-        );
-      const snapshot =
-        v.source === 'chatgpt'
-          ? importChatGPTThread(JSON.parse(readFileSync(v.file, 'utf8')), {
-              sourceId: store.sourceId,
-              projectId: v['project-id'],
-              title: v.title,
-            })
-          : importTranscriptFile(v.file, {
-              source: v.source as 'codex' | 'claude-code',
-              sourceId: store.sourceId,
-              projectId: v['project-id'],
-              sessionId: v['session-id'],
-              title: v.title,
-            });
-      snapshot.tags = [
-        ...new Set([...(store.read(archiveKey(snapshot))?.snapshot.tags ?? []), ...(v.tag ?? [])]),
-      ];
-      output({
-        ...store.capture(snapshot),
-        entries: snapshot.entries.length,
-        coverage: snapshot.coverage,
-      });
-    } else if (command === 'list') output(store.list());
-    else if (command === 'routes') output(routingPreview(store, readDestinations(config)));
-    else if (command === 'sync' || command === 'collect') {
-      if (
-        command === 'collect' &&
-        (!v.directory ||
-          !v['project-root'] ||
-          !v['project-id'] ||
-          !['codex', 'claude-code'].includes(v.source ?? ''))
-      )
-        throw new Error('Collect requires --directory, --source, --project-root and --project-id');
-      let stopped = false;
-      const stop = () => {
-        stopped = true;
-      };
-      process.once('SIGINT', stop);
-      process.once('SIGTERM', stop);
-      do {
-        if (command === 'collect') {
-          const result = await collectSessions(store, {
-            directory: v.directory!,
-            source: v.source as 'codex' | 'claude-code',
-            projectRoots: v['project-root']!,
-            worktrees: v.worktrees,
-            atlas: v.atlas,
-            projectId: v['project-id']!,
-            tags: v.tag,
-          });
-          output(result);
-          if (!v.watch && result.failed) process.exitCode = 1;
-        } else {
-          const results = await syncArchives(store, readDestinations(config));
-          output(results);
-          if (!v.watch && results.some((r) => r.status.startsWith('failed'))) process.exitCode = 1;
-        }
-        if (v.watch && !stopped) await Bun.sleep(1000);
-        // Short waits allow prompt shutdown; network requests have their own timeout.
-        for (let i = 1; v.watch && !stopped && i < 30; i++) await Bun.sleep(1000);
-      } while (v.watch && !stopped);
-      process.removeListener('SIGINT', stop);
-      process.removeListener('SIGTERM', stop);
-    } else if (command === 'publish') {
-      if (!v.id || !v.destination) throw new Error('Publish requires --id and --destination');
-      output(
-        await publishArchive(
-          store,
-          v.id,
-          archiveDestinationSchema.parse(JSON.parse(readFileSync(v.destination, 'utf8'))),
-        ),
-      );
-    } else if (command === 'search')
-      output(store.search(v.id ? [v.id] : store.list().map((a) => a.id), v.query!));
-    else if (command === 'export' || command === 'tag') {
-      const archive = v.id ? store.read(v.id) : undefined;
-      if (!archive) throw new Error('Valid --id required');
-      if (command === 'export') output(archive.snapshot);
+  if (command === 'sync' || command === 'routes') {
+    const store = new ArchiveStore(databaseUrl());
+    try {
+      if (command === 'routes') output(await routingPreview(store, readDestinations(config)));
       else {
-        if (!v.tag?.length && !v.untag?.length)
-          throw new Error('Tag requires at least one --tag or --untag');
-        output(store.tag(archive.id, { add: v.tag, remove: v.untag }));
+        const results = await syncArchives(store, readDestinations(config));
+        output(results);
+        if (results.some((r) => r.status.startsWith('failed'))) process.exitCode = 1;
       }
-    } else throw new Error('Unknown command; use --help');
-  } finally {
-    store.close();
+    } finally {
+      await store.close();
+    }
+    return;
   }
+  const token = process.env.ARCHIVE_TOKEN ?? readToken();
+  if (!token) throw new Error('No Archive token: run `archive init` or set ARCHIVE_TOKEN');
+  const archive = new ArchiveClient({ url: v.url ?? DEFAULT_URL, token });
+  if (command === 'import') {
+    if (
+      !v.file ||
+      !['codex', 'claude-code', 'chatgpt'].includes(v.source ?? '') ||
+      !v['project-id']
+    )
+      throw new Error(
+        'Import requires --file, --source codex|claude-code|chatgpt and --project-id',
+      );
+    const sourceId = await archive.sourceId();
+    const snapshot =
+      v.source === 'chatgpt'
+        ? importChatGPTThread(JSON.parse(readFileSync(v.file, 'utf8')), {
+            sourceId,
+            projectId: v['project-id'],
+            title: v.title,
+          })
+        : importTranscriptFile(v.file, {
+            source: v.source as 'codex' | 'claude-code',
+            sourceId,
+            projectId: v['project-id'],
+            sessionId: v['session-id'],
+            title: v.title,
+          });
+    snapshot.tags = [...new Set(v.tag ?? [])];
+    output({
+      ...(await archive.capture(snapshot)),
+      entries: snapshot.entries.length,
+      coverage: snapshot.coverage,
+    });
+  } else if (command === 'list') output(await archive.list());
+  else if (command === 'collect') {
+    if (
+      !v.directory ||
+      !v['project-root'] ||
+      !v['project-id'] ||
+      !['codex', 'claude-code'].includes(v.source ?? '')
+    )
+      throw new Error('Collect requires --directory, --source, --project-root and --project-id');
+    let stopped = false;
+    const stop = () => {
+      stopped = true;
+    };
+    process.once('SIGINT', stop);
+    process.once('SIGTERM', stop);
+    do {
+      try {
+        const result = await collectSessions(archive, {
+          directory: v.directory,
+          source: v.source as 'codex' | 'claude-code',
+          projectRoots: v['project-root'],
+          worktrees: v.worktrees,
+          atlas: v.atlas,
+          projectId: v['project-id'],
+          tags: v.tag,
+        });
+        output(result);
+        if (!v.watch && result.failed) process.exitCode = 1;
+      } catch (error) {
+        // The server may be starting; a watching collector retries.
+        if (!v.watch) throw error;
+        console.error(JSON.stringify({ collect: 'server unavailable' }));
+      }
+      // Short waits allow prompt shutdown; network requests have their own timeout.
+      for (let i = 0; v.watch && !stopped && i < 30; i++) await Bun.sleep(1000);
+    } while (v.watch && !stopped);
+    process.removeListener('SIGINT', stop);
+    process.removeListener('SIGTERM', stop);
+  } else if (command === 'search')
+    output(
+      await archive.search({
+        query: v.query,
+        limit: Number(v.limit) > 100 ? 100 : Number(v.limit),
+      }),
+    );
+  else if (command === 'export' || command === 'tag') {
+    if (!v.id) throw new Error('Valid --id required');
+    if (command === 'export') {
+      const read = await archive.read(v.id);
+      if (!read) throw new Error('Valid --id required');
+      output(read.snapshot);
+    } else {
+      if (!v.tag?.length && !v.untag?.length)
+        throw new Error('Tag requires at least one --tag or --untag');
+      output(await archive.tag(v.id, { add: v.tag, remove: v.untag }));
+    }
+  } else throw new Error('Unknown command; use --help');
 }
 
 if (import.meta.main)
-  runCli().catch(() => {
+  runCli().catch((error) => {
     console.error(
-      'Archive command failed. Check arguments, destination access and local paths. Use --help for usage.',
+      process.env.ARCHIVE_DEBUG
+        ? error
+        : 'Archive command failed. Check arguments, server and destination access, and local paths. Use --help for usage. Set ARCHIVE_DEBUG=1 for details.',
     );
     process.exitCode = 1;
   });

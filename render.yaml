@@ -1,3 +1,7 @@
+databases:
+  - name: archive-db
+    plan: basic-256mb
+    postgresMajorVersion: "17"
 services:
   - type: web
     name: archive
@@ -7,12 +11,12 @@ services:
     plan: starter
     healthCheckPath: /health
     autoDeployTrigger: off
-    disk:
-      name: archive-data
-      mountPath: /data
-      sizeGB: 1
     envVars:
       - key: ARCHIVE_SERVER_TOKEN
         generateValue: true
       - key: PORT
-        value: "4411"
+        value: "4700"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: archive-db
+          property: connectionString

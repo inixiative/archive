@@ -3,9 +3,9 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { collectionRoots, collectSessions } from '../src/collector';
-import { LocalArchiveStore } from '../src/local';
+import { freshStore } from './db';
 
-test('collector matches exact provider cwd, retries partial files and preserves manual tags across restart', async () => {
+test('collector matches exact provider cwd, retries partial files and keeps manual tags', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'archive-collect-'));
   const root = '/work/inixiative';
   const rows = (id: string, cwd: string, text = 'Fix regression') =>
@@ -18,7 +18,7 @@ test('collector matches exact provider cwd, retries partial files and preserves 
     ]
       .map((r) => JSON.stringify(r))
       .join('\n') + '\n';
-  let store = new LocalArchiveStore(join(dir, 'local.sqlite'));
+  const store = await freshStore();
   const config = {
     directory: dir,
     source: 'codex' as const,
@@ -34,31 +34,27 @@ test('collector matches exact provider cwd, retries partial files and preserves 
     symlinkSync(join(dir, 'ue.jsonl'), join(dir, 'linked.jsonl'));
     const first = await collectSessions(store, config);
     expect(first).toEqual({ imported: 1, unchanged: 0, failed: 1, skipped: 2 });
-    const id = store.list()[0].id;
-    store.capture({
-      ...store.read(id)!.snapshot,
-      tags: ['manually-reviewed'],
-      capturedAt: Date.now(),
-    });
-    store.close();
-    store = new LocalArchiveStore(join(dir, 'local.sqlite'));
+    const id = (await await store.list())[0].id;
+    await await store.tag(id, { add: ['manually-reviewed'] });
     writeFileSync(join(dir, 'partial.jsonl'), rows('partial', root));
     writeFileSync(join(dir, 'wanted.jsonl'), rows('wanted', root, 'More work'));
     const next = await collectSessions(store, config);
     expect(next.imported).toBe(2);
-    expect(store.read(id)?.snapshot.tags).toEqual(['manually-reviewed', 'coding']);
-    expect(store.list()).toHaveLength(2);
+    expect((await await store.list()).find((a) => a.id === id)?.tags).toEqual([
+      'coding',
+      'manually-reviewed',
+    ]);
+    expect(await await store.list()).toHaveLength(2);
     expect((await collectSessions(store, config)).unchanged).toBe(2);
     expect((await collectSessions(store, { ...config, projectId: 'personal' })).failed).toBe(2);
   } finally {
-    store.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test('Claude cwd metadata is collected without treating a destination name in text as routing', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'archive-claude-'));
-  const store = new LocalArchiveStore(':memory:');
+  const store = await freshStore();
   try {
     writeFileSync(
       join(dir, 'session.jsonl'),
@@ -78,12 +74,11 @@ test('Claude cwd metadata is collected without treating a destination name in te
       projectRoots: ['/work/ue'],
     });
     expect(result.imported).toBe(1);
-    expect(store.list()[0].projectId).toBe('userevidence');
+    expect((await store.list())[0].projectId).toBe('userevidence');
     // A branch without a GitHub repository references no integration.
-    expect(store.list()[0].tags).toEqual([]);
-    expect(store.list()[0].references).toEqual([]);
+    expect((await store.list())[0].tags).toEqual([]);
+    expect((await store.list())[0].references).toEqual([]);
   } finally {
-    store.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -95,7 +90,7 @@ test('several exact roots and their git worktrees collect into one project; nest
   const history = join(dir, 'history');
   const git = (...args: string[]) =>
     expect(Bun.spawnSync(['git', '-C', repo, ...args], { stderr: 'ignore' }).success).toBe(true);
-  const store = new LocalArchiveStore(':memory:');
+  const store = await freshStore();
   try {
     mkdirSync(repo);
     mkdirSync(history);
@@ -146,9 +141,10 @@ test('several exact roots and their git worktrees collect into one project; nest
       skipped: 1,
       failed: 0,
     });
-    expect(new Set(store.list().map((archive) => archive.projectId))).toEqual(new Set(['foundry']));
+    expect(new Set((await store.list()).map((archive) => archive.projectId))).toEqual(
+      new Set(['foundry']),
+    );
   } finally {
-    store.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
