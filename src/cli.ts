@@ -64,6 +64,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       name: { type: 'string' },
       hostname: { type: 'string', default: '127.0.0.1' },
       watch: { type: 'boolean', default: false },
+      sync: { type: 'boolean', default: false },
       remote: { type: 'boolean', default: false },
       destination: { type: 'string' },
       help: { type: 'boolean' },
@@ -82,7 +83,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'tag --id ID [--tag TAG ...] [--untag TAG ...]\n' +
         'collect --directory HISTORY --source codex|claude-code --project-root EXACT_CWD [--project-root ...] [--worktrees] [--atlas] --project-id ID [--watch]\n' +
         'sync [--watch] | routes | search --query TEXT [--remote]\n' +
-        'serve --home PATH [--port 4411 --hostname 127.0.0.1]\n' +
+        'serve --home PATH [--port 4411 --hostname 127.0.0.1] [--sync]\n' +
         'agents add-collector --name N --source codex|claude-code --project-id ID --project-root DIR [--project-root ...] [--directory HISTORY] [--worktrees] [--atlas]\n' +
         'agents remove-collector --name N | serve on|off [--port P] | sync on|off | install | uninstall | status\n' +
         'All commands accept --home PATH; integrations may use --store FILE --config FILE.',
@@ -111,8 +112,24 @@ export async function runCli(args = Bun.argv.slice(2)) {
       port: Number(v.port ?? process.env.PORT ?? 4411),
       hostname: v.hostname,
     });
-    output({ listening: instance.server.url.href, store: storePath });
+    output({ listening: instance.server.url.href, store: storePath, sync: v.sync });
+    let stopped = false;
+    // One process owns the store: the server and its sync share it, as in a container.
+    const sync = (async () => {
+      while (v.sync && !stopped) {
+        try {
+          const results = await syncArchives(instance.store, readDestinations(config));
+          const failed = results.filter((r) => r.status.startsWith('failed')).length;
+          if (failed) console.error(JSON.stringify({ sync: 'failed', archives: failed }));
+        } catch {
+          console.error(JSON.stringify({ sync: 'unavailable' }));
+        }
+        for (let i = 0; i < 30 && !stopped; i++) await Bun.sleep(1000);
+      }
+    })();
     const stop = async () => {
+      stopped = true;
+      await sync;
       await instance.close();
       process.exit(0);
     };

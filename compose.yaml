@@ -1,6 +1,7 @@
 services:
   archive:
-    build: .
+    image: ghcr.io/inixiative/archive:${ARCHIVE_VERSION:-latest}
+    command: ["bun", "run", "src/cli.ts", "serve", "--home", "/data", "--hostname", "0.0.0.0", "--sync"]
     ports:
       - "127.0.0.1:${ARCHIVE_PORT:-4411}:4411"
     environment:
