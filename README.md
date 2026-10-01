@@ -39,7 +39,7 @@ bun run archive list
 bun run archive search --query 'migration'
 ```
 
-Use `--source claude-code` for Claude histories. Collection matches the exact working-directory metadata recorded by the provider. Repeat `--project-root` to map several checkouts to one project; `--worktrees` also accepts every current git worktree of each root, re-read on each scan. Nested checkouts are separate mappings. Unknown directories, symlinks and sessions without usable metadata are skipped. Incomplete or changing files remain at source and retry on the next scan. The initial collector rescans files every 30 seconds; it deduplicates normalized content rather than maintaining byte-offset ingestion cursors. It retains prior manually assigned tags. It does not upload: run sync separately.
+Use `--source claude-code` for Claude histories. Collection matches the exact working-directory metadata recorded by the provider. Repeat `--project-root` to map several checkouts to one project; `--worktrees` also accepts every current git worktree of each root, re-read on each scan. Nested checkouts are separate mappings. Unknown directories, symlinks and sessions without usable metadata are skipped. Incomplete or changing files remain at source and retry on the next scan. The initial collector rescans files every 30 seconds; it deduplicates normalized content rather than maintaining byte-offset ingestion cursors. It keeps tags captured earlier. It does not upload: run sync separately.
 
 ## Connect to BYO hosting
 
@@ -98,17 +98,41 @@ Kingdom takes the owner from the runtime credential; `--owner-model`, `--organiz
 
 Foundry exposes the same commands through `bun run archive`. Its defaults remain `.foundry/archives/archives.sqlite` and `.foundry/archives.json`. Its durable journal capture automatically publishes matching projects once destination credentials are in the viewer's environment. Restart the viewer after changing destination configuration.
 
-## Routing, tagging and Jev
+## Routing
 
-Only explicit `projectId` matches authorize publication. An archive with no matching destination stays local. Multiple matches create deliberate separate copies. `routes` previews these destinations before upload.
+Only explicit `projectId` matches authorize publication. An archive with no matching destination stays local. Multiple matches create deliberate separate copies. `routes` previews these destinations before upload. Tags, references and actors never change ownership or routing.
+
+## Tags, references, actors and retention
+
+The archive owns its tag system. It keeps two different things apart:
+
+- **Tags** are concepts: the `atlas:<concept>` of repository files a session's tool calls touched (collectors with `--atlas`, from `atlas graph --json`), collector `--tag`s, and tags people add. Heuristic categories are offered as `suggestedTags`, computed on read and never stored.
+- **References** point at items in an integration. Collectors record the session's GitHub repository and branch (`owner/repo`, `owner/repo/tree/branch`); linked GitHub pull requests, issues and commits (`owner/repo#24`, `owner/repo@sha`) and Linear issues (`KEY-12`) are found in the text and counted. A link is a mention, not proof of work. The archive's settings list the integrations it references: GitHub and Linear are recognized natively, and any other integration names the link prefix of its items (for example `https://acme.atlassian.net/browse/`); the item is what follows. Prefixes are literal, so settings cannot make matching slow.
 
 ```sh
-bun run archive tag --id ARCHIVE_ID --tag reviewed
+bun run archive tag --id ARCHIVE_ID --tag reviewed --untag debugging
 ```
 
-Collectors add explicit tags from recorded session metadata: `repo:owner/name` and `branch:name` from git context, and with `--atlas` the `atlas:<concept>` of repository files the session's tool calls touched (from `atlas graph --json` in the session's checkout). Suggestions are computed on read and never stored: heuristic categories, plus `reference` suggestions for linked GitHub pull requests, issues and commits (`github:owner/repo#24`, `github:owner/repo@sha`) and Linear issues (`linear:KEY-12`). A link is a mention, not proof of work, so references stay suggestions.
+Tag edits apply to that archive without a new revision, survive re-capture, and do not sync. Offered tags are defined archive-wide or for one actor. Each session can name its **actor**: a `user`, or a `service` such as an API-key run. An organization's archive mostly holds its members' work, filterable per person. Entries the model produced record its `model` and `effort` (from Claude Code assistant records and Codex turn context, per turn); listings summarize them per session as `models` and filter by `model` and `effort`.
 
-Tags and suggestions do not change ownership or routing. Jev integration is not enabled: the next step is labeled, shadow-mode tag/destination proposals, scored for accuracy and cross-organization mistakes before any automatic action. Session content must not be sent to Jev without selecting that service for the relevant ownership boundary.
+The **retention** setting (`retentionDays`, off by default) deletes archives whose latest capture is older than that, at server start and hourly. It deletes only from the archive it is set on; deletions never sync.
+
+### HTTP API
+
+All data endpoints are `POST /api/v1/archive/<action>` with a JSON body and `Authorization: Bearer <token>`:
+
+| Action | Body | Returns |
+|---|---|---|
+| `ingest` | `snapshot`, `previousDigest` | id, digest, revision |
+| `read` | `archiveId`, `revision?` | snapshot and chunks |
+| `list` | filters, `limit?`, `beforeId?` | metadata, `nextCursor` |
+| `search` | filters, `query`, `budget?`, `limit?`, `beforeId?` | matching chunks within the token budget |
+| `tag` | `archiveId`, `add?`, `remove?` | tags |
+| `delete` | `archiveId` | deleted |
+| `settings/read`, `settings/update` | `integrations?`, `retentionDays?` | settings |
+| `tags/list`, `tags/define`, `tags/remove` | `tag`, `actorId?`, `description?` | offered tags with usage counts |
+
+Filters are `projectId`, `source`, `tag`, `actorId`, `model`, `effort` and `reference` (`{integration, ref}`). Jev integration is not enabled. Session content must not be sent to Jev without selecting that service for the relevant ownership boundary.
 
 ## Limits
 

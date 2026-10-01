@@ -79,7 +79,9 @@ test('Claude cwd metadata is collected without treating a destination name in te
     });
     expect(result.imported).toBe(1);
     expect(store.list()[0].projectId).toBe('userevidence');
-    expect(store.list()[0].tags).toEqual(['branch:feat/tags']);
+    // A branch without a GitHub repository references no integration.
+    expect(store.list()[0].tags).toEqual([]);
+    expect(store.list()[0].references).toEqual([]);
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });

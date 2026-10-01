@@ -58,6 +58,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       worktrees: { type: 'boolean', default: false },
       atlas: { type: 'boolean', default: false },
       tag: { type: 'string', multiple: true },
+      untag: { type: 'string', multiple: true },
       limit: { type: 'string', default: '100' },
       port: { type: 'string' },
       name: { type: 'string' },
@@ -78,6 +79,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       'Archive: init | serve | connect (setup) | preview | import | collect | list | export | tag | routes | sync | search | agents\n' +
         'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH) [--kind kingdom [--connection-id ID] [--owner-model M --organization-id UUID --space-id UUID]]\n' +
         'import --file PATH --source codex|claude-code --project-id ID [--tag TAG]\n' +
+        'tag --id ID [--tag TAG ...] [--untag TAG ...]\n' +
         'collect --directory HISTORY --source codex|claude-code --project-root EXACT_CWD [--project-root ...] [--worktrees] [--atlas] --project-id ID [--watch]\n' +
         'sync [--watch] | routes | search --query TEXT [--remote]\n' +
         'serve --home PATH [--port 4411 --hostname 127.0.0.1]\n' +
@@ -308,14 +310,9 @@ export async function runCli(args = Bun.argv.slice(2)) {
       if (!archive) throw new Error('Valid --id required');
       if (command === 'export') output(archive.snapshot);
       else {
-        if (!v.tag?.length) throw new Error('Tag requires at least one --tag');
-        output(
-          store.capture({
-            ...archive.snapshot,
-            capturedAt: Date.now(),
-            tags: [...new Set([...archive.snapshot.tags, ...v.tag])],
-          }),
-        );
+        if (!v.tag?.length && !v.untag?.length)
+          throw new Error('Tag requires at least one --tag or --untag');
+        output(store.tag(archive.id, { add: v.tag, remove: v.untag }));
       }
     } else throw new Error('Unknown command; use --help');
   } finally {
