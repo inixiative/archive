@@ -26,12 +26,9 @@ import { collectSessions } from './collector';
 import { archiveDestinationSchema, connectDestination, readDestinations } from './config';
 import { importTranscriptFile } from './import-file';
 import { previewImports } from './preview';
-import { ArchiveClient } from './remote';
+import { ArchiveClient, DEFAULT_URL } from './remote';
 import { startArchiveServer } from './server';
 import { ArchiveStore } from './store';
-
-/** The local Archive server's default address (the `archive` block in @inixiative/config ports). */
-export const DEFAULT_URL = 'http://127.0.0.1:4700';
 
 /** Applies pending schema migrations to the archive database. */
 export function migrate(databaseUrl: string) {

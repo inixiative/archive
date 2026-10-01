@@ -16,7 +16,8 @@
     "./tags": "./src/tags.ts",
     "./agents": "./src/agents.ts",
     "./store": "./src/store.ts",
-    "./remote": "./src/remote.ts"
+    "./remote": "./src/remote.ts",
+    "./schemas": "./src/schemas.ts"
   },
   "files": [
     "src",

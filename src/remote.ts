@@ -1,6 +1,9 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { defaultHome } from './agents';
 import type { ArchiveChunk, ArchiveSnapshot } from './index';
 import { archiveKey, archiveSnapshotSchema } from './index';
-import type { ArchiveFilter, ArchiveSettings, TagDefinition } from './store';
+import type { ArchiveFilter, ArchiveSettings, TagDefinition } from './schemas';
 import type { ArchiveReferenceCount, TagSuggestion } from './tags';
 
 export type ArchiveListing = Omit<ArchiveSnapshot, 'entries'> & {
@@ -140,4 +143,24 @@ export class ArchiveClient {
       actorId ? { actorId } : {},
     );
   }
+}
+
+/** The machine's local Archive server (the `archive` block in @inixiative/config ports). */
+export const DEFAULT_URL = 'http://127.0.0.1:4700';
+
+/**
+ * A client for this machine's Archive: `ARCHIVE_URL` or the default address, with `ARCHIVE_TOKEN`
+ * or the home's `server.token`. Undefined until `archive up` (or `init`) has made a token.
+ */
+export function localArchive(options: { home?: string; url?: string; fetch?: typeof fetch } = {}) {
+  const tokenFile = join(options.home ?? defaultHome(), 'server.token');
+  const token =
+    process.env.ARCHIVE_TOKEN ??
+    (existsSync(tokenFile) ? readFileSync(tokenFile, 'utf8').trim() : undefined);
+  if (!token) return undefined;
+  return new ArchiveClient({
+    url: options.url ?? process.env.ARCHIVE_URL ?? DEFAULT_URL,
+    token,
+    fetch: options.fetch,
+  });
 }

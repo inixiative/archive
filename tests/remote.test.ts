@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { collectSessions } from '../src/collector';
 import { archiveSnapshotSchema } from '../src/index';
-import { ArchiveClient } from '../src/remote';
+import { ArchiveClient, localArchive } from '../src/remote';
 import { startArchiveServer } from '../src/server';
 import { freshStore, testDatabaseUrl } from './db';
 
@@ -77,5 +77,27 @@ test('collectors and clients write through the server over HTTP and retry lost r
   } finally {
     await server.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('localArchive reaches this machine’s server once a token exists', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'archive-local-'));
+  const previous = process.env.ARCHIVE_TOKEN;
+  delete process.env.ARCHIVE_TOKEN;
+  await freshStore('serve');
+  const server = await startArchiveServer({
+    databaseUrl: testDatabaseUrl('serve'),
+    token,
+    port: 0,
+  });
+  try {
+    expect(localArchive({ home })).toBeUndefined();
+    writeFileSync(join(home, 'server.token'), `${token}\n`);
+    const archive = localArchive({ home, url: server.server.url.href })!;
+    expect(await archive.sourceId()).toBe(await server.store.sourceId());
+  } finally {
+    if (previous !== undefined) process.env.ARCHIVE_TOKEN = previous;
+    await server.close();
+    rmSync(home, { recursive: true, force: true });
   }
 });
