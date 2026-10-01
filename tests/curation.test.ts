@@ -59,6 +59,14 @@ test('sessions carry an actor; list filters by actor, source, tag and reference 
     const ada = store.capture(snapshot('a', { actor: { kind: 'user', id: 'ada', name: 'Ada' } }));
     store.capture(snapshot('b', { actor: { kind: 'service', id: 'nightly' } }));
     store.capture(snapshot('c'));
+    store.capture(
+      snapshot('d', { actor: { kind: 'job', id: 'renewIntegrations', integrationId: 'int-1' } }),
+    );
+    expect(store.list({ actorId: 'renewIntegrations' })[0].actor).toEqual({
+      kind: 'job',
+      id: 'renewIntegrations',
+      integrationId: 'int-1',
+    });
     const mine = await call(handler, 'list', { actorId: 'ada' });
     expect(mine.body.data.archives.map((a) => [a.id, a.actor])).toEqual([
       [ada.id, { kind: 'user', id: 'ada', name: 'Ada' }],
@@ -67,12 +75,12 @@ test('sessions carry an actor; list filters by actor, source, tag and reference 
     expect(mine.body.data.archives[0].entries).toBe(1);
     const first = await call(handler, 'list', { limit: 2 });
     const second = await call(handler, 'list', { limit: 2, beforeId: first.body.data.nextCursor });
-    expect([...first.body.data.archives, ...second.body.data.archives]).toHaveLength(3);
+    expect([...first.body.data.archives, ...second.body.data.archives]).toHaveLength(4);
     expect(second.body.data.nextCursor).toBeNull();
     const linked = await call(handler, 'list', {
       reference: { integration: 'github', ref: 'inixiative/archive#9' },
     });
-    expect(linked.body.data.archives).toHaveLength(3);
+    expect(linked.body.data.archives).toHaveLength(4);
     expect((await call(handler, 'list', { source: 'codex' })).body.data.archives).toEqual([]);
   } finally {
     store.close();

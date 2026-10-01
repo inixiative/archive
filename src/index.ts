@@ -15,11 +15,13 @@ export const archiveEntrySchema = z.strictObject({
   model: z.string().min(1).max(200).optional(),
   effort: z.string().min(1).max(40).optional(),
 });
-/** Who did the work: a person, or a service such as an API-key run. */
+/** Who did the work: a person, a service such as an API-key run, or a job (id = job name). */
 export const archiveActorSchema = z.strictObject({
-  kind: z.enum(['user', 'service']),
+  kind: z.enum(['user', 'service', 'job']),
   id: identifier,
   name: z.string().min(1).max(200).optional(),
+  /** The integration the work ran under, when there is one. */
+  integrationId: identifier.optional(),
 });
 /** An item in an integration (a GitHub pull request, a Linear issue) the session is about. */
 export const archiveReferenceSchema = z.strictObject({
