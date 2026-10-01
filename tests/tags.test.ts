@@ -1,6 +1,12 @@
 import { expect, test } from 'bun:test';
 import { type ArchiveEntry, archiveSnapshotSchema } from '../src/index';
-import { atlasTags, provenanceTags, referenceSuggestions, suggestTags } from '../src/tags';
+import {
+  archiveReferences,
+  atlasTags,
+  defaultIntegrations,
+  provenanceReferences,
+  suggestTags,
+} from '../src/tags';
 
 const snapshot = (entries: Pick<ArchiveEntry, 'kind' | 'text'>[]) =>
   archiveSnapshotSchema.parse({
@@ -20,7 +26,7 @@ const snapshot = (entries: Pick<ArchiveEntry, 'kind' | 'text'>[]) =>
     })),
   });
 
-test('linked pull requests, issues, commits and Linear issues become reference suggestions, most-linked first', () => {
+test('linked pull requests, issues, commits and Linear issues become references, recorded first, then most-linked', () => {
   const archive = snapshot([
     { kind: 'user', text: 'Fix the bug from https://linear.app/inixiative/issue/arc-12/title' },
     {
@@ -32,27 +38,41 @@ test('linked pull requests, issues, commits and Linear issues become reference s
       text: 'See https://github.com/inixiative/archive/commit/531c17d9a1b2 and github.com/a/b/issues/3',
     },
   ]);
-  expect(referenceSuggestions(archive)).toEqual([
-    { tag: 'github:inixiative/foundry#24', origin: 'reference' },
-    { tag: 'linear:ARC-12', origin: 'reference' },
-    { tag: 'github:a/b#3', origin: 'reference' },
-    { tag: 'github:inixiative/archive@531c17d', origin: 'reference' },
+  archive.references = [{ integration: 'github', ref: 'inixiative/archive' }];
+  expect(archiveReferences(archive)).toEqual([
+    { integration: 'github', ref: 'inixiative/archive', recorded: true, mentions: 0 },
+    { integration: 'github', ref: 'inixiative/foundry#24', recorded: false, mentions: 2 },
+    { integration: 'github', ref: 'a/b#3', recorded: false, mentions: 1 },
+    { integration: 'github', ref: 'inixiative/archive@531c17d', recorded: false, mentions: 1 },
+    { integration: 'linear', ref: 'ARC-12', recorded: false, mentions: 1 },
   ]);
-  expect(suggestTags(archive).map((s) => s.tag)).toEqual([
-    'debugging',
-    ...referenceSuggestions(archive).map((s) => s.tag),
-  ]);
-  expect(referenceSuggestions(archive, 1)).toHaveLength(1);
+  expect(suggestTags(archive)).toEqual([{ tag: 'debugging', origin: 'heuristic' }]);
+  expect(archiveReferences(archive, defaultIntegrations, 1)).toHaveLength(1);
 });
 
-test('recorded git context becomes repository and branch tags', () => {
-  expect(
-    provenanceTags({ repository: 'git@github.com:inixiative/Foundry.git', branch: 'fix/x' }),
-  ).toEqual(['repo:inixiative/foundry', 'branch:fix/x']);
-  expect(provenanceTags({ repository: 'https://github.com/a/b', branch: 'HEAD' })).toEqual([
-    'repo:a/b',
+test("only the archive's integrations are referenced; others match their own pattern", () => {
+  const archive = snapshot([
+    { kind: 'user', text: 'See JIRA-7, jira-8 and https://linear.app/x/issue/ARC-1/t' },
   ]);
-  expect(provenanceTags({ repository: 'https://gitlab.example/a/b' })).toEqual([]);
+  archive.references = [{ integration: 'notion', ref: 'page' }];
+  expect(
+    archiveReferences(archive, [{ key: 'jira', name: 'Jira', pattern: '\\b(JIRA-\\d+)\\b' }]),
+  ).toEqual([{ integration: 'jira', ref: 'JIRA-7', recorded: false, mentions: 1 }]);
+});
+
+test('recorded git context becomes repository and branch references', () => {
+  expect(
+    provenanceReferences({ repository: 'git@github.com:inixiative/Foundry.git', branch: 'fix/x' }),
+  ).toEqual([
+    { integration: 'github', ref: 'inixiative/foundry' },
+    { integration: 'github', ref: 'inixiative/foundry/tree/fix/x' },
+  ]);
+  expect(provenanceReferences({ repository: 'https://github.com/a/b', branch: 'HEAD' })).toEqual([
+    { integration: 'github', ref: 'a/b' },
+  ]);
+  expect(provenanceReferences({ repository: 'https://gitlab.example/a/b', branch: 'x' })).toEqual(
+    [],
+  );
 });
 
 test('Atlas concepts come from files tool calls touched, in any root, never from prose', () => {

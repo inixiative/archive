@@ -2,6 +2,7 @@ import { Database } from 'bun:sqlite';
 import { randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { z } from 'zod';
 import {
   type ArchiveChunk,
   type ArchiveSnapshot,
@@ -11,7 +12,44 @@ import {
   selectChunks,
   snapshotDigest,
 } from './index';
-import { suggestTags } from './tags';
+import {
+  archiveIntegrationSchema,
+  archiveReferences,
+  defaultIntegrations,
+  suggestTags,
+} from './tags';
+
+export const archiveSettingsSchema = z.strictObject({
+  /** Integrations sessions can reference; Kingdom and Foundry display these, Archive owns them. */
+  integrations: z
+    .array(archiveIntegrationSchema)
+    .max(50)
+    .refine(
+      (list) => new Set(list.map((i) => i.key)).size === list.length,
+      'Duplicate integration keys',
+    ),
+  /** Archives whose latest capture is older than this are deleted here. Deletions never sync. */
+  retentionDays: z.number().int().positive().max(36_500).nullable(),
+});
+export type ArchiveSettings = z.infer<typeof archiveSettingsSchema>;
+const defaultSettings: ArchiveSettings = { integrations: defaultIntegrations, retentionDays: null };
+
+const tagSchema = z.string().min(1).max(120);
+/** A conceptual tag this archive offers: archive-wide (no actor) or for one actor. */
+export const tagDefinitionSchema = z.strictObject({
+  tag: tagSchema,
+  actorId: z.string().min(1).max(256).optional(),
+  description: z.string().max(500).optional(),
+});
+export type TagDefinition = z.infer<typeof tagDefinitionSchema>;
+
+export interface ArchiveFilter {
+  projectId?: string;
+  source?: ArchiveSnapshot['source'];
+  tag?: string;
+  actorId?: string;
+  reference?: { integration: string; ref: string };
+}
 
 export class LocalArchiveStore {
   private readonly db: Database;
@@ -28,7 +66,11 @@ export class LocalArchiveStore {
       CREATE TABLE IF NOT EXISTS receipts (archive_id TEXT NOT NULL REFERENCES archives(id), destination TEXT NOT NULL,
         digest TEXT NOT NULL, PRIMARY KEY(archive_id, destination));
       CREATE TABLE IF NOT EXISTS outbox (archive_id TEXT NOT NULL REFERENCES archives(id), destination TEXT NOT NULL,
-        pending TEXT NOT NULL, PRIMARY KEY(archive_id, destination));`);
+        pending TEXT NOT NULL, PRIMARY KEY(archive_id, destination));
+      CREATE TABLE IF NOT EXISTS tag_edits (archive_id TEXT NOT NULL REFERENCES archives(id), tag TEXT NOT NULL,
+        added INTEGER NOT NULL, PRIMARY KEY(archive_id, tag));
+      CREATE TABLE IF NOT EXISTS tag_definitions (actor_id TEXT NOT NULL, tag TEXT NOT NULL, description TEXT,
+        PRIMARY KEY(actor_id, tag));`);
     this.db.query("INSERT OR IGNORE INTO settings VALUES ('sourceId', ?)").run(randomUUID());
     this.sourceId = (
       this.db.query("SELECT value FROM settings WHERE key='sourceId'").get() as { value: string }
@@ -82,21 +124,140 @@ export class LocalArchiveStore {
         }
       : undefined;
   }
-  list() {
+  /** Archive metadata, newest first. Tags are the captured tags with this archive's edits applied. */
+  list(filter: ArchiveFilter = {}) {
+    const { integrations } = this.settings();
     return (
       this.db.query('SELECT id FROM archives ORDER BY rowid DESC').all() as { id: string }[]
-    ).map(({ id }) => {
+    ).flatMap(({ id }) => {
       const archive = this.read(id)!;
-      const { entries, ...snapshot } = archive.snapshot;
-      return {
-        id,
-        revision: archive.revision,
-        digest: archive.digest,
-        ...snapshot,
-        entries: entries.length,
-        suggestedTags: suggestTags(archive.snapshot),
-      };
+      const { entries, tags: _, ...snapshot } = archive.snapshot;
+      const tags = this.tags(id, archive.snapshot.tags);
+      const references = archiveReferences(archive.snapshot, integrations);
+      const reference = filter.reference;
+      if (
+        (filter.projectId && snapshot.projectId !== filter.projectId) ||
+        (filter.source && snapshot.source !== filter.source) ||
+        (filter.tag && !tags.includes(filter.tag)) ||
+        (filter.actorId && snapshot.actor?.id !== filter.actorId) ||
+        (reference &&
+          !references.some(
+            (r) => r.integration === reference.integration && r.ref === reference.ref,
+          ))
+      )
+        return [];
+      return [
+        {
+          id,
+          revision: archive.revision,
+          digest: archive.digest,
+          ...snapshot,
+          tags,
+          entries: entries.length,
+          suggestedTags: suggestTags(archive.snapshot),
+          references,
+        },
+      ];
     });
+  }
+  private tags(id: string, captured: string[]) {
+    const edits = this.db.query('SELECT tag, added FROM tag_edits WHERE archive_id=?').all(id) as {
+      tag: string;
+      added: number;
+    }[];
+    const removed = new Set(edits.filter((e) => !e.added).map((e) => e.tag));
+    return [...new Set([...captured, ...edits.filter((e) => e.added).map((e) => e.tag)])].filter(
+      (tag) => !removed.has(tag),
+    );
+  }
+  /** Tag or untag without a new revision. Edits belong to this archive and do not sync. */
+  tag(id: string, change: { add?: string[]; remove?: string[] }) {
+    const add = z
+      .array(tagSchema)
+      .max(100)
+      .parse(change.add ?? []);
+    const remove = z
+      .array(tagSchema)
+      .max(100)
+      .parse(change.remove ?? []);
+    const archive = this.read(id);
+    if (!archive) throw new Error('Archive unavailable');
+    const captured = new Set(archive.snapshot.tags);
+    const upsert = this.db.query(
+      'INSERT INTO tag_edits VALUES (?, ?, ?) ON CONFLICT(archive_id, tag) DO UPDATE SET added=excluded.added',
+    );
+    const clear = this.db.query('DELETE FROM tag_edits WHERE archive_id=? AND tag=?');
+    return this.db.transaction(() => {
+      for (const tag of add) captured.has(tag) ? clear.run(id, tag) : upsert.run(id, tag, 1);
+      for (const tag of remove) captured.has(tag) ? upsert.run(id, tag, 0) : clear.run(id, tag);
+      const tags = this.tags(id, archive.snapshot.tags);
+      z.array(tagSchema).max(100, 'An archive holds at most 100 tags').parse(tags);
+      return { id, tags };
+    })();
+  }
+  delete(id: string) {
+    return this.db.transaction(() => {
+      for (const table of ['tag_edits', 'receipts', 'outbox', 'revisions'])
+        this.db.query(`DELETE FROM ${table} WHERE archive_id=?`).run(id);
+      return this.db.query('DELETE FROM archives WHERE id=?').run(id).changes > 0;
+    })();
+  }
+  /** Applies the retention setting; returns the deleted archive ids. */
+  prune(now = Date.now()) {
+    const { retentionDays } = this.settings();
+    if (retentionDays === null) return [];
+    const cutoff = now - retentionDays * 86_400_000;
+    const expired = (this.db.query('SELECT id FROM archives').all() as { id: string }[]).filter(
+      ({ id }) => this.read(id)!.snapshot.capturedAt < cutoff,
+    );
+    for (const { id } of expired) this.delete(id);
+    return expired.map(({ id }) => id);
+  }
+  settings(): ArchiveSettings {
+    const row = this.db.query("SELECT value FROM settings WHERE key='archive'").get() as {
+      value: string;
+    } | null;
+    return row ? archiveSettingsSchema.parse(JSON.parse(row.value)) : defaultSettings;
+  }
+  updateSettings(change: Partial<ArchiveSettings>) {
+    const next = archiveSettingsSchema.parse({ ...this.settings(), ...change });
+    this.db
+      .query(
+        "INSERT INTO settings VALUES ('archive', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      )
+      .run(JSON.stringify(next));
+    return next;
+  }
+  /** Offered tags with how many archives carry each; an actor sees archive-wide and their own. */
+  tagDefinitions(actorId?: string) {
+    const rows = this.db
+      .query(
+        "SELECT actor_id, tag, description FROM tag_definitions WHERE actor_id IN ('', ?) ORDER BY tag",
+      )
+      .all(actorId ?? '') as { actor_id: string; tag: string; description: string | null }[];
+    const archives = this.list(actorId ? { actorId } : {});
+    return rows.map((row) => ({
+      tag: row.tag,
+      ...(row.actor_id ? { actorId: row.actor_id } : {}),
+      ...(row.description ? { description: row.description } : {}),
+      archives: archives.filter((archive) => archive.tags.includes(row.tag)).length,
+    }));
+  }
+  defineTag(input: TagDefinition) {
+    const definition = tagDefinitionSchema.parse(input);
+    this.db
+      .query(
+        'INSERT INTO tag_definitions VALUES (?, ?, ?) ON CONFLICT(actor_id, tag) DO UPDATE SET description=excluded.description',
+      )
+      .run(definition.actorId ?? '', definition.tag, definition.description ?? null);
+    return definition;
+  }
+  undefineTag(input: { tag: string; actorId?: string }) {
+    return (
+      this.db
+        .query('DELETE FROM tag_definitions WHERE actor_id=? AND tag=?')
+        .run(input.actorId ?? '', input.tag).changes > 0
+    );
   }
   search(ids: string[], query: string, budget = 2048) {
     return ids.map((id) => {

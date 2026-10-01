@@ -12,6 +12,17 @@ export const archiveEntrySchema = z.strictObject({
   timestamp: z.number().finite().nonnegative().nullable(),
   sourceRef: z.string().min(1).max(512),
 });
+/** Who did the work: a person, or a service such as an API-key run. */
+export const archiveActorSchema = z.strictObject({
+  kind: z.enum(['user', 'service']),
+  id: identifier,
+  name: z.string().min(1).max(200).optional(),
+});
+/** An item in an integration (a GitHub pull request, a Linear issue) the session is about. */
+export const archiveReferenceSchema = z.strictObject({
+  integration: z.string().regex(/^[a-z0-9-]{1,64}$/),
+  ref: z.string().min(1).max(300),
+});
 export const archiveSnapshotSchema = z
   .strictObject({
     schemaVersion: z.literal(1),
@@ -20,6 +31,9 @@ export const archiveSnapshotSchema = z
     sessionId: identifier,
     title: z.string().min(1).max(500),
     projectId: identifier.optional(),
+    actor: archiveActorSchema.optional(),
+    /** Recorded references, such as the session's repository and branch. Linked ones are found in the text. */
+    references: z.array(archiveReferenceSchema).max(100).optional(),
     tags: z.array(z.string().min(1).max(120)).max(100),
     goalIds: z.array(identifier).max(100).default([]),
     runIds: z.array(identifier).max(100).default([]),
@@ -39,6 +53,8 @@ export const archiveSnapshotSchema = z
   });
 export type ArchiveSnapshot = z.infer<typeof archiveSnapshotSchema>;
 export type ArchiveEntry = z.infer<typeof archiveEntrySchema>;
+export type ArchiveActor = z.infer<typeof archiveActorSchema>;
+export type ArchiveReference = z.infer<typeof archiveReferenceSchema>;
 export interface ArchiveChunk {
   id: string;
   entryId: string;

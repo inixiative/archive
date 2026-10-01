@@ -3,7 +3,7 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { importTranscriptFile } from './import-file';
 import { archiveKey } from './index';
 import type { LocalArchiveStore } from './local';
-import { type AtlasFileConcepts, atlasTags, provenanceTags } from './tags';
+import { type AtlasFileConcepts, atlasTags, provenanceReferences } from './tags';
 
 export interface CollectionSource {
   directory: string;
@@ -138,13 +138,14 @@ export async function collectSessions(store: LocalArchiveStore, config: Collecti
         ...new Set([
           ...(old?.snapshot.tags ?? []),
           ...(config.tags ?? []),
-          ...provenanceTags({
-            branch: meta.branch,
-            repository: meta.repository ?? repositories.get(cwd),
-          }),
           ...(graph ? atlasTags(snapshot, graph, roots) : []),
         ]),
       ].slice(0, 100);
+      const references = provenanceReferences({
+        branch: meta.branch,
+        repository: meta.repository ?? repositories.get(cwd),
+      });
+      if (references.length) snapshot.references = references;
       if (store.capture(snapshot).changed) result.imported++;
       else result.unchanged++;
     } catch {
