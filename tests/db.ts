@@ -28,7 +28,10 @@ export type TestDatabase = (typeof TEST_DATABASES)[number];
 export const MIGRATED_DATABASE = 'served';
 
 export async function prepareTestDatabases() {
-  const admin = new Bun.SQL(base.href);
+  // The maintenance database exists in every cluster; the test databases may not yet.
+  const maintenance = new URL(base);
+  maintenance.pathname = '/postgres';
+  const admin = new Bun.SQL(maintenance.href);
   try {
     const migrated = new URL(testDatabaseUrl(MIGRATED_DATABASE)).pathname.slice(1);
     const [present] = await admin`SELECT 1 FROM pg_database WHERE datname = ${migrated}`;
