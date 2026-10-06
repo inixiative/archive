@@ -162,8 +162,8 @@ export async function runCli(args = Bun.argv.slice(2)) {
       while (v.sync && !stopped) {
         try {
           const results = await syncArchives(instance.store, readDestinations(config));
-          const failed = results.filter((r) => r.status.startsWith('failed')).length;
-          if (failed) console.error(JSON.stringify({ sync: 'failed', archives: failed }));
+          const failed = results.filter((r) => r.status.startsWith('failed'));
+          if (failed.length) console.error(JSON.stringify({ sync: 'failed', archives: failed }));
         } catch {
           console.error(JSON.stringify({ sync: 'unavailable' }));
         }

@@ -112,11 +112,11 @@ export async function syncArchives(store: ArchiveStore, destinations: ArchiveDes
           destination: destination.url,
           status: result.unchanged ? 'unchanged' : 'published',
         });
-      } catch {
+      } catch (error) {
         results.push({
           id: archive.id,
           destination: destination.url,
-          status: 'failed; local revision retained',
+          status: `failed; local revision retained: ${error instanceof Error ? error.message : String(error)}`,
         });
       }
     }
