@@ -50,7 +50,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       url: { type: 'string' },
       kind: { type: 'string', default: 'archive' },
       'project-id': { type: 'string' },
-      'connection-id': { type: 'string' },
+      'integration-id': { type: 'string' },
       'owner-model': { type: 'string' },
       'organization-id': { type: 'string' },
       'space-id': { type: 'string' },
@@ -91,7 +91,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'import --file PATH --source codex|claude-code|chatgpt --project-id ID [--tag TAG]\n' +
         'collect --directory HISTORY --source codex|claude-code --project-root EXACT_CWD [--project-root ...] [--worktrees] [--atlas] --project-id ID [--watch]\n' +
         'list | export --id ID | tag --id ID [--tag TAG ...] [--untag TAG ...] | search --query TEXT [--remote]\n' +
-        'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH) [--kind kingdom ...]   (destinations for serve --sync)\n' +
+        'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH) [--kind kingdom --integration-id UUID ...]   (destinations for serve --sync)\n' +
         'sync | routes   (DATABASE_URL: publish to, or preview, destinations once)\n' +
         'agents add-collector --name N --source codex|claude-code --project-id ID --project-root DIR [--project-root ...] [--directory HISTORY] [--worktrees] [--atlas]\n' +
         'agents remove-collector --name N | server --url URL | install | uninstall | status\n' +
@@ -190,7 +190,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       kind: v.kind,
       ...(v.kind === 'kingdom'
         ? {
-            connectionId: v['connection-id'],
+            integrationId: v['integration-id'],
             ownerModel: v['owner-model'],
             organizationId: v['organization-id'],
             spaceId: v['space-id'],

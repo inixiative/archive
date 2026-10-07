@@ -112,7 +112,9 @@ test('hosted auth, immutable revisions, concurrent-write conflicts and bounded s
         await (await handler(request('search', { query: 'userevidence' }))).json(),
       ).data.archives,
     ).toHaveLength(2);
-    expect((await handler(request('search', { connectionId: 'not-standalone' }))).status).toBe(400);
+    expect((await handler(request('search', { integrationId: 'not-standalone' }))).status).toBe(
+      400,
+    );
   } finally {
   }
 });
@@ -261,7 +263,7 @@ test('hosted tag filtering matches exact explicit tags, not transcript mentions'
   }
 });
 
-test('Kingdom destinations name an owner and optional forwarding connection', async () => {
+test('Kingdom destinations name an owner and its Archive integration', async () => {
   const local = await freshStore();
   const id = (await local.capture(snapshot())).id;
   const sent: { path: string; body: any }[] = [];
@@ -281,39 +283,31 @@ test('Kingdom destinations name an owner and optional forwarding connection', as
   process.env.KINGDOM_TEST_RUNTIME = 'kingdom_runtime_synthetic';
   try {
     const organizationId = '1ae3ac76-faa8-4498-8072-425ab35f453c';
+    const integrationId = '01a0e466-dfd8-7603-80dd-8ead750293b5';
     await publishArchive(
       local,
       id,
-      destination({ ownerModel: 'Organization', organizationId }),
+      destination({ ownerModel: 'Organization', organizationId, integrationId }),
       kingdom,
     );
-    await publishArchive(local, id, destination({ connectionId: 'inixiative' }), kingdom);
-    expect(sent.map(({ path }) => path)).toEqual([
-      '/api/v1/archive/ingest',
-      '/api/v1/archive/remote/ingest',
-    ]);
+    expect(sent.map(({ path }) => path)).toEqual(['/api/v1/archive/ingest']);
     expect(Object.keys(sent[0].body).sort()).toEqual([
+      'integrationId',
       'organizationId',
       'ownerModel',
       'previousDigest',
       'snapshot',
     ]);
-    expect(Object.keys(sent[1].body).sort()).toEqual([
-      'connectionId',
-      'previousDigest',
-      'snapshot',
-    ]);
     expect(
-      (await routingPreview(local, [destination({ connectionId: 'inixiative' })]))[0]
-        .destinations as unknown,
-    ).toEqual([{ kind: 'kingdom', url: 'https://kingdom.example/', connectionId: 'inixiative' }]);
+      (await routingPreview(local, [destination({ integrationId })]))[0].destinations as unknown,
+    ).toEqual([{ kind: 'kingdom', url: 'https://kingdom.example/', integrationId }]);
     await expect(
       publishArchive(local, id, destination({ ownerId: organizationId }), kingdom),
     ).rejects.toThrow();
     process.env.KINGDOM_TEST_RUNTIME = 'not-a-runtime-credential';
-    await expect(publishArchive(local, id, destination({}), kingdom)).rejects.toThrow(
-      'credential unavailable',
-    );
+    await expect(
+      publishArchive(local, id, destination({ integrationId }), kingdom),
+    ).rejects.toThrow('credential unavailable');
   } finally {
     delete process.env.KINGDOM_TEST_RUNTIME;
   }

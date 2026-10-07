@@ -9,12 +9,12 @@ import type { ArchiveStore } from './store';
 
 export { type ArchiveDestination, archiveDestinationSchema } from './config';
 
-/** Identifies the Kingdom owner and forwarding connection; standalone Archive needs neither. */
+/** Identifies the Kingdom owner and Archive integration; standalone Archive needs neither. */
 export function kingdomFields(destination: ArchiveDestination) {
   if (destination.kind === 'archive') return {};
-  const { ownerModel, organizationId, spaceId, connectionId } = destination;
+  const { ownerModel, organizationId, spaceId, integrationId } = destination;
   return Object.fromEntries(
-    Object.entries({ ownerModel, organizationId, spaceId, connectionId }).filter(
+    Object.entries({ ownerModel, organizationId, spaceId, integrationId }).filter(
       ([, value]) => value !== undefined,
     ),
   );
@@ -30,9 +30,7 @@ export async function archiveRequest(
   const token = destinationToken(destination);
   if (!token || (destination.kind === 'kingdom' && !token.startsWith('kingdom_runtime_')))
     throw new Error('Archive runtime credential unavailable');
-  const path =
-    destination.kind === 'kingdom' && destination.connectionId ? `remote/${action}` : action;
-  const response = await transport(new URL(`api/v1/archive/${path}`, url), {
+  const response = await transport(new URL(`api/v1/archive/${action}`, url), {
     method: 'POST',
     redirect: 'error',
     signal: AbortSignal.timeout(30_000),

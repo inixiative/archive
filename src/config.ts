@@ -38,12 +38,8 @@ export const archiveDestinationSchema = z
     z.strictObject({
       ...common,
       kind: z.literal('kingdom'),
-      /** A hosted Archive that Kingdom forwards to; omitted, Kingdom stores the archive itself. */
-      connectionId: z
-        .string()
-        .regex(/^[a-z0-9-]+$/)
-        .max(120)
-        .optional(),
+      /** The owner's Archive integration in Kingdom that receives the archive. */
+      integrationId: z.uuid(),
       ...kingdomOwnerFields,
     }),
   ])
@@ -100,7 +96,7 @@ export function destinationIdentity(destination: ArchiveDestination) {
     destination.kind === 'archive'
       ? 'standalone'
       : [
-          destination.connectionId ?? 'kingdom',
+          destination.integrationId,
           destination.ownerModel ?? null,
           destination.organizationId ?? null,
           destination.spaceId ?? null,

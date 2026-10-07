@@ -68,19 +68,13 @@ archive agents status
 
 ## Connect through Kingdom
 
-Pair a runtime with Kingdom (Foundry: Settings → Kingdom) and expose its `kingdom_runtime_` credential in an environment variable, then either let Kingdom store the archives:
+Pair a runtime with Kingdom (Foundry: Settings → Kingdom) and expose its `kingdom_runtime_` credential in an environment variable, then send a project's archives through the owner's Archive integration in Kingdom:
 
 ```sh
-bun run archive connect --kind kingdom --url https://your-kingdom.example --project-id inixiative --token-env KINGDOM_ARCHIVE_TOKEN
+bun run archive connect --kind kingdom --url https://your-kingdom.example --integration-id INTEGRATION_UUID --project-id inixiative --token-env KINGDOM_ARCHIVE_TOKEN
 ```
 
-or forward them through Kingdom to a hosted Archive it has bound for that project:
-
-```sh
-bun run archive connect --kind kingdom --url https://your-kingdom.example --connection-id inixiative --project-id inixiative --token-env KINGDOM_ARCHIVE_TOKEN
-```
-
-Kingdom takes the owner from the runtime credential; `--owner-model`, `--organization-id` and `--space-id` narrow it to an organization or space that owner manages. A forwarding connection accepts only its bound `projectId`, and the hosted Archive's own token stays in Kingdom's server environment. A Kingdom runtime credential is distinct from a standalone Archive token. Kingdom retains responsibility for memberships, shares, revocation and hosted browsing.
+Kingdom keeps no archive store: it forwards to the Archive server behind that integration, whose own token stays in Kingdom as an encrypted credential. Kingdom takes the owner from the runtime credential; `--owner-model`, `--organization-id` and `--space-id` narrow it to an organization or space that owner manages. A Kingdom runtime credential is distinct from a standalone Archive token. Sharing is a Signet in Kingdom.
 
 Foundry writes its captures to the local Archive server through `@inixiative/archive/remote`.
 
