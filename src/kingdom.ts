@@ -1,8 +1,8 @@
 import { join } from 'node:path';
 import {
   collectPairing,
-  generateClientKey,
-  kingdomOrigin,
+  generateSignetKey,
+  kingdomUrl,
   requestPairing,
   SignetClient,
   saveCollectedSignet,
@@ -14,7 +14,7 @@ const pollMs = 3000;
 
 /** Libraries this Archive's Signet may write to, as Kingdom describes them. */
 export async function writableLibraries(credentialFile: string) {
-  const description = await new SignetClient(credentialFile).describe();
+  const description = await (await SignetClient.fromFile(credentialFile)).describe();
   return (
     description.operations
       .find((operation) => operation.key === 'sessions.write')
@@ -38,9 +38,9 @@ export async function pairWithKingdom(input: {
   onReview: (review: { reviewCode: string; review: string; expiresAt: string }) => void;
   sleep?: (ms: number) => Promise<unknown>;
 }) {
-  const kingdom = kingdomOrigin(input.kingdom);
+  const kingdom = kingdomUrl(input.kingdom);
   const keyFile = join(input.directory, `key-${crypto.randomUUID()}.json`);
-  await writePrivateJson(keyFile, generateClientKey());
+  await writePrivateJson(keyFile, generateSignetKey());
   const pending = await requestPairing(kingdom, keyFile, {
     provider: 'archive',
     deviceId: input.sourceId,

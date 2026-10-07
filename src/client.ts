@@ -1,4 +1,4 @@
-import { SignetClient } from '@inixiative/signet';
+import { kingdomUrl, SignetClient } from '@inixiative/signet';
 import {
   type ArchiveDestination,
   archiveDestinationSchema,
@@ -37,8 +37,12 @@ export async function archiveRequest(
   return response.json() as Promise<{ data: any }>;
 }
 
-const kingdomSignet = (destination: KingdomDestination) =>
-  new SignetClient(destination.credentialFile, { url: destination.url });
+const kingdomSignet = async (destination: KingdomDestination) => {
+  const signet = await SignetClient.fromFile(destination.credentialFile);
+  if (signet.url !== kingdomUrl(destination.url))
+    throw new Error('The Signet credential belongs to a different Kingdom');
+  return signet;
+};
 
 /** Runs one Archive operation on the destination's library through the paired Signet. */
 export async function kingdomArchiveOperation(
@@ -46,7 +50,7 @@ export async function kingdomArchiveOperation(
   operation: 'sessions.write' | 'documents.search',
   input: Record<string, unknown>,
 ) {
-  const { result } = await kingdomSignet(destination).execute(
+  const { result } = await (await kingdomSignet(destination)).execute(
     {
       integrationId: destination.integrationId,
       operation,

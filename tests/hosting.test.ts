@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { chmodSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { generateClientKey, verifySignetProof, writePrivateJson } from '@inixiative/signet';
+import { generateSignetKey, verifySignetProof, writePrivateJson } from '@inixiative/signet';
 import { z } from 'zod';
 import { runCli } from '../src/cli';
 import { publishArchive, routingPreview, searchRemotes, syncArchives } from '../src/client';
@@ -335,7 +335,7 @@ test('Kingdom destinations write and search through the paired Signet', async ()
   const resourceId = crypto.randomUUID();
   const keyFile = join(directory, 'key.json');
   const credentialFile = join(directory, 'signet.json');
-  await writePrivateJson(keyFile, generateClientKey());
+  await writePrivateJson(keyFile, generateSignetKey());
   await writePrivateJson(credentialFile, {
     url: origin,
     signetId,
