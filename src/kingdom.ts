@@ -1,3 +1,4 @@
+import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   collectPairing,
@@ -41,6 +42,19 @@ export async function pairWithKingdom(input: {
   const kingdom = kingdomUrl(input.kingdom);
   const keyFile = join(input.directory, `key-${crypto.randomUUID()}.json`);
   await writePrivateJson(keyFile, generateSignetKey());
+  try {
+    return await awaitPairing(kingdom, keyFile, input);
+  } catch (error) {
+    await rm(keyFile, { force: true });
+    throw error;
+  }
+}
+
+async function awaitPairing(
+  kingdom: string,
+  keyFile: string,
+  input: Parameters<typeof pairWithKingdom>[0],
+) {
   const pending = await requestPairing(kingdom, keyFile, {
     provider: 'archive',
     deviceId: input.sourceId,

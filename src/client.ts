@@ -14,7 +14,7 @@ type DirectDestination = Extract<ArchiveDestination, { kind: 'archive' }>;
 type KingdomDestination = Extract<ArchiveDestination, { kind: 'kingdom' }>;
 type Ingested = { id: string; digest: string; revision: number; changed: boolean };
 
-const sessionWriteTimeoutMs = 180_000;
+const sessionWriteTimeoutMs = 300_000;
 
 export async function archiveRequest(
   destination: DirectDestination,
@@ -161,7 +161,11 @@ export async function searchRemotes(
                   projectId: destination.projectId,
                 })
               ).data
-            : await kingdomArchiveOperation(destination, 'documents.search', { query, budget });
+            : await kingdomArchiveOperation(destination, 'documents.search', {
+                query,
+                budget,
+                projectId: destination.projectId,
+              });
         return {
           destination: destination.url,
           projectId: destination.projectId,
