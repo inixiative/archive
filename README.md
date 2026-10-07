@@ -68,13 +68,33 @@ archive agents status
 
 ## Connect through Kingdom
 
-Pair a runtime with Kingdom (Foundry: Settings → Kingdom) and expose its `kingdom_runtime_` credential in an environment variable, then send a project's archives through the owner's Archive integration in Kingdom:
+Kingdom is the permission hub. Your machine's Archive talks directly only to local pieces, such as your local Foundry. It reaches a hosted Archive through Kingdom, by presenting a Signet.
+
+First, pair this Archive with Kingdom:
 
 ```sh
-bun run archive connect --kind kingdom --url https://your-kingdom.example --integration-id INTEGRATION_UUID --project-id inixiative --token-env KINGDOM_ARCHIVE_TOKEN
+bun run archive pair --kingdom https://api.your-kingdom.example --name "Work laptop"
 ```
 
-Kingdom keeps no archive store: it forwards to the Archive server behind that integration, whose own token stays in Kingdom as an encrypted credential. Kingdom takes the owner from the runtime credential; `--owner-model`, `--organization-id` and `--space-id` narrow it to an organization or space that owner manages. A Kingdom runtime credential is distinct from a standalone Archive token. Sharing is a Signet in Kingdom.
+`pair` creates a device key in `<home>/kingdom/` and asks Kingdom to pair this Archive, identified by its `sourceId`. It prints a review code and a link. Open the link, choose the owner and the hosted Archives this machine may write to, and approve. The command waits for the approval, then saves the delivered Signet credential (0600) and lists the libraries it may write to.
+
+Next, route a project to one of those libraries:
+
+```sh
+bun run archive connect --kind kingdom --url https://api.your-kingdom.example --credential-file ~/.archive/kingdom/signet-SIGNET.json --integration-id HOSTED_ARCHIVE_INTEGRATION --resource-id LIBRARY --project-id inixiative
+```
+
+`connect` checks that the Signet grants `sessions.write` on that library before it saves anything. `serve --sync` then sends each changed session through `POST /api/v1/access/execute`. Every call carries the Signet's access token and a fresh DPoP proof (`@inixiative/signet` renews the token).
+
+Kingdom enforces the grant on every write:
+
+- It accepts only snapshots whose `sourceId` is this Archive's.
+- It records the paired integration on the session's actor.
+- It resolves a revision conflict from this source by writing over the hosted head. Older captures are still refused.
+
+Each write is usage on the Signet. Revoke the Signet, or pause the local Archive integration in Kingdom, to stop it. `search --remote` uses `documents.search` when the Signet grants it.
+
+Kingdom keeps no archive store. It forwards each write to the hosted Archive server, whose own token stays in Kingdom as an encrypted credential.
 
 Foundry writes its captures to the local Archive server through `@inixiative/archive/remote`.
 

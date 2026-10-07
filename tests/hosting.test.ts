@@ -1,12 +1,15 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { chmodSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { generateClientKey, verifySignetProof, writePrivateJson } from '@inixiative/signet';
 import { z } from 'zod';
 import { runCli } from '../src/cli';
-import { publishArchive, routingPreview, syncArchives } from '../src/client';
+import { publishArchive, routingPreview, searchRemotes, syncArchives } from '../src/client';
 import { type ArchiveDestination, connectDestination, readDestinations } from '../src/config';
 import { archiveSnapshotSchema } from '../src/index';
+import { verifyKingdomDestination } from '../src/kingdom';
 import { createArchiveHandler, startArchiveServer } from '../src/server';
 import { ArchiveStore } from '../src/store';
 import { freshStore, testDatabaseUrl } from './db';
@@ -263,52 +266,121 @@ test('hosted tag filtering matches exact explicit tags, not transcript mentions'
   }
 });
 
-test('Kingdom destinations name an owner and its Archive integration', async () => {
+test('Kingdom destinations write and search through the paired Signet', async () => {
   const local = await freshStore();
   const id = (await local.capture(snapshot())).id;
-  const sent: { path: string; body: any }[] = [];
-  const kingdom = (async (url: any, options: any) => {
-    const body = JSON.parse(options.body);
-    sent.push({ path: new URL(url).pathname, body });
-    return Response.json({ data: { digest: (await local.read(id))!.digest } });
-  }) as unknown as typeof fetch;
-  const destination = (fields: object) =>
-    ({
-      kind: 'kingdom',
-      projectId: 'inixiative',
-      url: 'https://kingdom.example/',
-      tokenEnv: 'KINGDOM_TEST_RUNTIME',
-      ...fields,
-    }) as ArchiveDestination;
-  process.env.KINGDOM_TEST_RUNTIME = 'kingdom_runtime_synthetic';
+  const directory = mkdtempSync(join(tmpdir(), 'archive-kingdom-'));
+  chmodSync(directory, 0o700);
+  const nonces = new Set<string>();
+  const executed: Record<string, any>[] = [];
+  const kingdom = Bun.serve({
+    port: 0,
+    hostname: '127.0.0.1',
+    async fetch(request) {
+      const action = new URL(request.url).pathname.split('/').pop()!;
+      const body = (await request.json()) as Record<string, any>;
+      const data = (value: unknown) => Response.json({ data: value });
+      if (action === 'nonce') {
+        const nonce = randomBytes(32).toString('base64url');
+        nonces.add(nonce);
+        return data({ nonce, expiresAt: new Date().toISOString() });
+      }
+      const token = request.headers.get('authorization')?.slice(5);
+      const proof = await verifySignetProof({
+        proof: request.headers.get('dpop') ?? '',
+        url: `${origin}/api/v1/access/${action}`,
+        method: 'POST',
+        now: new Date(),
+        token,
+      });
+      if (!nonces.delete(proof.nonce)) return Response.json({}, { status: 401 });
+      if (action === 'describe')
+        return data({
+          signetId,
+          integrationId: localIntegrationId,
+          provider: 'archive',
+          name: 'Laptop Archive',
+          expiresAt: null,
+          lifecycle: 'ongoing',
+          taskId: null,
+          currentRevision: 1,
+          remainingRequests: null,
+          operations: [
+            {
+              key: 'sessions.write',
+              name: 'Write sessions',
+              resources: [
+                { id: resourceId, name: 'Org Archive', kind: 'archiveLibrary', integrationId },
+              ],
+            },
+          ],
+        });
+      if (action === 'execute') {
+        executed.push(body);
+        if (body.operation === 'documents.search')
+          return data({ executionId: crypto.randomUUID(), result: { documents: [] } });
+        const digest = (await local.read(id))!.digest;
+        return data({
+          executionId: crypto.randomUUID(),
+          result: { id, digest, revision: 1, changed: true },
+        });
+      }
+      return Response.json({}, { status: 404 });
+    },
+  });
+  const origin = `http://127.0.0.1:${kingdom.port}`;
+  const signetId = crypto.randomUUID();
+  const localIntegrationId = crypto.randomUUID();
+  const integrationId = crypto.randomUUID();
+  const resourceId = crypto.randomUUID();
+  const keyFile = join(directory, 'key.json');
+  const credentialFile = join(directory, 'signet.json');
+  await writePrivateJson(keyFile, generateClientKey());
+  await writePrivateJson(credentialFile, {
+    url: origin,
+    signetId,
+    integrationId: localIntegrationId,
+    keyFile,
+    enrollmentId: crypto.randomUUID(),
+    lifecycle: 'ongoing',
+    taskId: null,
+    accessToken: `kingdom_${'a'.repeat(43)}`,
+    renewalCredential: `signet_renew_${'b'.repeat(43)}`,
+    expiresAt: new Date(Date.now() + 300000).toISOString(),
+    renewalExpiresAt: new Date(Date.now() + 86400000).toISOString(),
+    idleExpiresAt: new Date(Date.now() + 86400000).toISOString(),
+    tokenType: 'DPoP',
+  });
+  const destination: ArchiveDestination = {
+    kind: 'kingdom',
+    projectId: 'inixiative',
+    url: origin,
+    credentialFile,
+    integrationId,
+    resourceId,
+  };
   try {
-    const organizationId = '1ae3ac76-faa8-4498-8072-425ab35f453c';
-    const integrationId = '01a0e466-dfd8-7603-80dd-8ead750293b5';
-    await publishArchive(
-      local,
-      id,
-      destination({ ownerModel: 'Organization', organizationId, integrationId }),
-      kingdom,
-    );
-    expect(sent.map(({ path }) => path)).toEqual(['/api/v1/archive/ingest']);
-    expect(Object.keys(sent[0].body).sort()).toEqual([
-      'integrationId',
-      'organizationId',
-      'ownerModel',
-      'previousDigest',
-      'snapshot',
+    await verifyKingdomDestination(destination);
+    await expect(
+      verifyKingdomDestination({ ...destination, resourceId: crypto.randomUUID() }),
+    ).rejects.toThrow('does not grant sessions.write');
+    await publishArchive(local, id, destination);
+    expect(executed[0]).toMatchObject({
+      signetId,
+      integrationId,
+      operation: 'sessions.write',
+      input: { resourceId, previousDigest: null },
+    });
+    expect(executed[0].input.snapshot.sessionId).toBe('one');
+    expect(await publishArchive(local, id, destination)).toEqual({ unchanged: true });
+    expect((await routingPreview(local, [destination]))[0].destinations).toEqual([
+      { kind: 'kingdom', url: origin, integrationId },
     ]);
-    expect(
-      (await routingPreview(local, [destination({ integrationId })]))[0].destinations as unknown,
-    ).toEqual([{ kind: 'kingdom', url: 'https://kingdom.example/', integrationId }]);
-    await expect(
-      publishArchive(local, id, destination({ ownerId: organizationId }), kingdom),
-    ).rejects.toThrow();
-    process.env.KINGDOM_TEST_RUNTIME = 'not-a-runtime-credential';
-    await expect(
-      publishArchive(local, id, destination({ integrationId }), kingdom),
-    ).rejects.toThrow('credential unavailable');
+    const [remote] = await searchRemotes([destination], 'anything');
+    expect(remote).toMatchObject({ data: { documents: [] } });
+    expect(executed.at(-1)).toMatchObject({ operation: 'documents.search' });
   } finally {
-    delete process.env.KINGDOM_TEST_RUNTIME;
+    kingdom.stop(true);
+    rmSync(directory, { recursive: true, force: true });
   }
 });

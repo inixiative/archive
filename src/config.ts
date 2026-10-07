@@ -14,39 +14,36 @@ import {
 import { dirname, isAbsolute } from 'node:path';
 import { z } from 'zod';
 
-const common = {
-  projectId: z.string().min(1).max(256),
-  url: z.url(),
-  tokenEnv: z
-    .string()
-    .regex(/^[A-Z][A-Z0-9_]+$/)
-    .optional(),
-  tokenFile: z.string().max(4096).refine(isAbsolute, 'tokenFile must be absolute').optional(),
-};
-/** Kingdom derives the owner from the runtime credential; these narrow it to a space or organization it manages. */
-export const kingdomOwnerFields = {
-  ownerModel: z.enum(['User', 'OrganizationUser', 'Organization', 'Space', 'SpaceUser']).optional(),
-  organizationId: z.uuid().optional(),
-  spaceId: z.uuid().optional(),
-};
-export const archiveDestinationSchema = z
-  .union([
-    z.strictObject({
-      ...common,
-      kind: z.literal('archive'),
-    }),
-    z.strictObject({
-      ...common,
-      kind: z.literal('kingdom'),
-      /** The owner's Archive integration in Kingdom that receives the archive. */
-      integrationId: z.uuid(),
-      ...kingdomOwnerFields,
-    }),
-  ])
+const projectId = z.string().min(1).max(256);
+/** A remote Archive this one syncs to directly with its server token. */
+const archiveDestination = z
+  .strictObject({
+    kind: z.literal('archive'),
+    projectId,
+    url: z.url(),
+    tokenEnv: z
+      .string()
+      .regex(/^[A-Z][A-Z0-9_]+$/)
+      .optional(),
+    tokenFile: z.string().max(4096).refine(isAbsolute, 'tokenFile must be absolute').optional(),
+  })
   .refine(
     (d) => Boolean(d.tokenEnv) !== Boolean(d.tokenFile),
     'Set exactly one of tokenEnv or tokenFile',
   );
+/**
+ * A hosted Archive reached through Kingdom: this Archive presents the Signet it was paired with,
+ * granting sessions.write on that Archive's library.
+ */
+const kingdomDestination = z.strictObject({
+  kind: z.literal('kingdom'),
+  projectId,
+  url: z.url(),
+  credentialFile: z.string().max(4096).refine(isAbsolute, 'credentialFile must be absolute'),
+  integrationId: z.uuid(),
+  resourceId: z.uuid(),
+});
+export const archiveDestinationSchema = z.union([archiveDestination, kingdomDestination]);
 export type ArchiveDestination = z.infer<typeof archiveDestinationSchema>;
 
 /** Private regular file owned by this user; a symlink or group/world access is refused. */
@@ -61,7 +58,7 @@ export function readTokenFile(path: string) {
     closeSync(fd);
   }
 }
-export const destinationToken = (destination: ArchiveDestination) =>
+export const destinationToken = (destination: z.infer<typeof archiveDestination>) =>
   destination.tokenFile ? readTokenFile(destination.tokenFile) : process.env[destination.tokenEnv!];
 
 export function destinationUrl(input: string) {
@@ -89,18 +86,12 @@ export function readDestinations(file: string): ArchiveDestination[] {
 }
 export function destinationIdentity(destination: ArchiveDestination) {
   const url = destinationUrl(destination.url);
-  // Preserve existing Foundry/Kingdom upload receipt identities.
   return JSON.stringify([
     url.origin,
     new URL(destination.url).pathname,
     destination.kind === 'archive'
       ? 'standalone'
-      : [
-          destination.integrationId,
-          destination.ownerModel ?? null,
-          destination.organizationId ?? null,
-          destination.spaceId ?? null,
-        ],
+      : ['kingdom', destination.integrationId, destination.resourceId],
   ]);
 }
 export function connectDestination(file: string, input: unknown) {
@@ -123,8 +114,10 @@ export function connectDestination(file: string, input: unknown) {
     kind: destination.kind,
     projectId: destination.projectId,
     url: destination.url,
-    ...(destination.tokenFile
-      ? { tokenFile: destination.tokenFile }
-      : { tokenEnv: destination.tokenEnv }),
+    ...(destination.kind === 'kingdom'
+      ? { integrationId: destination.integrationId, resourceId: destination.resourceId }
+      : destination.tokenFile
+        ? { tokenFile: destination.tokenFile }
+        : { tokenEnv: destination.tokenEnv }),
   };
 }

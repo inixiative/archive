@@ -391,6 +391,7 @@ test('token files: exactly one credential source, private regular file, read at 
       url: instance.server.url.href,
       tokenFile: file,
     });
+    if (destination.kind !== 'archive') throw new Error('Expected a direct Archive destination');
     writeFileSync(file, 'wrong\n');
     await expect(
       archiveRequest(destination, 'search', { query: '', projectId: 'p' }),

@@ -32,13 +32,17 @@ export class ArchiveRequestError extends Error {
 export class ArchiveClient {
   private cachedSourceId?: string;
   constructor(private readonly options: { url: string; token: string; fetch?: typeof fetch }) {}
-  async request<T>(action: string, body: unknown = {}): Promise<T> {
+  async request<T>(
+    action: string,
+    body: unknown = {},
+    { timeoutMs = 30_000 }: { timeoutMs?: number } = {},
+  ): Promise<T> {
     const response = await (this.options.fetch ?? fetch)(
       new URL(`api/v1/archive/${action}`, this.options.url),
       {
         method: 'POST',
         redirect: 'error',
-        signal: AbortSignal.timeout(30_000),
+        signal: AbortSignal.timeout(timeoutMs),
         headers: {
           authorization: `Bearer ${this.options.token}`,
           'content-type': 'application/json',

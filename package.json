@@ -1,6 +1,6 @@
 {
   "name": "@inixiative/archive",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
@@ -35,6 +35,7 @@
     "prepare": "if git rev-parse --git-dir >/dev/null 2>&1; then lefthook install; fi && prisma generate"
   },
   "dependencies": {
+    "@inixiative/signet": "file:/private/tmp/claude-501/-Users-arongreenspan-code-inixiative/c100a93c-aa39-490b-b4da-02e6c8c8108d/scratchpad/pkg/signet-1791415282.tgz",
     "@prisma/client": "^6.6.0",
     "js-tiktoken": "1.0.21",
     "prisma": "^6.6.0",

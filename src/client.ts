@@ -1,3 +1,4 @@
+import { SignetClient } from '@inixiative/signet';
 import {
   type ArchiveDestination,
   archiveDestinationSchema,
@@ -9,31 +10,25 @@ import type { ArchiveStore } from './store';
 
 export { type ArchiveDestination, archiveDestinationSchema } from './config';
 
-/** Identifies the Kingdom owner and Archive integration; standalone Archive needs neither. */
-export function kingdomFields(destination: ArchiveDestination) {
-  if (destination.kind === 'archive') return {};
-  const { ownerModel, organizationId, spaceId, integrationId } = destination;
-  return Object.fromEntries(
-    Object.entries({ ownerModel, organizationId, spaceId, integrationId }).filter(
-      ([, value]) => value !== undefined,
-    ),
-  );
-}
+type DirectDestination = Extract<ArchiveDestination, { kind: 'archive' }>;
+type KingdomDestination = Extract<ArchiveDestination, { kind: 'kingdom' }>;
+type Ingested = { id: string; digest: string; revision: number; changed: boolean };
+
+const sessionWriteTimeoutMs = 180_000;
 
 export async function archiveRequest(
-  destination: ArchiveDestination,
+  destination: DirectDestination,
   action: string,
   body: unknown,
   transport: typeof fetch = fetch,
 ) {
   const url = destinationUrl(destination.url);
   const token = destinationToken(destination);
-  if (!token || (destination.kind === 'kingdom' && !token.startsWith('kingdom_runtime_')))
-    throw new Error('Archive runtime credential unavailable');
+  if (!token) throw new Error('Archive server token unavailable');
   const response = await transport(new URL(`api/v1/archive/${action}`, url), {
     method: 'POST',
     redirect: 'error',
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(action === 'ingest' ? sessionWriteTimeoutMs : 30_000),
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
     body: JSON.stringify(body),
   });
@@ -41,6 +36,35 @@ export async function archiveRequest(
     throw new Error(`Archive request rejected (${response.status}); local archive retained`);
   return response.json() as Promise<{ data: any }>;
 }
+
+const kingdomSignet = (destination: KingdomDestination) =>
+  new SignetClient(destination.credentialFile, { url: destination.url });
+
+/** Runs one Archive operation on the destination's library through the paired Signet. */
+export async function kingdomArchiveOperation(
+  destination: KingdomDestination,
+  operation: 'sessions.write' | 'documents.search',
+  input: Record<string, unknown>,
+) {
+  const { result } = await kingdomSignet(destination).execute(
+    {
+      integrationId: destination.integrationId,
+      operation,
+      input: { resourceId: destination.resourceId, limit: 20, ...input },
+    },
+    { timeoutMs: operation === 'sessions.write' ? sessionWriteTimeoutMs : 30_000 },
+  );
+  return result;
+}
+
+const ingest = async (
+  destination: ArchiveDestination,
+  body: { snapshot: unknown; previousDigest: string | null },
+  transport: typeof fetch,
+) =>
+  (destination.kind === 'archive'
+    ? (await archiveRequest(destination, 'ingest', body, transport)).data
+    : await kingdomArchiveOperation(destination, 'sessions.write', body)) as Ingested | undefined;
 
 export async function publishArchive(
   store: ArchiveStore,
@@ -66,17 +90,12 @@ export async function publishArchive(
     const queued = await store.read(id, pending.revision);
     if (!queued || queued.snapshot.projectId !== destination.projectId)
       throw new Error('Pending archive is outside destination project');
-    const body = await archiveRequest(
+    const acknowledged = await ingest(
       destination,
-      'ingest',
-      {
-        ...kingdomFields(destination),
-        previousDigest,
-        snapshot: queued.snapshot,
-      },
+      { previousDigest, snapshot: queued.snapshot },
       transport,
     );
-    if (body.data?.digest !== queued.digest) throw new Error('Archive acknowledgement mismatch');
+    if (acknowledged?.digest !== queued.digest) throw new Error('Archive acknowledgement mismatch');
     await store.delivered(id, receiptKey, queued.digest);
     sent = true;
   }
@@ -94,7 +113,7 @@ export async function routingPreview(store: ArchiveStore, destinations: ArchiveD
       .map((d) => ({
         kind: d.kind,
         url: d.url,
-        ...kingdomFields(d),
+        ...(d.kind === 'kingdom' ? { integrationId: d.integrationId } : {}),
       })),
   }));
 }
@@ -129,17 +148,20 @@ export async function searchRemotes(
   return Promise.all(
     destinations.map(async (destination) => {
       try {
-        const result = await archiveRequest(destination, 'search', {
-          query,
-          budget,
-          ...(destination.kind === 'archive'
-            ? { projectId: destination.projectId }
-            : kingdomFields(destination)),
-        });
+        const data =
+          destination.kind === 'archive'
+            ? (
+                await archiveRequest(destination, 'search', {
+                  query,
+                  budget,
+                  projectId: destination.projectId,
+                })
+              ).data
+            : await kingdomArchiveOperation(destination, 'documents.search', { query, budget });
         return {
           destination: destination.url,
           projectId: destination.projectId,
-          data: result.data,
+          data,
         };
       } catch {
         return {

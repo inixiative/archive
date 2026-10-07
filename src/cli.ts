@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -15,16 +16,11 @@ import {
   writeAgents,
 } from './agents';
 import { importChatGPTThread } from './chatgpt';
-import {
-  archiveRequest,
-  kingdomFields,
-  routingPreview,
-  searchRemotes,
-  syncArchives,
-} from './client';
+import { archiveRequest, routingPreview, searchRemotes, syncArchives } from './client';
 import { collectSessions } from './collector';
 import { archiveDestinationSchema, connectDestination, readDestinations } from './config';
 import { importTranscriptFile } from './import-file';
+import { pairWithKingdom, verifyKingdomDestination } from './kingdom';
 import { previewImports } from './preview';
 import { ArchiveClient, DEFAULT_URL } from './remote';
 import { startArchiveServer } from './server';
@@ -51,9 +47,9 @@ export async function runCli(args = Bun.argv.slice(2)) {
       kind: { type: 'string', default: 'archive' },
       'project-id': { type: 'string' },
       'integration-id': { type: 'string' },
-      'owner-model': { type: 'string' },
-      'organization-id': { type: 'string' },
-      'space-id': { type: 'string' },
+      'resource-id': { type: 'string' },
+      'credential-file': { type: 'string' },
+      kingdom: { type: 'string' },
       'token-env': { type: 'string' },
       'token-file': { type: 'string' },
       file: { type: 'string' },
@@ -91,7 +87,9 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'import --file PATH --source codex|claude-code|chatgpt --project-id ID [--tag TAG]\n' +
         'collect --directory HISTORY --source codex|claude-code --project-root EXACT_CWD [--project-root ...] [--worktrees] [--atlas] --project-id ID [--watch]\n' +
         'list | export --id ID | tag --id ID [--tag TAG ...] [--untag TAG ...] | search --query TEXT [--remote]\n' +
-        'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH) [--kind kingdom --integration-id UUID ...]   (destinations for serve --sync)\n' +
+        'pair --kingdom KINGDOM_API_URL [--name NAME]   (pair this Archive with Kingdom; approve the review code there)\n' +
+        'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH)   (a remote Archive, for serve --sync)\n' +
+        'connect --kind kingdom --url KINGDOM_API_URL --credential-file PATH --integration-id UUID --resource-id UUID --project-id ID   (a hosted Archive through Kingdom)\n' +
         'sync | routes   (DATABASE_URL: publish to, or preview, destinations once)\n' +
         'agents add-collector --name N --source codex|claude-code --project-id ID --project-root DIR [--project-root ...] [--directory HISTORY] [--worktrees] [--atlas]\n' +
         'agents remove-collector --name N | server --url URL | install | uninstall | status\n' +
@@ -180,34 +178,54 @@ export async function runCli(args = Bun.argv.slice(2)) {
     process.once('SIGINT', stop);
     return;
   }
+  if (command === 'pair') {
+    if (!v.kingdom) throw new Error('pair requires --kingdom KINGDOM_API_URL');
+    const local = new ArchiveClient({
+      url: v.url ?? DEFAULT_URL,
+      token: process.env.ARCHIVE_TOKEN ?? readToken() ?? '',
+    });
+    output(
+      await pairWithKingdom({
+        kingdom: v.kingdom,
+        name: v.name ?? `${hostname()} Archive`,
+        sourceId: await local.sourceId(),
+        directory: join(home, 'kingdom'),
+        onReview: (review) => console.error(JSON.stringify(review)),
+      }),
+    );
+    return;
+  }
   if (command === 'connect' || command === 'setup') {
-    const destinationTokenFile = v['token-file'] && resolve(v['token-file']);
-    const destination = archiveDestinationSchema.parse({
-      projectId: v['project-id'],
-      url: v.url,
-      tokenEnv: v['token-env'] ?? (destinationTokenFile ? undefined : 'ARCHIVE_TOKEN'),
-      tokenFile: destinationTokenFile,
-      kind: v.kind,
-      ...(v.kind === 'kingdom'
+    const destination = archiveDestinationSchema.parse(
+      v.kind === 'kingdom'
         ? {
+            kind: 'kingdom',
+            projectId: v['project-id'],
+            url: v.url,
+            credentialFile: v['credential-file'] && resolve(v['credential-file']),
             integrationId: v['integration-id'],
-            ownerModel: v['owner-model'],
-            organizationId: v['organization-id'],
-            spaceId: v['space-id'],
+            resourceId: v['resource-id'],
           }
-        : {}),
-    });
+        : {
+            kind: 'archive',
+            projectId: v['project-id'],
+            url: v.url,
+            tokenEnv: v['token-env'] ?? (v['token-file'] ? undefined : 'ARCHIVE_TOKEN'),
+            tokenFile: v['token-file'] && resolve(v['token-file']),
+          },
+    );
     // Verify credentials and protocol before saving; no records uploaded by setup.
-    const probe = await archiveRequest(destination, 'search', {
-      query: '',
-      budget: 16,
-      limit: 1,
-      ...(destination.kind === 'archive'
-        ? { projectId: destination.projectId }
-        : kingdomFields(destination)),
-    });
-    if (!Array.isArray(probe.data?.archives))
-      throw new Error('Destination is not an Archive-compatible endpoint');
+    if (destination.kind === 'kingdom') await verifyKingdomDestination(destination);
+    else {
+      const probe = await archiveRequest(destination, 'search', {
+        query: '',
+        budget: 16,
+        limit: 1,
+        projectId: destination.projectId,
+      });
+      if (!Array.isArray(probe.data?.archives))
+        throw new Error('Destination is not an Archive-compatible endpoint');
+    }
     output(connectDestination(config, destination));
     return;
   }
