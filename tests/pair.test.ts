@@ -9,7 +9,7 @@ import { pairWithKingdom } from '../src/kingdom';
 const fakeKingdom = () => {
   const nonces = new Set<string>();
   const state = { polls: 0, collected: 0, actions: [] as string[] };
-  const inquiryId = crypto.randomUUID();
+  let inquiryId = crypto.randomUUID();
   const signetId = crypto.randomUUID();
   const integrationId = crypto.randomUUID();
   const resourceId = crypto.randomUUID();
@@ -44,11 +44,14 @@ const fakeKingdom = () => {
       if (!nonces.delete(proof.nonce)) return Response.json({}, { status: 401 });
       state.actions.push(action);
       if (action === 'registerInstallation') return data({ installationId: crypto.randomUUID() });
-      if (action === 'requestRegistration')
+      if (action === 'requestRegistration') {
+        state.polls = 0;
+        inquiryId = crypto.randomUUID();
         return data({
           reviewCode: 'ABCDEF123456',
           expiresAt: new Date(Date.now() + 600000).toISOString(),
         });
+      }
       if (action === 'installationInquiries') {
         state.polls++;
         const approved = state.polls > 1;
@@ -152,8 +155,9 @@ test('pair registers the Archive, waits for the claim, confirms the owner and co
     expect(paired.libraries).toEqual([
       { integrationId: kingdom.hostedId, resourceId: kingdom.resourceId, name: 'Acme Archive' },
     ]);
-    expect(kingdom.state.actions.slice(0, 2)).toEqual([
+    expect(kingdom.state.actions.slice(0, 3)).toEqual([
       'registerInstallation',
+      'installationInquiries',
       'requestRegistration',
     ]);
 
