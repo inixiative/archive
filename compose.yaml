@@ -19,7 +19,7 @@ services:
       timeout: 5s
       retries: 20
   archive:
-    image: ghcr.io/inixiative/archive:${ARCHIVE_VERSION:-latest}
+    image: ghcr.io/inixiative/archive:${ARCHIVE_VERSION:?archive up sets ARCHIVE_VERSION to the CLI's own version}
     command: ["bun", "run", "src/cli.ts", "serve", "--home", "${ARCHIVE_DATA_DIR}", "--hostname", "0.0.0.0", "--sync"]
     depends_on:
       postgres:

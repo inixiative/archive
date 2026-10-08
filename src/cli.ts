@@ -117,6 +117,12 @@ export async function runCli(args = Bun.argv.slice(2)) {
     output({ initialized: true, home, tokenFile });
     return;
   }
+  const packageVersion = () =>
+    (
+      JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+        version: string;
+      }
+    ).version;
   if (command === 'up' || command === 'down') {
     // The machine's one local Archive: the bundled compose file, with its data in the home.
     if (command === 'up') init();
@@ -135,6 +141,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         env: {
           ...process.env,
           ARCHIVE_DATA_DIR: home,
+          ARCHIVE_VERSION: process.env.ARCHIVE_VERSION ?? packageVersion(),
           // Compose requires the variable even to stop; down never needs the real token.
           ARCHIVE_SERVER_TOKEN: readToken() ?? 'x'.repeat(32),
         },

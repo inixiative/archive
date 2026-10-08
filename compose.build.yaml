@@ -1,4 +1,4 @@
-# Build the image from this checkout instead of pulling it: docker compose -f compose.yaml -f compose.build.yaml up -d --build
+# Build the image from this checkout instead of pulling it: ARCHIVE_VERSION=local docker compose -f compose.yaml -f compose.build.yaml up -d --build
 services:
   archive:
     build: .
