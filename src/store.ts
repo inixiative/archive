@@ -429,6 +429,15 @@ export class ArchiveStore {
       this.db.outbox.deleteMany({ where: { archiveId: id, destination } }),
     ]);
   }
+  /** A project's archives at one destination: delivered at their latest digest, or pending. */
+  async delivery(projectId: string, destination: string) {
+    const archives = await this.db.archive.findMany({
+      where: { projectId },
+      select: { digest: true, receipts: { where: { destination }, select: { digest: true } } },
+    });
+    const delivered = archives.filter((a) => a.receipts[0]?.digest === a.digest).length;
+    return { delivered, pending: archives.length - delivered };
+  }
   async close() {
     await this.db.$disconnect();
   }

@@ -11,7 +11,7 @@ import {
   renameSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, isAbsolute } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { z } from 'zod';
 
 const projectId = z.string().min(1).max(256);
@@ -35,7 +35,7 @@ const archiveDestination = z
  * A hosted Archive reached through Kingdom: this Archive presents the Signet it was paired with,
  * granting sessions.write on that Archive's library.
  */
-const kingdomDestination = z.strictObject({
+export const kingdomDestinationSchema = z.strictObject({
   kind: z.literal('kingdom'),
   projectId,
   url: z.url(),
@@ -43,7 +43,7 @@ const kingdomDestination = z.strictObject({
   integrationId: z.uuid(),
   resourceId: z.uuid(),
 });
-export const archiveDestinationSchema = z.union([archiveDestination, kingdomDestination]);
+export const archiveDestinationSchema = z.union([archiveDestination, kingdomDestinationSchema]);
 export type ArchiveDestination = z.infer<typeof archiveDestinationSchema>;
 
 /** Private regular file owned by this user; a symlink or group/world access is refused. */
@@ -94,30 +94,56 @@ export function destinationIdentity(destination: ArchiveDestination) {
       : ['kingdom', destination.integrationId, destination.resourceId],
   ]);
 }
+/**
+ * The server's configuration: destinations and the Kingdom pairing. Compose mounts it at the same
+ * absolute path, so the CLI and the server read one file and the paths in it resolve for both.
+ */
+export const configDirectory = (home: string) => join(home, 'config');
+export const destinationsFile = (home: string) => join(configDirectory(home), 'destinations.json');
+export const kingdomDirectory = (home: string) => join(configDirectory(home), 'kingdom');
+
+/** A destination as reported: never a token, and no credential file for Kingdom entries. */
+export const describeDestination = (destination: ArchiveDestination) => ({
+  configured: true as const,
+  kind: destination.kind,
+  projectId: destination.projectId,
+  url: destination.url,
+  ...(destination.kind === 'kingdom'
+    ? { integrationId: destination.integrationId, resourceId: destination.resourceId }
+    : destination.tokenFile
+      ? { tokenFile: destination.tokenFile }
+      : { tokenEnv: destination.tokenEnv }),
+});
+export type DescribedDestination = ReturnType<typeof describeDestination>;
+
+function writeDestinations(file: string, destinations: ArchiveDestination[]) {
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  const temp = `${file}.${randomUUID()}.tmp`;
+  writeFileSync(temp, `${JSON.stringify(destinations, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+  renameSync(temp, file);
+  chmodSync(file, 0o600);
+}
+
+const sameRoute = (a: ArchiveDestination, projectId: string, identity: string) =>
+  a.projectId === projectId && destinationIdentity(a) === identity;
+
 export function connectDestination(file: string, input: unknown) {
   const destination = archiveDestinationSchema.parse(input);
   destination.url = destinationUrl(destination.url).href;
   const destinations = readDestinations(file);
   const identity = destinationIdentity(destination);
-  const index = destinations.findIndex(
-    (item) => item.projectId === destination.projectId && destinationIdentity(item) === identity,
-  );
+  const index = destinations.findIndex((item) => sameRoute(item, destination.projectId, identity));
   if (index < 0) destinations.push(destination);
   else destinations[index] = destination;
-  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-  const temp = `${file}.${randomUUID()}.tmp`;
-  writeFileSync(temp, JSON.stringify(destinations, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
-  renameSync(temp, file);
-  chmodSync(file, 0o600);
-  return {
-    configured: true,
-    kind: destination.kind,
-    projectId: destination.projectId,
-    url: destination.url,
-    ...(destination.kind === 'kingdom'
-      ? { integrationId: destination.integrationId, resourceId: destination.resourceId }
-      : destination.tokenFile
-        ? { tokenFile: destination.tokenFile }
-        : { tokenEnv: destination.tokenEnv }),
-  };
+  writeDestinations(file, destinations);
+  return describeDestination(destination);
+}
+
+/** Stops routing a project to a destination (by `destinationIdentity`); its receipts remain. */
+export function removeDestination(file: string, route: { projectId: string; identity: string }) {
+  const destinations = readDestinations(file);
+  const kept = destinations.filter((item) => !sameRoute(item, route.projectId, route.identity));
+  if (kept.length === destinations.length) return false;
+  writeDestinations(file, kept);
+  return true;
 }

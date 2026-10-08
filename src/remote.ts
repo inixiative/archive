@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { defaultHome } from './agents';
+import type { DescribedDestination } from './config';
 import type { ArchiveChunk, ArchiveSnapshot } from './index';
 import { archiveKey, archiveSnapshotSchema } from './index';
 import type { ArchiveFilter, ArchiveSettings, TagDefinition } from './schemas';
@@ -15,6 +16,14 @@ export type ArchiveListing = Omit<ArchiveSnapshot, 'entries'> & {
   suggestedTags: TagSuggestion[];
   references: ArchiveReferenceCount[];
 };
+
+/** A configured destination and how many of its project's archives it holds at their latest. */
+export type DestinationStatus = DescribedDestination & { delivered: number; pending: number };
+/** A hosted Archive library a held Signet may write to. */
+export type ArchiveLibrary = { integrationId: string; resourceId: string; name: string };
+export type ArchiveLibraries = { paired: boolean; libraries: ArchiveLibrary[] };
+/** A project routed to a hosted Archive library through Kingdom. */
+export type KingdomRoute = { projectId: string; integrationId: string; resourceId: string };
 
 export class ArchiveRequestError extends Error {
   constructor(
@@ -146,6 +155,19 @@ export class ArchiveClient {
       'tags/list',
       actorId ? { actorId } : {},
     );
+  }
+  destinations(filter: { projectId?: string } = {}) {
+    return this.request<{ destinations: DestinationStatus[] }>('destinations/list', filter);
+  }
+  libraries() {
+    return this.request<ArchiveLibraries>('destinations/libraries');
+  }
+  /** Routes a project to a library; the server verifies its Signet grants sessions.write first. */
+  connectDestination(route: KingdomRoute) {
+    return this.request<DescribedDestination>('destinations/connect', route);
+  }
+  removeDestination(route: KingdomRoute) {
+    return this.request<{ removed: boolean }>('destinations/remove', route);
   }
 }
 

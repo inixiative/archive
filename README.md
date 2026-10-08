@@ -21,7 +21,7 @@ archive up      # creates ~/.local/share/archive/server.token, then docker compo
 archive down
 ```
 
-`up` runs the `compose.yaml` that ships in the package (project `archive`) with `ARCHIVE_DATA_DIR` set to the archive home and the server token from its `server.token`. Postgres data lives in `$ARCHIVE_DATA_DIR/postgres` and the server's destinations in `$ARCHIVE_DATA_DIR/config`, so both survive rebuilds and volume prunes. Pin a version with `ARCHIVE_VERSION`; build from a checkout with `docker compose -f compose.yaml -f compose.build.yaml up -d --build`.
+`up` runs the `compose.yaml` that ships in the package (project `archive`) with `ARCHIVE_DATA_DIR` set to the archive home and the server token from its `server.token`. Postgres data lives in `$ARCHIVE_DATA_DIR/postgres` and the server's configuration (`destinations.json`, destination token files, the Kingdom pairing) in `$ARCHIVE_DATA_DIR/config`, so both survive rebuilds and volume prunes. Compose mounts the config directory at the same absolute path, so the CLI and the server read one `destinations.json` and every path in it resolves for both. Running Compose directly requires an absolute `ARCHIVE_DATA_DIR`. Pin a version with `ARCHIVE_VERSION`; build from a checkout with `docker compose -f compose.yaml -f compose.build.yaml up -d --build`.
 
 The server applies its schema migrations on start and requires bearer authentication for data endpoints; `/health` has no session data. Every other command talks to it over HTTP at `--url` (default `http://127.0.0.1:4700`) with the token in `--token-file` (default `~/.local/share/archive/server.token`) or `ARCHIVE_TOKEN`:
 
@@ -44,11 +44,11 @@ Every deployment runs the published image `ghcr.io/inixiative/archive` (tags: ve
 The local Archive publishes onward to destinations. Place the destination's token in a private file under the server's config directory (`chmod 600`, owned by you) or an environment variable, then run:
 
 ```sh
-archive connect --home ~/.local/share/archive/config --url https://your-archive.example --project-id inixiative --token-file ~/.local/share/archive/config/credentials/inixiative.token
-archive search --remote --home ~/.local/share/archive/config --query 'migration'
+archive connect --url https://your-archive.example --project-id inixiative --token-file ~/.local/share/archive/config/credentials/inixiative.token
+archive search --remote --query 'migration'
 ```
 
-`setup` is an alias for `connect`. Setup verifies access before saving `destinations.json` and does not upload; the Compose server (`serve --sync`) reads it and publishes every 30 seconds. `sync` and `routes` run the same publication, or preview it, once against `DATABASE_URL`. The URL locates the server; the token grants access. Configuration stores only the token file path (`tokenFile`) or environment variable name (`--token-env`, `tokenEnv`), never the token. A token file is read on every request, so rotating it needs no restart; symlinks and files readable by group or others are refused. Redirects are refused; only HTTPS or loopback HTTP is allowed.
+`setup` is an alias for `connect`. Setup verifies access before saving `<home>/config/destinations.json` and does not upload; the Compose server (`serve --sync`) reads it and publishes every 30 seconds. `sync` and `routes` run the same publication, or preview it, once against `DATABASE_URL`. The URL locates the server; the token grants access. Configuration stores only the token file path (`tokenFile`) or environment variable name (`--token-env`, `tokenEnv`), never the token. A token file is read on every request, so rotating it needs no restart; symlinks and files readable by group or others are refused. Redirects are refused; only HTTPS or loopback HTTP is allowed.
 
 ## Always-on local archiving
 
@@ -76,14 +76,14 @@ First, pair this Archive with Kingdom:
 bun run archive pair --kingdom https://api.your-kingdom.example --name "Work laptop"
 ```
 
-`pair` registers this Archive with Kingdom as an **Installation**, named by a key kept in `<home>/kingdom/<kingdom host>/`. The same key is reused for every owner it registers with. It then asks to be registered as an integration and prints a review code with a link.
+`pair` registers this Archive with Kingdom as an **Installation**, named by a key kept in `<home>/config/kingdom/<kingdom host>/`. The same key is reused for every owner it registers with. It then asks to be registered as an integration and prints a review code with a link.
 
 Open the link, choose the owner and the hosted Archives this machine may write to, and approve. The command waits for approval, then shows which owner it was registered with and asks you to accept. Pass `--yes` to accept without the prompt; without a terminal, `--yes` is required. Only then does it collect the Signet (0600) and list the libraries it may write to. Confirming the owner protects you if someone else claimed your code into their own owner.
 
 Next, route a project to one of those libraries:
 
 ```sh
-bun run archive connect --kind kingdom --url https://api.your-kingdom.example --credential-file ~/.archive/kingdom/signet-SIGNET.json --integration-id HOSTED_ARCHIVE_INTEGRATION --resource-id LIBRARY --project-id inixiative
+bun run archive connect --kind kingdom --url https://api.your-kingdom.example --credential-file ~/.local/share/archive/config/kingdom/KINGDOM_HOST/signet-SIGNET.json --integration-id HOSTED_ARCHIVE_INTEGRATION --resource-id LIBRARY --project-id inixiative
 ```
 
 `connect` checks that the Signet grants `sessions.write` on that library before it saves anything. `serve --sync` then sends each changed session through `POST /api/v1/access/execute`. Every call carries the Signet's access token and a fresh DPoP proof (`@inixiative/signet` renews the token).
@@ -103,6 +103,17 @@ Foundry writes its captures to the local Archive server through `@inixiative/arc
 ## Routing
 
 Only explicit `projectId` matches authorize publication. An archive with no matching destination stays local. Multiple matches create deliberate separate copies. `routes` previews these destinations before upload. Tags, references and actors never change ownership or routing.
+
+The server manages routes over HTTP too, so Foundry can read and set them. Only Kingdom destinations are set this way, through the Signets `pair` collected; direct token destinations stay CLI-only.
+
+| Action | Body | Returns |
+|---|---|---|
+| `destinations/list` | `projectId?` | `destinations`: each as `connect` reports it, with `delivered` (archives acknowledged at their latest digest) and `pending` |
+| `destinations/libraries` | none | `paired`, and the `libraries` (`integrationId`, `resourceId`, `name`) the held Signets may write to |
+| `destinations/connect` | `projectId`, `integrationId`, `resourceId` | the saved destination, after Kingdom confirms `sessions.write` on the library (403 otherwise) |
+| `destinations/remove` | `projectId`, `integrationId`, `resourceId` | `removed` |
+
+`@inixiative/archive/remote`'s `ArchiveClient` wraps these as `destinations()`, `libraries()`, `connectDestination()` and `removeDestination()`. The sync loop picks up changes within 30 seconds.
 
 ## Tags, references, actors and retention
 
@@ -133,6 +144,7 @@ All data endpoints are `POST /api/v1/archive/<action>` with a JSON body and `Aut
 | `delete` | `archiveId` | deleted |
 | `settings/read`, `settings/update` | `integrations?`, `retentionDays?` | settings |
 | `tags/list`, `tags/define`, `tags/remove` | `tag`, `actorId?`, `description?` | offered tags with usage counts |
+| `destinations/list`, `destinations/libraries`, `destinations/connect`, `destinations/remove` | see [Routing](#routing) | routes |
 
 Filters are `projectId`, `source`, `tag`, `actorId`, `model`, `effort` and `reference` (`{integration, ref}`). Jev integration is not enabled. Session content must not be sent to Jev without selecting that service for the relevant ownership boundary.
 

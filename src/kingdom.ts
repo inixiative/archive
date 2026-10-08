@@ -1,5 +1,17 @@
+import { existsSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { pairInstallation, SignetClient } from '@inixiative/signet';
 import type { ArchiveDestination } from './config';
+
+type KingdomDestination = Extract<ArchiveDestination, { kind: 'kingdom' }>;
+type Library = { integrationId: string; resourceId: string; name: string };
+
+/** The Signet does not grant sessions.write on the library. */
+export class KingdomGrantMissing extends Error {
+  constructor() {
+    super("This Archive's Signet does not grant sessions.write on that library");
+  }
+}
 
 /** Libraries this Archive's Signet may write to, as Kingdom describes them. */
 export async function writableLibraries(credentialFile: string) {
@@ -60,9 +72,7 @@ export async function pairWithKingdom(input: Pairing) {
   };
 }
 
-export async function verifyKingdomDestination(
-  destination: Extract<ArchiveDestination, { kind: 'kingdom' }>,
-) {
+export async function verifyKingdomDestination(destination: KingdomDestination) {
   const libraries = await writableLibraries(destination.credentialFile);
   if (
     !libraries.some(
@@ -71,5 +81,50 @@ export async function verifyKingdomDestination(
         library.resourceId === destination.resourceId,
     )
   )
-    throw new Error("This Archive's Signet does not grant sessions.write on that library");
+    throw new KingdomGrantMissing();
+}
+
+/** Credential files of the Signets `pair` collected into the directory, one per owner. */
+export function heldSignets(directory: string) {
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .flatMap((kingdom) =>
+      readdirSync(join(directory, kingdom.name))
+        .filter((name) => /^signet-[^/]+\.json$/.test(name))
+        .map((name) => join(directory, kingdom.name, name)),
+    )
+    .sort();
+}
+
+/** Every library the held Signets may write to; `paired` is false until `pair` collected one. */
+export async function pairedLibraries(directory: string) {
+  const credentialFiles = heldSignets(directory);
+  const libraries = new Map<string, Library>();
+  for (const credentialFile of credentialFiles)
+    for (const library of await writableLibraries(credentialFile))
+      libraries.set(JSON.stringify([library.integrationId, library.resourceId]), library);
+  return { paired: credentialFiles.length > 0, libraries: [...libraries.values()] };
+}
+
+/** The Kingdom destination for a library, through whichever held Signet grants writing to it. */
+export async function pairedDestination(
+  directory: string,
+  route: { projectId: string; integrationId: string; resourceId: string },
+): Promise<KingdomDestination> {
+  for (const credentialFile of heldSignets(directory)) {
+    const destination: KingdomDestination = {
+      kind: 'kingdom',
+      ...route,
+      url: (await SignetClient.fromFile(credentialFile)).url,
+      credentialFile,
+    };
+    try {
+      await verifyKingdomDestination(destination);
+      return destination;
+    } catch (error) {
+      if (!(error instanceof KingdomGrantMissing)) throw error;
+    }
+  }
+  throw new KingdomGrantMissing();
 }

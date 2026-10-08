@@ -1,6 +1,15 @@
 import { timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
+import {
+  connectDestination,
+  describeDestination,
+  destinationIdentity,
+  kingdomDestinationSchema,
+  readDestinations,
+  removeDestination,
+} from './config';
 import { archiveReferenceSchema, archiveSnapshotSchema, selectChunks } from './index';
+import { KingdomGrantMissing, pairedDestination, pairedLibraries } from './kingdom';
 import { ArchiveConflict, ArchiveStore, archiveSettingsSchema, tagDefinitionSchema } from './store';
 
 const ingestSchema = z.strictObject({
@@ -36,9 +45,22 @@ const tagSchema = z.strictObject({
 });
 const tagListSchema = z.strictObject({ actorId: z.string().min(1).max(256).optional() });
 const tagRemoveSchema = tagDefinitionSchema.pick({ tag: true, actorId: true });
+const destinationListSchema = z.strictObject({ projectId: filterFields.projectId });
+const kingdomRouteSchema = kingdomDestinationSchema.pick({
+  projectId: true,
+  integrationId: true,
+  resourceId: true,
+});
+
+/** Where the server finds its destinations and the Signets `pair` collected. */
+export type ArchiveServerConfig = { destinationsFile: string; kingdomDirectory: string };
 
 /** One deployment, one ownership boundary. No shared cross-tenant database or admin API. */
-export function createArchiveHandler(store: ArchiveStore, token: string) {
+export function createArchiveHandler(
+  store: ArchiveStore,
+  token: string,
+  config?: ArchiveServerConfig,
+) {
   if (token.length < 32)
     throw new Error('ARCHIVE_SERVER_TOKEN must contain at least 32 characters');
   const expected = Buffer.from(`Bearer ${token}`);
@@ -162,9 +184,50 @@ export function createArchiveHandler(store: ArchiveStore, token: string) {
         return json({ data: await store.defineTag(tagDefinitionSchema.parse(body)) });
       if (path === '/api/v1/archive/tags/remove')
         return json({ data: { removed: await store.undefineTag(tagRemoveSchema.parse(body)) } });
+      if (config && path === '/api/v1/archive/destinations/list') {
+        const { projectId } = destinationListSchema.parse(body);
+        const destinations = [];
+        for (const destination of readDestinations(config.destinationsFile))
+          if (!projectId || destination.projectId === projectId)
+            destinations.push({
+              ...describeDestination(destination),
+              ...(await store.delivery(destination.projectId, destinationIdentity(destination))),
+            });
+        return json({ data: { destinations } });
+      }
+      if (config && path === '/api/v1/archive/destinations/libraries') {
+        z.strictObject({}).parse(body);
+        return json({ data: await pairedLibraries(config.kingdomDirectory) });
+      }
+      if (config && path === '/api/v1/archive/destinations/connect') {
+        const route = kingdomRouteSchema.parse(body);
+        const destination = await pairedDestination(config.kingdomDirectory, route);
+        return json({ data: connectDestination(config.destinationsFile, destination) });
+      }
+      if (config && path === '/api/v1/archive/destinations/remove') {
+        const route = kingdomRouteSchema.parse(body);
+        const configured = readDestinations(config.destinationsFile).find(
+          (d) =>
+            d.kind === 'kingdom' &&
+            d.projectId === route.projectId &&
+            d.integrationId === route.integrationId &&
+            d.resourceId === route.resourceId,
+        );
+        return json({
+          data: {
+            removed: configured
+              ? removeDestination(config.destinationsFile, {
+                  projectId: route.projectId,
+                  identity: destinationIdentity(configured),
+                })
+              : false,
+          },
+        });
+      }
       return json({ error: 'Not found' }, 404);
     } catch (error) {
       if (error instanceof ArchiveConflict) return json({ error: error.message }, 409);
+      if (error instanceof KingdomGrantMissing) return json({ error: error.message }, 403);
       if (error instanceof z.ZodError || error instanceof SyntaxError)
         return json({ error: 'Invalid archive request' }, 400);
       return json({ error: 'Archive operation failed' }, 500);
@@ -177,6 +240,7 @@ export async function startArchiveServer(options: {
   token: string;
   port?: number;
   hostname?: string;
+  config?: ArchiveServerConfig;
 }) {
   const store = new ArchiveStore(options.databaseUrl);
   try {
@@ -188,7 +252,7 @@ export async function startArchiveServer(options: {
       port: options.port ?? 4700,
       hostname: options.hostname ?? '127.0.0.1',
       maxRequestBodySize: 65_000_000,
-      fetch: createArchiveHandler(store, options.token),
+      fetch: createArchiveHandler(store, options.token, options.config),
     });
     return {
       server,

@@ -1,18 +1,22 @@
 import { expect, test } from 'bun:test';
-import { randomBytes } from 'node:crypto';
 import { chmodSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { generateSignetKey, verifySignetProof, writePrivateJson } from '@inixiative/signet';
 import { z } from 'zod';
 import { runCli } from '../src/cli';
 import { publishArchive, routingPreview, searchRemotes, syncArchives } from '../src/client';
-import { type ArchiveDestination, connectDestination, readDestinations } from '../src/config';
+import {
+  type ArchiveDestination,
+  connectDestination,
+  destinationsFile,
+  readDestinations,
+} from '../src/config';
 import { archiveSnapshotSchema } from '../src/index';
 import { verifyKingdomDestination } from '../src/kingdom';
 import { createArchiveHandler, startArchiveServer } from '../src/server';
 import { ArchiveStore } from '../src/store';
 import { freshStore, testDatabaseUrl } from './db';
+import { signetKingdom } from './kingdom';
 
 const captureResponse = z.object({
   data: z.object({ id: z.string(), digest: z.string(), revision: z.number() }),
@@ -207,7 +211,7 @@ test('connect validates credentials before changing configuration and repeated s
     token,
     port: 0,
   });
-  const config = join(dir, 'destinations.json');
+  const config = destinationsFile(dir);
   const args = [
     'connect',
     '--home',
@@ -271,86 +275,17 @@ test('Kingdom destinations write and search through the paired Signet', async ()
   const id = (await local.capture(snapshot())).id;
   const directory = mkdtempSync(join(tmpdir(), 'archive-kingdom-'));
   chmodSync(directory, 0o700);
-  const nonces = new Set<string>();
-  const executed: Record<string, any>[] = [];
-  const kingdom = Bun.serve({
-    port: 0,
-    hostname: '127.0.0.1',
-    async fetch(request) {
-      const action = new URL(request.url).pathname.split('/').pop()!;
-      const body = (await request.json()) as Record<string, any>;
-      const data = (value: unknown) => Response.json({ data: value });
-      if (action === 'nonce') {
-        const nonce = randomBytes(32).toString('base64url');
-        nonces.add(nonce);
-        return data({ nonce, expiresAt: new Date().toISOString() });
-      }
-      const token = request.headers.get('authorization')?.slice(5);
-      const proof = await verifySignetProof({
-        proof: request.headers.get('dpop') ?? '',
-        url: `${origin}/api/v1/access/${action}`,
-        method: 'POST',
-        now: new Date(),
-        token,
-      });
-      if (!nonces.delete(proof.nonce)) return Response.json({}, { status: 401 });
-      if (action === 'describe')
-        return data({
-          signetId,
-          integrationId: localIntegrationId,
-          provider: 'archive',
-          name: 'Laptop Archive',
-          expiresAt: null,
-          lifecycle: 'ongoing',
-          taskId: null,
-          currentRevision: 1,
-          remainingRequests: null,
-          operations: [
-            {
-              key: 'sessions.write',
-              name: 'Write sessions',
-              resources: [
-                { id: resourceId, name: 'Org Archive', kind: 'archiveLibrary', integrationId },
-              ],
-            },
-          ],
-        });
-      if (action === 'execute') {
-        executed.push(body);
-        if (body.operation === 'documents.search')
-          return data({ executionId: crypto.randomUUID(), result: { documents: [] } });
-        const digest = (await local.read(id))!.digest;
-        return data({
-          executionId: crypto.randomUUID(),
-          result: { id, digest, revision: 1, changed: true },
-        });
-      }
-      return Response.json({}, { status: 404 });
-    },
-  });
-  const origin = `http://127.0.0.1:${kingdom.port}`;
-  const signetId = crypto.randomUUID();
-  const localIntegrationId = crypto.randomUUID();
   const integrationId = crypto.randomUUID();
   const resourceId = crypto.randomUUID();
-  const keyFile = join(directory, 'key.json');
-  const credentialFile = join(directory, 'signet.json');
-  await writePrivateJson(keyFile, generateSignetKey());
-  await writePrivateJson(credentialFile, {
-    url: origin,
-    signetId,
-    integrationId: localIntegrationId,
-    keyFile,
-    enrollmentId: crypto.randomUUID(),
-    lifecycle: 'ongoing',
-    taskId: null,
-    accessToken: `kingdom_${'a'.repeat(43)}`,
-    renewalCredential: `signet_renew_${'b'.repeat(43)}`,
-    expiresAt: new Date(Date.now() + 300000).toISOString(),
-    renewalExpiresAt: new Date(Date.now() + 86400000).toISOString(),
-    idleExpiresAt: new Date(Date.now() + 86400000).toISOString(),
-    tokenType: 'DPoP',
+  const kingdom = signetKingdom({
+    libraries: [{ integrationId, resourceId, name: 'Org Archive' }],
+    execute: async (body) =>
+      body.operation === 'documents.search'
+        ? { documents: [] }
+        : { id, digest: (await local.read(id))!.digest, revision: 1, changed: true },
   });
+  const { origin, signetId, executed } = kingdom;
+  const credentialFile = await kingdom.hold(directory);
   const destination: ArchiveDestination = {
     kind: 'kingdom',
     projectId: 'inixiative',
@@ -371,7 +306,7 @@ test('Kingdom destinations write and search through the paired Signet', async ()
       operation: 'sessions.write',
       input: { resourceId, previousDigest: null },
     });
-    expect(executed[0].input.snapshot.sessionId).toBe('one');
+    expect(executed[0].input.snapshot?.sessionId).toBe('one');
     expect(await publishArchive(local, id, destination)).toEqual({ unchanged: true });
     expect((await routingPreview(local, [destination]))[0].destinations).toEqual([
       { kind: 'kingdom', url: origin, integrationId },
@@ -380,7 +315,7 @@ test('Kingdom destinations write and search through the paired Signet', async ()
     expect(remote).toMatchObject({ data: { documents: [] } });
     expect(executed.at(-1)).toMatchObject({ operation: 'documents.search' });
   } finally {
-    kingdom.stop(true);
+    kingdom.stop();
     rmSync(directory, { recursive: true, force: true });
   }
 });

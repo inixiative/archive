@@ -28,7 +28,7 @@ import {
 } from '../src/agents';
 import { runCli } from '../src/cli';
 import { archiveRequest } from '../src/client';
-import { archiveDestinationSchema, readTokenFile } from '../src/config';
+import { archiveDestinationSchema, destinationsFile, readTokenFile } from '../src/config';
 import { startArchiveServer } from '../src/server';
 import { freshStore, testDatabaseUrl } from './db';
 
@@ -413,7 +413,7 @@ test('token files: exactly one credential source, private regular file, read at 
       '--token-file',
       file,
     ]);
-    const saved = JSON.parse(readFileSync(join(home, 'destinations.json'), 'utf8'));
+    const saved = JSON.parse(readFileSync(destinationsFile(home), 'utf8'));
     expect(saved).toEqual([
       { projectId: 'p', url: instance.server.url.href, tokenFile: file, kind: 'archive' },
     ]);

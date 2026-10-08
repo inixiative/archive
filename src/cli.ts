@@ -18,7 +18,13 @@ import {
 import { importChatGPTThread } from './chatgpt';
 import { archiveRequest, routingPreview, searchRemotes, syncArchives } from './client';
 import { collectSessions } from './collector';
-import { archiveDestinationSchema, connectDestination, readDestinations } from './config';
+import {
+  archiveDestinationSchema,
+  connectDestination,
+  destinationsFile,
+  kingdomDirectory,
+  readDestinations,
+} from './config';
 import { importTranscriptFile } from './import-file';
 import { pairWithKingdom, verifyKingdomDestination } from './kingdom';
 import { previewImports } from './preview';
@@ -76,7 +82,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
     },
   });
   const home = resolve(v.home!),
-    config = v.config ?? join(home, 'destinations.json'),
+    config = v.config ?? destinationsFile(home),
     tokenFile = v['token-file'] ? resolve(v['token-file']) : join(home, 'server.token');
   const output = (value: unknown) => console.log(JSON.stringify(value, null, 2));
   const command = positionals[0];
@@ -153,6 +159,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       token: process.env.ARCHIVE_SERVER_TOKEN ?? readToken() ?? '',
       port: Number(v.port ?? process.env.PORT ?? 4700),
       hostname: v.hostname,
+      config: { destinationsFile: config, kingdomDirectory: kingdomDirectory(home) },
     });
     output({ listening: instance.server.url.href, sync: v.sync });
     let stopped = false;
@@ -190,7 +197,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         kingdom: v.kingdom,
         name: v.name ?? `${hostname()} Archive`,
         sourceId: await local.sourceId(),
-        directory: join(home, 'kingdom'),
+        directory: kingdomDirectory(home),
         onReview: (review) => console.error(JSON.stringify(review)),
         onError: (error) =>
           console.error(`Still waiting: ${error instanceof Error ? error.message : String(error)}`),

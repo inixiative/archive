@@ -1,7 +1,8 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { destinationsFile } from '../src/config';
 import { archiveSnapshotSchema } from '../src/index';
 import { startArchiveServer } from '../src/server';
 import { freshStore, MIGRATED_DATABASE, testDatabaseUrl } from './db';
@@ -29,8 +30,9 @@ test('serve --sync publishes what it receives to its destinations from the same 
     stderr: 'pipe',
   });
   try {
+    mkdirSync(dirname(destinationsFile(home)), { recursive: true });
     writeFileSync(
-      join(home, 'destinations.json'),
+      destinationsFile(home),
       JSON.stringify([
         {
           kind: 'archive',
