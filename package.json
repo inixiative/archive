@@ -35,7 +35,7 @@
     "prepare": "if git rev-parse --git-dir >/dev/null 2>&1; then lefthook install; fi && prisma generate"
   },
   "dependencies": {
-    "@inixiative/signet": "^0.2.1",
+    "@inixiative/signet": "^0.2.2",
     "@prisma/client": "^6.6.0",
     "js-tiktoken": "1.0.21",
     "prisma": "^6.6.0",
@@ -43,7 +43,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
-    "@inixiative/config": "^0.5.56",
+    "@inixiative/config": "^0.5.58",
     "@types/bun": "1.4.2",
     "lefthook": "2.1.9",
     "typescript": "6.0.3"
