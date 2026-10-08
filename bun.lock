@@ -5,7 +5,7 @@
     "": {
       "name": "@inixiative/archive",
       "dependencies": {
-        "@inixiative/signet": "file:/private/tmp/claude-501/-Users-arongreenspan-code-inixiative/c100a93c-aa39-490b-b4da-02e6c8c8108d/scratchpad/pkg/signet-1791417135.tgz",
+        "@inixiative/signet": "^0.1.0",
         "@prisma/client": "^6.6.0",
         "js-tiktoken": "1.0.21",
         "prisma": "^6.6.0",
@@ -41,7 +41,7 @@
 
     "@inixiative/config": ["@inixiative/config@0.5.47", "", { "peerDependencies": { "@biomejs/biome": ">=2.5.0", "tsup": ">=8.5.0", "typescript": ">=6.0.0" }, "optionalPeers": ["@biomejs/biome", "tsup", "typescript"], "bin": { "inixiative-config": "dist/cli.js" } }, "sha512-gmZmdYwaROR938j5fQGHubbYFtzswTmpEAhUMGLjuofkHcerciWq0nUC+/lwRas2IqO3M9IkQ4OBPzeZVoInSQ=="],
 
-    "@inixiative/signet": ["@inixiative/signet@/private/tmp/claude-501/-Users-arongreenspan-code-inixiative/c100a93c-aa39-490b-b4da-02e6c8c8108d/scratchpad/pkg/signet-1791417135.tgz", { "dependencies": { "jose": "^6.2.3" }, "peerDependencies": { "zod": "^4.3.6" } }, "sha512-CBWWyp/zQ5uoYnzUhjwIUnhT1w4kWtiDzRs1xzgyidejTq8YMALW71iGQS1Sq2thUZ26e28l7yF8uiZ/HUAxSg=="],
+    "@inixiative/signet": ["@inixiative/signet@0.1.0", "", { "dependencies": { "jose": "^6.2.3" }, "peerDependencies": { "zod": "^4.3.6" } }, "sha512-eRZFlRfuTq3ggTbJz9Aw7GpxAf4tg5GqYuVSuixMEiY+QRZjbKz3hz2Mqb9cYXuDO5pJndtH+4aNlaElg/cNwQ=="],
 
     "@prisma/client": ["@prisma/client@6.19.3", "", { "peerDependencies": { "prisma": "*", "typescript": ">=5.1.0" }, "optionalPeers": ["prisma", "typescript"] }, "sha512-mKq3jQFhjvko5LTJFHGilsuQs+W+T3Gm451NzuTDGQxwCzwXHYnIu2zGkRoW+Exq3Rob7yp2MfzSrdIiZVhrBg=="],
 

@@ -35,7 +35,7 @@
     "prepare": "if git rev-parse --git-dir >/dev/null 2>&1; then lefthook install; fi && prisma generate"
   },
   "dependencies": {
-    "@inixiative/signet": "file:/private/tmp/claude-501/-Users-arongreenspan-code-inixiative/c100a93c-aa39-490b-b4da-02e6c8c8108d/scratchpad/pkg/signet-1791417135.tgz",
+    "@inixiative/signet": "^0.1.0",
     "@prisma/client": "^6.6.0",
     "js-tiktoken": "1.0.21",
     "prisma": "^6.6.0",
