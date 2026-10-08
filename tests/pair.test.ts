@@ -24,6 +24,8 @@ const fakeKingdom = () => {
     port: 0,
     hostname: '127.0.0.1',
     async fetch(request) {
+      if (request.headers.get('upgrade') === 'websocket')
+        return new Response(null, { status: 426 });
       const action = new URL(request.url).pathname.split('/').pop()!;
       const data = (value: unknown) => Response.json({ data: value });
       if (action === 'nonce') {
@@ -76,6 +78,7 @@ const fakeKingdom = () => {
             : [],
         });
       }
+      if (action === 'installationSignets') return data({ signets: [] });
       if (action === 'collectSignet') {
         state.collected++;
         return data({
@@ -142,7 +145,7 @@ test('pair registers the Archive, waits for the claim, confirms the owner and co
         owners.push(ownerName);
         return true;
       },
-      sleep: async () => {},
+      socketOptions: { pollMs: 10, retryBaseMs: 10_000 },
     });
     expect(reviews).toEqual(['ABCDEF123456']);
     expect(owners).toEqual(['Acme']);
@@ -162,7 +165,7 @@ test('pair registers the Archive, waits for the claim, confirms the owner and co
         directory,
         onReview: () => {},
         confirmOwner: async () => false,
-        sleep: async () => {},
+        socketOptions: { pollMs: 10, retryBaseMs: 10_000 },
       }),
     ).rejects.toThrow('owner was not confirmed');
     expect(kingdom.state.collected).toBe(1);

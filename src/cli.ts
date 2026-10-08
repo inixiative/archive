@@ -192,6 +192,8 @@ export async function runCli(args = Bun.argv.slice(2)) {
         sourceId: await local.sourceId(),
         directory: join(home, 'kingdom'),
         onReview: (review) => console.error(JSON.stringify(review)),
+        onError: (error) =>
+          console.error(`Still waiting: ${error instanceof Error ? error.message : String(error)}`),
         confirmOwner: async ({ ownerName }) => {
           if (v.yes) return true;
           if (!process.stdin.isTTY)
