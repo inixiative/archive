@@ -71,6 +71,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       watch: { type: 'boolean', default: false },
       sync: { type: 'boolean', default: false },
       remote: { type: 'boolean', default: false },
+      yes: { type: 'boolean', default: false },
       help: { type: 'boolean' },
     },
   });
@@ -87,7 +88,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'import --file PATH --source codex|claude-code|chatgpt --project-id ID [--tag TAG]\n' +
         'collect --directory HISTORY --source codex|claude-code --project-root EXACT_CWD [--project-root ...] [--worktrees] [--atlas] --project-id ID [--watch]\n' +
         'list | export --id ID | tag --id ID [--tag TAG ...] [--untag TAG ...] | search --query TEXT [--remote]\n' +
-        'pair --kingdom KINGDOM_API_URL [--name NAME]   (pair this Archive with Kingdom; approve the review code there)\n' +
+        'pair --kingdom KINGDOM_API_URL [--name NAME] [--yes]   (register this Archive with Kingdom; claim the review code there, then confirm the owner)\n' +
         'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH)   (a remote Archive, for serve --sync)\n' +
         'connect --kind kingdom --url KINGDOM_API_URL --credential-file PATH --integration-id UUID --resource-id UUID --project-id ID   (a hosted Archive through Kingdom)\n' +
         'sync | routes   (DATABASE_URL: publish to, or preview, destinations once)\n' +
@@ -191,6 +192,13 @@ export async function runCli(args = Bun.argv.slice(2)) {
         sourceId: await local.sourceId(),
         directory: join(home, 'kingdom'),
         onReview: (review) => console.error(JSON.stringify(review)),
+        confirmOwner: async ({ ownerName }) => {
+          if (v.yes) return true;
+          if (!process.stdin.isTTY)
+            throw new Error(`Registered with ${ownerName}; rerun with --yes to accept it`);
+          const answer = prompt(`Kingdom registered this Archive with ${ownerName}. Accept? [y/N]`);
+          return /^y(es)?$/i.test(answer?.trim() ?? '');
+        },
       }),
     );
     return;

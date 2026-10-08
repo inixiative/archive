@@ -1,10 +1,12 @@
-import { rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  collectPairing,
+  collectSignet,
   generateSignetKey,
+  installationInquiries,
   kingdomUrl,
-  requestPairing,
+  registerInstallation,
+  requestRegistration,
   SignetClient,
   saveCollectedSignet,
   writePrivateJson,
@@ -27,38 +29,41 @@ export async function writableLibraries(credentialFile: string) {
   );
 }
 
-/**
- * Pairs this Archive with Kingdom as a local Archive integration bound to its sourceId. The owner
- * approves the review code in Kingdom and chooses which hosted Archives it may write to.
- */
-export async function pairWithKingdom(input: {
+type Pairing = {
   kingdom: string;
   name: string;
   sourceId: string;
   directory: string;
   onReview: (review: { reviewCode: string; review: string; expiresAt: string }) => void;
+  confirmOwner: (owner: { ownerName: string | null; owner: unknown }) => Promise<boolean>;
   sleep?: (ms: number) => Promise<unknown>;
-}) {
-  const kingdom = kingdomUrl(input.kingdom);
-  const keyFile = join(input.directory, `key-${crypto.randomUUID()}.json`);
-  await writePrivateJson(keyFile, generateSignetKey());
-  try {
-    return await awaitPairing(kingdom, keyFile, input);
-  } catch (error) {
-    await rm(keyFile, { force: true });
-    throw error;
-  }
+};
+
+/** The key that names this Archive to one Kingdom; reused for every owner it registers with. */
+async function installationKey(directory: string) {
+  const keyFile = join(directory, 'installation-key.json');
+  if (!existsSync(keyFile)) await writePrivateJson(keyFile, generateSignetKey());
+  return keyFile;
 }
 
-async function awaitPairing(
-  kingdom: string,
-  keyFile: string,
-  input: Parameters<typeof pairWithKingdom>[0],
-) {
-  const pending = await requestPairing(kingdom, keyFile, {
-    provider: 'archive',
-    deviceId: input.sourceId,
+/**
+ * Registers this Archive with Kingdom as an Installation and asks to become an owner's local
+ * Archive integration. A person claims the review code in Kingdom; once approved, the Archive
+ * confirms the owner locally before collecting its Signet.
+ */
+export async function pairWithKingdom(input: Pairing) {
+  const kingdom = kingdomUrl(input.kingdom);
+  const directory = join(input.directory, new URL(kingdom).host);
+  const keyFile = await installationKey(directory);
+  await registerInstallation(kingdom, keyFile, {
+    kind: 'archive',
     name: input.name,
+    sourceId: input.sourceId,
+  });
+  const askedAt = Date.now();
+  const pending = await requestRegistration(kingdom, keyFile, {
+    name: input.name,
+    lifecycle: 'ongoing',
     resources: [],
     expiresAt: null,
     maxRequests: null,
@@ -70,22 +75,35 @@ async function awaitPairing(
     expiresAt: pending.expiresAt,
   });
   const sleep = input.sleep ?? Bun.sleep;
-  while (Date.parse(pending.expiresAt) > Date.now()) {
-    const collected = await collectPairing(kingdom, keyFile, pending.deviceCode);
-    if (collected) {
-      const credentialFile = join(input.directory, `signet-${collected.signetId}.json`);
+  for (;;) {
+    const state = await installationInquiries(kingdom, keyFile);
+    if (state.declinedAt && Date.parse(state.declinedAt) >= askedAt)
+      throw new Error('The registration was declined in Kingdom');
+    const inquiry = state.inquiries.find(
+      (item) => item.type === 'registerIntegration' && Date.parse(item.createdAt) >= askedAt,
+    );
+    if (inquiry?.status === 'approved') {
+      if (!(await input.confirmOwner({ ownerName: inquiry.ownerName, owner: inquiry.owner })))
+        throw new Error('Not collected: the owner was not confirmed');
+      const collected = await collectSignet(kingdom, keyFile, inquiry.id);
+      if (!collected) throw new Error('Kingdom has not released the Signet yet; try again');
+      const credentialFile = join(directory, `signet-${collected.signetId}.json`);
       await saveCollectedSignet(credentialFile, kingdom, keyFile, collected);
       return {
         paired: true,
+        owner: inquiry.ownerName,
         integrationId: collected.integrationId,
         credentialFile,
         libraries: await writableLibraries(credentialFile),
         next: 'archive connect --kind kingdom --url KINGDOM --credential-file FILE --integration-id ID --resource-id ID --project-id PROJECT',
       };
     }
+    if (inquiry && inquiry.status !== 'sent')
+      throw new Error(`The registration was ${inquiry.status} in Kingdom`);
+    if (!inquiry && !state.pending)
+      throw new Error('The review code expired before it was claimed; run archive pair again');
     await sleep(pollMs);
   }
-  throw new Error('The review code expired before it was approved; run archive pair again');
 }
 
 export async function verifyKingdomDestination(

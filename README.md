@@ -76,7 +76,9 @@ First, pair this Archive with Kingdom:
 bun run archive pair --kingdom https://api.your-kingdom.example --name "Work laptop"
 ```
 
-`pair` creates a device key in `<home>/kingdom/` and asks Kingdom to pair this Archive, identified by its `sourceId`. It prints a review code and a link. Open the link, choose the owner and the hosted Archives this machine may write to, and approve. The command waits for the approval, then saves the delivered Signet credential (0600) and lists the libraries it may write to.
+`pair` registers this Archive with Kingdom as an **Installation**, named by a key kept in `<home>/kingdom/<kingdom host>/`. The same key is reused for every owner it registers with. It then asks to be registered as an integration and prints a review code with a link.
+
+Open the link, choose the owner and the hosted Archives this machine may write to, and approve. The command waits for approval, then shows which owner it was registered with and asks you to accept. Pass `--yes` to accept without the prompt; without a terminal, `--yes` is required. Only then does it collect the Signet (0600) and list the libraries it may write to. Confirming the owner protects you if someone else claimed your code into their own owner.
 
 Next, route a project to one of those libraries:
 
