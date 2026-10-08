@@ -5,7 +5,7 @@
     "": {
       "name": "@inixiative/archive",
       "dependencies": {
-        "@inixiative/signet": "^0.2.2",
+        "@inixiative/signet": "^0.3.0",
         "@prisma/client": "^6.6.0",
         "js-tiktoken": "1.0.21",
         "prisma": "^6.6.0",
@@ -41,7 +41,7 @@
 
     "@inixiative/config": ["@inixiative/config@0.5.59", "", { "peerDependencies": { "@biomejs/biome": ">=2.5.0", "tsup": ">=8.5.0", "typescript": ">=6.0.0" }, "optionalPeers": ["@biomejs/biome", "tsup", "typescript"], "bin": { "inixiative-config": "dist/cli.js" } }, "sha512-c2jemr9rJ5IbZaU9Jn2fsg4slefB8gepiT0lc2WEf63wjNF8AN/hxO0ot+s3Xsgy3kbR/vnfVap1jl7o9gdX/w=="],
 
-    "@inixiative/signet": ["@inixiative/signet@0.2.2", "", { "dependencies": { "jose": "^6.2.3" }, "peerDependencies": { "zod": "^4.3.6" } }, "sha512-+cniGbaB4e0Adejxe/4CPojvciJ4B17SbvNBk2BV43B1SHmDQxmHjIQRGHR4qZqijdkU9zQfTV/lBA/z/EiVwQ=="],
+    "@inixiative/signet": ["@inixiative/signet@0.3.0", "", { "dependencies": { "jose": "^6.2.3" }, "peerDependencies": { "zod": "^4.3.6" } }, "sha512-gekBCw769ztSlRfap9gXVMaxJ2pUkTqp3OsVMij9N3F+vvPRg56Wo1qWK8sn7iS24/vnLnPl5qDsI3Va6M/VgA=="],
 
     "@prisma/client": ["@prisma/client@6.19.3", "", { "peerDependencies": { "prisma": "*", "typescript": ">=5.1.0" }, "optionalPeers": ["prisma", "typescript"] }, "sha512-mKq3jQFhjvko5LTJFHGilsuQs+W+T3Gm451NzuTDGQxwCzwXHYnIu2zGkRoW+Exq3Rob7yp2MfzSrdIiZVhrBg=="],
 
