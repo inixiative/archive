@@ -13,7 +13,7 @@
       },
       "devDependencies": {
         "@biomejs/biome": "2.5.2",
-        "@inixiative/config": "^0.5.60",
+        "@inixiative/config": "^0.5.62",
         "@types/bun": "1.4.2",
         "lefthook": "2.1.9",
         "typescript": "6.0.3",
@@ -39,7 +39,7 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.5.2", "", { "os": "win32", "cpu": "x64" }, "sha512-4InchVpdVmdkkkgjQqKpgvyu+VPnoF/7RPSw5YATgEVpt2j72wcCAeV5TwaE9ZGJUZWZn7v2CwSAj6CrMJEx8A=="],
 
-    "@inixiative/config": ["@inixiative/config@0.5.60", "", { "peerDependencies": { "@biomejs/biome": ">=2.5.0", "tsup": ">=8.5.0", "typescript": ">=6.0.0" }, "optionalPeers": ["@biomejs/biome", "tsup", "typescript"], "bin": { "inixiative-config": "dist/cli.js" } }, "sha512-7ooPijmA/VVCNx7tJLE+SE12rbx0VSP06fyXZkyOvEXzlWwXnbiQfNxf1xfvTi5y6Uib703DPVKjfwZ1nxXIaA=="],
+    "@inixiative/config": ["@inixiative/config@0.5.62", "", { "peerDependencies": { "@biomejs/biome": ">=2.5.0", "tsup": ">=8.5.0", "typescript": ">=6.0.0" }, "optionalPeers": ["@biomejs/biome", "tsup", "typescript"], "bin": { "inixiative-config": "dist/cli.js" } }, "sha512-swfWpCoz0Wznboeno4i/TQ/grbYw7uwyzbs7aTgd5uoW5y2YDoQX8Orq5Mp2+rZrayPkz3Fq1JUiEjLqneMrkQ=="],
 
     "@inixiative/signet": ["@inixiative/signet@0.3.0", "", { "dependencies": { "jose": "^6.2.3" }, "peerDependencies": { "zod": "^4.3.6" } }, "sha512-gekBCw769ztSlRfap9gXVMaxJ2pUkTqp3OsVMij9N3F+vvPRg56Wo1qWK8sn7iS24/vnLnPl5qDsI3Va6M/VgA=="],
 
