@@ -48,7 +48,7 @@ archive connect --url https://your-archive.example --project-id inixiative --tok
 archive search --remote --query 'migration'
 ```
 
-`setup` is an alias for `connect`. Setup verifies access before saving `<home>/config/destinations.json` and does not upload; the Compose server (`serve --sync`) reads it and publishes every 30 seconds. `sync` and `routes` run the same publication, or preview it, once against `DATABASE_URL`. The URL locates the server; the token grants access. Configuration stores only the token file path (`tokenFile`) or environment variable name (`--token-env`, `tokenEnv`), never the token. A token file is read on every request, so rotating it needs no restart; symlinks and files readable by group or others are refused. Redirects are refused; only HTTPS or loopback HTTP is allowed.
+`setup` is an alias for `connect`. Setup verifies access before saving `<home>/config/destinations.json` and does not upload; the Compose server (`serve --sync`) reads it and publishes every 30 seconds. `sync` and `routes` ask that server to run the same publication, or preview it, once. The URL locates the server; the token grants access. Configuration stores only the token file path (`tokenFile`) or environment variable name (`--token-env`, `tokenEnv`), never the token. A token file is read on every request, so rotating it needs no restart; symlinks and files readable by group or others are refused. Redirects are refused; only HTTPS or loopback HTTP is allowed.
 
 ## Always-on local archiving
 
@@ -112,8 +112,10 @@ The server manages routes over HTTP too, so Foundry can read and set them. Only 
 | `destinations/libraries` | none | `paired`, and the `libraries` (`integrationId`, `resourceId`, `name`) the held Signets may write to |
 | `destinations/connect` | `projectId`, `integrationId`, `resourceId` | the saved destination, after Kingdom confirms `sessions.write` on the library (403 otherwise) |
 | `destinations/remove` | `projectId`, `integrationId`, `resourceId` | `removed` |
+| `destinations/routes` | none | each archive with the destinations its project routes to; nothing is sent |
+| `destinations/sync` | none | one publication to every destination: `id`, `destination`, `status` per archive and route |
 
-`@inixiative/archive/remote`'s `ArchiveClient` wraps these as `destinations()`, `libraries()`, `connectDestination()` and `removeDestination()`. The sync loop picks up changes within 30 seconds.
+`@inixiative/archive/remote`'s `ArchiveClient` wraps these as `destinations()`, `libraries()`, `connectDestination()`, `removeDestination()`, `routes()` and `sync()`. The sync loop picks up changes within 30 seconds.
 
 ## Tags, references, actors and retention
 
@@ -144,7 +146,7 @@ All data endpoints are `POST /api/v1/archive/<action>` with a JSON body and `Aut
 | `delete` | `archiveId` | deleted |
 | `settings/read`, `settings/update` | `integrations?`, `retentionDays?` | settings |
 | `tags/list`, `tags/define`, `tags/remove` | `tag`, `actorId?`, `description?` | offered tags with usage counts |
-| `destinations/list`, `destinations/libraries`, `destinations/connect`, `destinations/remove` | see [Routing](#routing) | routes |
+| `destinations/list`, `destinations/libraries`, `destinations/connect`, `destinations/remove`, `destinations/routes`, `destinations/sync` | see [Routing](#routing) | routes |
 
 Filters are `projectId`, `source`, `tag`, `actorId`, `model`, `effort` and `reference` (`{integration, ref}`). Jev integration is not enabled. Session content must not be sent to Jev without selecting that service for the relevant ownership boundary.
 

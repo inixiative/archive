@@ -16,7 +16,7 @@ import {
   writeAgents,
 } from './agents';
 import { importChatGPTThread } from './chatgpt';
-import { archiveRequest, routingPreview, searchRemotes, syncArchives } from './client';
+import { archiveRequest, searchRemotes, syncArchives } from './client';
 import { collectSessions } from './collector';
 import {
   archiveDestinationSchema,
@@ -30,7 +30,6 @@ import { pairWithKingdom, verifyKingdomDestination } from './kingdom';
 import { previewImports } from './preview';
 import { ArchiveClient, DEFAULT_URL } from './remote';
 import { startArchiveServer } from './server';
-import { ArchiveStore } from './store';
 
 /** Applies pending schema migrations to the archive database. */
 export function migrate(databaseUrl: string) {
@@ -97,7 +96,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'pair --kingdom KINGDOM_API_URL [--name NAME] [--yes]   (register this Archive with Kingdom; claim the review code there, then confirm the owner)\n' +
         'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH)   (a remote Archive, for serve --sync)\n' +
         'connect --kind kingdom --url KINGDOM_API_URL --credential-file PATH --integration-id UUID --resource-id UUID --project-id ID   (a hosted Archive through Kingdom)\n' +
-        'sync | routes   (DATABASE_URL: publish to, or preview, destinations once)\n' +
+        'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
         'agents add-collector --name N --source codex|claude-code --project-id ID --project-root DIR [--project-root ...] [--directory HISTORY] [--worktrees] [--atlas]\n' +
         'agents remove-collector --name N | server --url URL | install | uninstall | status\n' +
         `Data commands talk to the Archive server at --url (default ${DEFAULT_URL}) with the token in --token-file (default <home>/server.token) or ARCHIVE_TOKEN.`,
@@ -312,24 +311,15 @@ export async function runCli(args = Bun.argv.slice(2)) {
     if (results.some((r) => 'error' in r)) process.exitCode = 1;
     return;
   }
-  if (command === 'sync' || command === 'routes') {
-    const store = new ArchiveStore(databaseUrl());
-    try {
-      if (command === 'routes') output(await routingPreview(store, readDestinations(config)));
-      else {
-        const results = await syncArchives(store, readDestinations(config));
-        output(results);
-        if (results.some((r) => r.status.startsWith('failed'))) process.exitCode = 1;
-      }
-    } finally {
-      await store.close();
-    }
-    return;
-  }
   const token = process.env.ARCHIVE_TOKEN ?? readToken();
   if (!token) throw new Error('No Archive token: run `archive init` or set ARCHIVE_TOKEN');
   const archive = new ArchiveClient({ url: v.url ?? DEFAULT_URL, token });
-  if (command === 'import') {
+  if (command === 'routes') output(await archive.routes());
+  else if (command === 'sync') {
+    const results = await archive.sync();
+    output(results);
+    if (results.some((r) => r.status.startsWith('failed'))) process.exitCode = 1;
+  } else if (command === 'import') {
     if (
       !v.file ||
       !['codex', 'claude-code', 'chatgpt'].includes(v.source ?? '') ||

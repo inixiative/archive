@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { defaultHome } from './agents';
+import type { routingPreview, syncArchives } from './client';
 import type { DescribedDestination } from './config';
 import type { ArchiveChunk, ArchiveSnapshot } from './index';
 import { archiveKey, archiveSnapshotSchema } from './index';
@@ -22,6 +23,8 @@ export type DestinationStatus = DescribedDestination & { delivered: number; pend
 /** A hosted Archive library a held Signet may write to. */
 export type ArchiveLibrary = { integrationId: string; resourceId: string; name: string };
 export type ArchiveLibraries = { paired: boolean; libraries: ArchiveLibrary[] };
+export type RoutingPreview = Awaited<ReturnType<typeof routingPreview>>;
+export type SyncResult = Awaited<ReturnType<typeof syncArchives>>[number];
 /** A project routed to a hosted Archive library through Kingdom. */
 export type KingdomRoute = { projectId: string; integrationId: string; resourceId: string };
 
@@ -161,6 +164,14 @@ export class ArchiveClient {
   }
   libraries() {
     return this.request<ArchiveLibraries>('destinations/libraries');
+  }
+  /** Each archive and the destinations its project routes to; nothing is sent. */
+  routes() {
+    return this.request<RoutingPreview>('destinations/routes');
+  }
+  /** Publishes every archive to its project's destinations once. */
+  sync() {
+    return this.request<SyncResult[]>('destinations/sync', {}, { timeoutMs: 600_000 });
   }
   /** Routes a project to a library; the server verifies its Signet grants sessions.write first. */
   connectDestination(route: KingdomRoute) {

@@ -1,5 +1,6 @@
 import { timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
+import { routingPreview, syncArchives } from './client';
 import {
   connectDestination,
   describeDestination,
@@ -194,6 +195,16 @@ export function createArchiveHandler(
               ...(await store.delivery(destination.projectId, destinationIdentity(destination))),
             });
         return json({ data: { destinations } });
+      }
+      if (config && path === '/api/v1/archive/destinations/routes') {
+        z.strictObject({}).parse(body);
+        return json({
+          data: await routingPreview(store, readDestinations(config.destinationsFile)),
+        });
+      }
+      if (config && path === '/api/v1/archive/destinations/sync') {
+        z.strictObject({}).parse(body);
+        return json({ data: await syncArchives(store, readDestinations(config.destinationsFile)) });
       }
       if (config && path === '/api/v1/archive/destinations/libraries') {
         z.strictObject({}).parse(body);
