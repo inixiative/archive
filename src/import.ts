@@ -7,6 +7,47 @@ export interface ImportOptions {
   title?: string;
   projectId?: string;
 }
+/** Content the harness wraps in or adds to a user message; the person never typed it. */
+const injectedTags = [
+  'system-reminder',
+  'local-command-caveat',
+  'local-command-stdout',
+  'local-command-stderr',
+  'command-name',
+  'command-message',
+  'command-args',
+  'bash-input',
+  'bash-stdout',
+  'bash-stderr',
+  'task-notification',
+  'user-prompt-submit-hook',
+  'fork-boilerplate',
+  'recommended_plugins',
+  'environment_context',
+  'user_instructions',
+  'permissions',
+  'INSTRUCTIONS',
+].join('|');
+const injectedBlock = new RegExp(`<(${injectedTags})(?:\\s[^>]*)?>[\\s\\S]*?</\\1>`, 'g');
+const injectedOpening = new RegExp(`^<(?:${injectedTags})(?:>|\\s)`);
+/** Foundry's native-session envelope; the person's text is the first User Message section. */
+const foundryUserMessage =
+  /^# User Message[ \t]*\n([\s\S]*?)(?=\n# (?:User Message|Assistant Message|Foundry Injection)[ \t]*\n|(?![\s\S]))/m;
+
+/** What the person typed in a user message, without injected content; undefined when nothing is left. */
+function typedPrompt(text: string) {
+  let prompt = text
+    .replace(injectedBlock, '')
+    .replace(/<\/?pasted_content(?:\s[^>]*)?>/g, '')
+    .replace(/^\s*# AGENTS\.md instructions for [^\n]*/, '')
+    .trim();
+  if (/^# (?:System Context|User Message)[ \t]*\n/.test(prompt))
+    prompt = prompt.match(foundryUserMessage)?.[1].trim() ?? '';
+  if (!prompt || injectedOpening.test(prompt) || /^\[Request interrupted by user/.test(prompt))
+    return undefined;
+  return prompt;
+}
+
 export function importTranscript(text: string, options: ImportOptions): ArchiveSnapshot {
   return importTranscriptLines(text.split('\n'), options);
 }
@@ -19,6 +60,8 @@ export function importTranscriptLines(
   let sessionId = options.sessionId;
   let reasoning = false;
   const seen = new Map<string, string>();
+  let prompt: string | undefined;
+  let metaPrompt: string | undefined;
   let index = -1;
   let contentBytes = 0;
   // Codex states the model per turn; Claude Code per assistant record.
@@ -75,6 +118,11 @@ export function importTranscriptLines(
           'Supported transcript content exceeds the archive size limit; no archive imported',
         );
       seen.set(id, identity);
+      // Claude Code marks expanded commands and caveats as meta: a title only when nothing was typed.
+      if (kind === 'user' && !prompt && !row.isCompactSummary) {
+        if (!row.isMeta) prompt = typedPrompt(content);
+        else metaPrompt ??= typedPrompt(content);
+      }
       entries.push({
         id,
         kind,
@@ -165,14 +213,7 @@ export function importTranscriptLines(
   }
   if (!sessionId || !entries.length)
     throw new Error('Transcript must identify a session and contain supported records');
-  const firstPrompt = entries.find(
-    (entry) =>
-      entry.kind === 'user' &&
-      !/^<(?:recommended_plugins|environment_context|user_instructions|permissions)(?:>|\s)/.test(
-        entry.text.trimStart(),
-      ),
-  );
-  const title = options.title ?? firstPrompt?.text.slice(0, 160) ?? sessionId;
+  const title = options.title ?? (prompt ?? metaPrompt)?.slice(0, 160) ?? sessionId;
   return archiveSnapshotSchema.parse({
     schemaVersion: 1,
     sourceId: options.sourceId,
