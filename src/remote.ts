@@ -1,8 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { defaultHome } from './agents';
-import type { routingPreview, syncArchives } from './client';
-import type { DescribedDestination } from './config';
+import type { ArchiveDestination, DescribedDestination } from './config';
 import type { ArchiveChunk, ArchiveSnapshot } from './index';
 import { archiveKey, archiveSnapshotSchema } from './index';
 import type { ArchiveFilter, ArchiveSettings, TagDefinition } from './schemas';
@@ -23,8 +22,16 @@ export type DestinationStatus = DescribedDestination & { delivered: number; pend
 /** A hosted Archive library a held Signet may write to. */
 export type ArchiveLibrary = { integrationId: string; resourceId: string; name: string };
 export type ArchiveLibraries = { paired: boolean; libraries: ArchiveLibrary[] };
-export type RoutingPreview = Awaited<ReturnType<typeof routingPreview>>;
-export type SyncResult = Awaited<ReturnType<typeof syncArchives>>[number];
+export type RoutedDestination = Pick<ArchiveDestination, 'kind' | 'url'> & {
+  integrationId?: string;
+};
+export type RoutingPreview = (Pick<
+  ArchiveListing,
+  'id' | 'projectId' | 'tags' | 'suggestedTags'
+> & {
+  destinations: RoutedDestination[];
+})[];
+export type SyncResult = { id: string; destination: string; status: string };
 /** A project routed to a hosted Archive library through Kingdom. */
 export type KingdomRoute = { projectId: string; integrationId: string; resourceId: string };
 

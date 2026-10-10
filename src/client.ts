@@ -6,6 +6,7 @@ import {
   destinationToken,
   destinationUrl,
 } from './config';
+import type { RoutingPreview, SyncResult } from './remote';
 import type { ArchiveStore } from './store';
 
 export { type ArchiveDestination, archiveDestinationSchema } from './config';
@@ -106,7 +107,10 @@ export async function publishArchive(
   throw new Error('Archive changed repeatedly during publication; retry sync');
 }
 
-export async function routingPreview(store: ArchiveStore, destinations: ArchiveDestination[]) {
+export async function routingPreview(
+  store: ArchiveStore,
+  destinations: ArchiveDestination[],
+): Promise<RoutingPreview> {
   return (await store.list()).map((archive) => ({
     id: archive.id,
     projectId: archive.projectId,
@@ -122,8 +126,11 @@ export async function routingPreview(store: ArchiveStore, destinations: ArchiveD
   }));
 }
 
-export async function syncArchives(store: ArchiveStore, destinations: ArchiveDestination[]) {
-  const results: { id: string; destination: string; status: string }[] = [];
+export async function syncArchives(
+  store: ArchiveStore,
+  destinations: ArchiveDestination[],
+): Promise<SyncResult[]> {
+  const results: SyncResult[] = [];
   for (const archive of await store.list())
     for (const destination of destinations.filter((d) => d.projectId === archive.projectId)) {
       try {
