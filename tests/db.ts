@@ -56,7 +56,9 @@ const open = new Map<string, ArchiveStore>();
 
 /** An empty store in its own database, emptied for each test. */
 export async function freshStore(name: TestDatabase = 'main') {
-  const store = open.get(name) ?? new ArchiveStore(testDatabaseUrl(name));
+  // A new store each time: a store caches the source id the truncate below deletes.
+  await open.get(name)?.close();
+  const store = new ArchiveStore(testDatabaseUrl(name));
   open.set(name, store);
   await store.db.$executeRawUnsafe(
     'TRUNCATE "archives", "settings", "tag_definitions" RESTART IDENTITY CASCADE',
