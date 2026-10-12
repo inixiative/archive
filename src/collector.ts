@@ -107,8 +107,14 @@ export function sessionMetadata(
   }
 }
 
+/**
+ * A collector never waits on a child for long: macOS holds a launchd agent's access to protected
+ * folders (Desktop, Documents) pending a privacy prompt nobody answers, which blocks git forever.
+ */
+const SPAWN_MS = 10_000;
+
 const git = (cwd: string, ...args: string[]) => {
-  const run = Bun.spawnSync(['git', '-C', cwd, ...args], { stderr: 'ignore' });
+  const run = Bun.spawnSync(['git', '-C', cwd, ...args], { stderr: 'ignore', timeout: SPAWN_MS });
   return run.success ? run.stdout.toString().trim() : undefined;
 };
 
@@ -117,6 +123,7 @@ function atlasGraph(cwd: string): AtlasFileConcepts | undefined {
   const run = Bun.spawnSync([process.execPath, 'x', 'atlas', 'graph', '--json'], {
     cwd,
     stderr: 'ignore',
+    timeout: 12 * SPAWN_MS,
   });
   if (!run.success) return;
   try {
@@ -127,6 +134,7 @@ function atlasGraph(cwd: string): AtlasFileConcepts | undefined {
 function worktreesOf(root: string): string[] {
   const listed = Bun.spawnSync(['git', '-C', root, 'worktree', 'list', '--porcelain'], {
     stderr: 'ignore',
+    timeout: SPAWN_MS,
   });
   if (!listed.success) return [];
   return listed.stdout
