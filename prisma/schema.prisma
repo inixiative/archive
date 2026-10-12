@@ -20,9 +20,9 @@ model Setting {
 /// One session. `summary` is its listing (snapshot metadata, tags as captured, models,
 /// references, suggestions), recomputed on capture and when settings change.
 model Archive {
-  id         String @id
+  id         String  @id
   /// Insertion order: listings are newest first.
-  seq        BigInt @unique @default(autoincrement())
+  seq        BigInt  @unique @default(autoincrement())
   digest     String
   revision   Int
   source     String
@@ -34,10 +34,11 @@ model Archive {
   capturedAt Float
   summary    Json
 
-  revisions Revision[]
-  tagEdits  TagEdit[]
-  receipts  Receipt[]
-  outbox    Outbox[]
+  revisions  Revision[]
+  tagEdits   TagEdit[]
+  suggestion Suggestion?
+  receipts   Receipt[]
+  outbox     Outbox[]
 
   @@index([projectId])
   @@index([actorId])
@@ -93,6 +94,24 @@ model TagEdit {
 
   @@id([archiveId, tag])
   @@map("tag_edits")
+}
+
+/// The tagger's suggestions for one digest of an archive: defined category tags, `junk`, and
+/// `project:<id>` when routing was weak. Never applied; a person applies or removes tags.
+model Suggestion {
+  archiveId String   @id
+  /// The archive digest the suggestions describe; a new digest makes them due again.
+  digest    String
+  /// The tagger's prompt, model, tag definitions and projects, hashed; a change makes them due again.
+  key       String
+  /// The model that suggested, or `prefilter` when no model was asked.
+  by        String
+  tags      String[]
+  at        Float
+
+  archive Archive @relation(fields: [archiveId], references: [id], onDelete: Cascade)
+
+  @@map("suggestions")
 }
 
 /// A tag this archive offers: archive-wide (actorId "") or for one actor.

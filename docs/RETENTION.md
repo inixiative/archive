@@ -126,6 +126,8 @@ An archive is **kept** while any of these hold. Each is a *citation* (§5) of a 
 | A subagent or handoff whose parent is kept, or the parent of a kept child | Archive, from lineage | derived, not stored |
 | Pinned by a person | Person (CLI, Foundry, Kingdom) | `pin` |
 
+**Exempt sessions** (`run:test`, `run:oracle`; README, "Run tags") are outside this scheme: they get no citations, no usefulness score and no summary, and readers never cite them. They stay until deleted, and a person removing the run tag brings one back under retention. The tagger's `junk` suggestion is evidence for a lower starting confidence, never a deletion.
+
 Releasing is deleting the citation (a feedback item is closed, a fixture is retired, a pin is removed). The archive then falls back to its score.
 
 ## 5. Usefulness score (MuninnDB style)

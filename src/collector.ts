@@ -8,8 +8,9 @@ import {
   readSync,
   realpathSync,
 } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { cwdRunTag, temporaryRoots } from './exemption';
 import { importTranscriptFile } from './import-file';
 import { archiveKey, archiveSnapshotSchema, snapshotDigest, UNROUTED } from './index';
 import type { ArchiveClient } from './remote';
@@ -35,21 +36,11 @@ export interface CollectionSource {
 
 /**
  * Where sessions are never swept in by a subdirectory or catch-all match: temp directories (test
- * fixtures, agent scratchpads) and Foundry's decision receipts. An exact root is explicit and wins.
+ * fixtures, agent scratchpads) and decision receipts (Foundry's, the repeat report's, the tagger's).
+ * An exact root is explicit and wins.
  * Absolute entries match the directory and below; relative ones match those path segments anywhere.
  */
-export const defaultExclusions = () => [
-  ...new Set(
-    ['/tmp', '/private/tmp', '/var/folders', '/private/var/folders', tmpdir()].flatMap((path) => {
-      try {
-        return [resolve(path), realpathSync(path)];
-      } catch {
-        return [resolve(path)];
-      }
-    }),
-  ),
-  '.foundry/decision-receipts',
-];
+export const defaultExclusions = () => [...temporaryRoots(), 'decision-receipts'];
 export function excluded(cwd: string, exclusions: string[]) {
   return exclusions.some((entry) =>
     isAbsolute(entry)
@@ -350,8 +341,10 @@ export async function collectSessions(
       if (!repositories.has(cwd)) repositories.set(cwd, git(cwd, 'remote', 'get-url', 'origin'));
       if (config.atlas && !graphs.has(cwd)) graphs.set(cwd, atlasGraph(cwd));
       const graph = graphs.get(cwd);
+      const run = cwdRunTag(cwd);
       snapshot.tags = [
         ...new Set([
+          ...(run ? [run] : []),
           ...(config.tags ?? []),
           ...(graph ? atlasTags(snapshot, graph, roots(config)) : []),
         ]),

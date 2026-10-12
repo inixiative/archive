@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { type Prisma, PrismaClient } from '@prisma/client';
 import { z } from 'zod';
+import { exemptRun, identityRunTags } from './exemption';
 import {
   type ArchiveChunk,
   type ArchiveSnapshot,
@@ -9,6 +10,7 @@ import {
   chunkArchive,
   selectChunks,
   snapshotDigest,
+  UNROUTED,
 } from './index';
 import {
   type ArchiveFilter,
@@ -19,7 +21,15 @@ import {
   tagDefinitionSchema,
   tagSchema,
 } from './schemas';
-import { archiveReferences, suggestTags } from './tags';
+import {
+  JUNK_TAG,
+  PREFILTER,
+  PROJECT_TAG_PREFIX,
+  type SuggestionDue,
+  type SuggestionResult,
+  sessionDigest,
+} from './suggest';
+import { archiveReferences, suggestTags, type TagSuggestion } from './tags';
 
 export {
   type ArchiveFilter,
@@ -77,22 +87,58 @@ const toChunk = (row: {
 
 const BATCH = 500;
 
+/** A session's tags before edits: as captured, plus the run tags its identity implies. */
+const baseTags = (summary: Summary) => [
+  ...new Set([
+    ...summary.capturedTags,
+    ...identityRunTags({
+      source: summary.source,
+      sessionId: summary.sessionId,
+      projectId: summary.projectId,
+      tags: summary.capturedTags,
+    }),
+  ]),
+];
+
 type ArchiveRow = {
   id: string;
   revision: number;
   digest: string;
   summary: Prisma.JsonValue;
   tagEdits: { tag: string; added: boolean }[];
+  suggestion: { by: string; tags: string[] } | null;
 };
+/**
+ * Tags are the base tags with this archive's edits applied. Suggestions are the tagger's and the
+ * heuristics', minus what a person applied or removed: their edits always win.
+ */
 const listing = (row: ArchiveRow, filter: ArchiveFilter) => {
-  const { capturedTags, ...summary } = row.summary as Summary;
+  const { capturedTags: _, suggestedTags: heuristic, ...summary } = row.summary as Summary;
   const removed = new Set(row.tagEdits.filter((e) => !e.added).map((e) => e.tag));
   const tags = [
-    ...new Set([...capturedTags, ...row.tagEdits.filter((e) => e.added).map((e) => e.tag)]),
+    ...new Set([
+      ...baseTags(row.summary as Summary),
+      ...row.tagEdits.filter((e) => e.added).map((e) => e.tag),
+    ]),
   ].filter((tag) => !removed.has(tag));
+  const suggested: TagSuggestion[] = [
+    ...(row.suggestion?.tags ?? []).map((tag) => ({
+      tag,
+      origin: row.suggestion!.by === PREFILTER ? ('heuristic' as const) : ('model' as const),
+    })),
+    ...heuristic,
+  ];
+  const suggestedTags = suggested.filter(
+    (s, index) =>
+      !tags.includes(s.tag) &&
+      !removed.has(s.tag) &&
+      suggested.findIndex((other) => other.tag === s.tag) === index,
+  );
   const { reference, model, effort } = filter;
   if (
     (filter.tag && !tags.includes(filter.tag)) ||
+    (filter.exempt !== undefined && Boolean(exemptRun(tags)) !== filter.exempt) ||
+    (filter.suggestedTag && !suggestedTags.some((s) => s.tag === filter.suggestedTag)) ||
     (model && !summary.models.some((m) => m.model === model)) ||
     (effort && !summary.models.some((m) => m.effort === effort && (!model || m.model === model))) ||
     (reference &&
@@ -101,7 +147,9 @@ const listing = (row: ArchiveRow, filter: ArchiveFilter) => {
       ))
   )
     return [];
-  return [{ id: row.id, revision: row.revision, digest: row.digest, ...summary, tags }];
+  return [
+    { id: row.id, revision: row.revision, digest: row.digest, ...summary, tags, suggestedTags },
+  ];
 };
 export type ArchiveListing = ReturnType<typeof listing>[number];
 
@@ -223,7 +271,7 @@ export class ArchiveStore {
           ...(filter.accessPath ? { accessPath: filter.accessPath } : {}),
           ...(cursor === undefined ? {} : { seq: { lt: cursor } }),
         },
-        include: { tagEdits: true },
+        include: { tagEdits: true, suggestion: { select: { by: true, tags: true } } },
         orderBy: { seq: 'desc' },
         take: BATCH,
       });
@@ -298,7 +346,7 @@ export class ArchiveStore {
     return this.db.$transaction(async (tx) => {
       const archive = await tx.archive.findUnique({ where: { id } });
       if (!archive) throw new Error('Archive unavailable');
-      const captured = new Set((archive.summary as Summary).capturedTags);
+      const captured = new Set(baseTags(archive.summary as Summary));
       const set = (tag: string, added: boolean) =>
         tx.tagEdit.upsert({
           where: { archiveId_tag: { archiveId: id, tag } },
@@ -307,7 +355,8 @@ export class ArchiveStore {
         });
       const clear = (tag: string) => tx.tagEdit.deleteMany({ where: { archiveId: id, tag } });
       for (const tag of add) await (captured.has(tag) ? clear(tag) : set(tag, true));
-      for (const tag of remove) await (captured.has(tag) ? set(tag, false) : clear(tag));
+      // A removal is kept even for a tag the session lacks, so a later capture or suggestion of it stays removed.
+      for (const tag of remove) await set(tag, false);
       const edits = await tx.tagEdit.findMany({ where: { archiveId: id } });
       const removed = new Set(edits.filter((e) => !e.added).map((e) => e.tag));
       const tags = [
@@ -441,6 +490,137 @@ export class ArchiveStore {
     });
     const delivered = archives.filter((a) => a.receipts[0]?.digest === a.digest).length;
     return { delivered, pending: archives.length - delivered };
+  }
+  /**
+   * Sessions due for suggestions, newest first: not exempt, and without suggestions for their
+   * current digest and this key (or every non-exempt one with `refresh`). Each comes as a bounded
+   * digest, so the tagger never downloads transcripts. `projects` are the archive's routed projects.
+   */
+  async suggestionQueue(input: {
+    key: string;
+    limit: number;
+    beforeId?: string;
+    refresh?: boolean;
+  }): Promise<
+    { items: SuggestionDue[]; projects: string[]; nextCursor: string | null } | undefined
+  > {
+    let cursor: bigint | undefined;
+    if (input.beforeId) {
+      const before = await this.db.archive.findUnique({
+        where: { id: input.beforeId },
+        select: { seq: true },
+      });
+      if (!before) return undefined;
+      cursor = before.seq;
+    }
+    const due: { id: string; revision: number; digest: string }[] = [];
+    let nextCursor: string | null = null;
+    scan: for (;;) {
+      const rows = await this.db.archive.findMany({
+        where: cursor === undefined ? {} : { seq: { lt: cursor } },
+        include: { tagEdits: true, suggestion: true },
+        orderBy: { seq: 'desc' },
+        take: BATCH,
+      });
+      for (const row of rows) {
+        const current = row.suggestion?.digest === row.digest && row.suggestion.key === input.key;
+        if ((current && !input.refresh) || exemptRun(listing(row, {})[0]!.tags)) continue;
+        due.push(row);
+        if (due.length >= input.limit) {
+          nextCursor = row.id;
+          break scan;
+        }
+      }
+      if (rows.length < BATCH) break;
+      cursor = rows.at(-1)!.seq;
+    }
+    const items: SuggestionDue[] = [];
+    for (const archive of due) {
+      const row = await this.db.revision.findUnique({
+        where: { archiveId_revision: { archiveId: archive.id, revision: archive.revision } },
+        select: { snapshot: true },
+      });
+      if (!row) continue;
+      items.push({
+        archiveId: archive.id,
+        digest: archive.digest,
+        session: sessionDigest(archiveSnapshotSchema.parse(row.snapshot)),
+      });
+    }
+    return { items, projects: await this.projects(), nextCursor };
+  }
+  /** Routed projects: every projectId but the catch-all's and Foundry's test fixture project. */
+  private async projects() {
+    const rows = await this.db.archive.findMany({
+      where: { projectId: { notIn: [UNROUTED, 'P'] } },
+      distinct: ['projectId'],
+      select: { projectId: true },
+      orderBy: { projectId: 'asc' },
+    });
+    return rows.flatMap((row) => (row.projectId ? [row.projectId] : []));
+  }
+  /**
+   * Records the tagger's suggestions. One for a digest that is no longer current is stale and
+   * dropped; one naming a tag this archive does not offer (archive-wide definitions, `junk`,
+   * `project:<routed project>`) is refused. Exempt sessions are refused too.
+   */
+  async recordSuggestions(results: SuggestionResult[], now = Date.now()) {
+    const parsed = z
+      .array(
+        z.strictObject({
+          archiveId: z.string().regex(/^[a-f0-9]{64}$/),
+          digest: z.string().regex(/^[a-f0-9]{64}$/),
+          key: z.string().min(1).max(128),
+          by: z.string().min(1).max(200),
+          tags: z.array(tagSchema).max(20),
+        }),
+      )
+      .max(500)
+      .parse(results);
+    const offered = new Set([
+      JUNK_TAG,
+      ...(
+        await this.db.tagDefinition.findMany({ where: { actorId: '' }, select: { tag: true } })
+      ).map((d) => d.tag),
+    ]);
+    const projects = new Set(await this.projects());
+    const outcome = { recorded: 0, stale: 0, refused: 0 };
+    for (const result of parsed) {
+      const row = await this.db.archive.findUnique({
+        where: { id: result.archiveId },
+        include: { tagEdits: true, suggestion: true },
+      });
+      if (!row || row.digest !== result.digest) {
+        outcome.stale++;
+        continue;
+      }
+      if (
+        exemptRun(listing(row, {})[0]!.tags) ||
+        !result.tags.every(
+          (tag) =>
+            offered.has(tag) ||
+            (tag.startsWith(PROJECT_TAG_PREFIX) &&
+              projects.has(tag.slice(PROJECT_TAG_PREFIX.length))),
+        )
+      ) {
+        outcome.refused++;
+        continue;
+      }
+      const fields = {
+        digest: result.digest,
+        key: result.key,
+        by: result.by,
+        tags: result.tags,
+        at: now,
+      };
+      await this.db.suggestion.upsert({
+        where: { archiveId: result.archiveId },
+        create: { archiveId: result.archiveId, ...fields },
+        update: fields,
+      });
+      outcome.recorded++;
+    }
+    return outcome;
   }
   async close() {
     await this.db.$disconnect();

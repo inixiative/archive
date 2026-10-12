@@ -39,4 +39,8 @@ export interface ArchiveFilter {
   effort?: string;
   provider?: string;
   accessPath?: 'subscription' | 'api' | 'unknown';
+  /** true: only test and evaluation runs (`run:test`, `run:oracle`); false: only the rest. */
+  exempt?: boolean;
+  /** Archives with this tag among their suggestions. */
+  suggestedTag?: string;
 }

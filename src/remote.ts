@@ -5,6 +5,7 @@ import type { ArchiveDestination, DescribedDestination } from './config';
 import type { ArchiveChunk, ArchiveSnapshot } from './index';
 import { archiveKey, archiveSnapshotSchema } from './index';
 import type { ArchiveFilter, ArchiveSettings, TagDefinition } from './schemas';
+import type { SuggestionDue, SuggestionResult } from './suggest';
 import type { ArchiveReferenceCount, TagSuggestion } from './tags';
 
 export type ArchiveListing = Omit<ArchiveSnapshot, 'entries'> & {
@@ -159,6 +160,26 @@ export class ArchiveClient {
   }
   updateSettings(change: Partial<ArchiveSettings>) {
     return this.request<ArchiveSettings>('settings/update', change);
+  }
+  defineTag(definition: TagDefinition) {
+    return this.request<TagDefinition>('tags/define', definition);
+  }
+  undefineTag(definition: { tag: string; actorId?: string }) {
+    return this.request<{ removed: boolean }>('tags/remove', definition);
+  }
+  /** Sessions due for tag suggestions, each as a bounded digest. */
+  suggestionQueue(body: { key: string; limit: number; beforeId?: string; refresh?: boolean }) {
+    return this.request<{ items: SuggestionDue[]; projects: string[]; nextCursor: string | null }>(
+      'suggestions/queue',
+      body,
+      { timeoutMs: 120_000 },
+    );
+  }
+  recordSuggestions(results: SuggestionResult[]) {
+    return this.request<{ recorded: number; stale: number; refused: number }>(
+      'suggestions/record',
+      { results },
+    );
   }
   tagDefinitions(actorId?: string) {
     return this.request<{ tags: (TagDefinition & { archives: number })[] }>(

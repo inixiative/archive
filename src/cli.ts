@@ -78,7 +78,13 @@ export async function runCli(args = Bun.argv.slice(2)) {
       atlas: { type: 'boolean', default: false },
       tag: { type: 'string', multiple: true },
       untag: { type: 'string', multiple: true },
-      limit: { type: 'string', default: '100' },
+      description: { type: 'string' },
+      exempt: { type: 'string' },
+      suggested: { type: 'string' },
+      batch: { type: 'string', default: '8' },
+      concurrency: { type: 'string', default: '2' },
+      refresh: { type: 'boolean', default: false },
+      limit: { type: 'string' },
       port: { type: 'string' },
       name: { type: 'string' },
       hostname: { type: 'string', default: '127.0.0.1' },
@@ -96,14 +102,16 @@ export async function runCli(args = Bun.argv.slice(2)) {
   const command = positionals[0];
   if (v.help || !command) {
     console.log(
-      'Archive: init | up | down | serve | connect (setup) | preview | import | collect | list | export | tag | routes | sync | search | agents\n' +
+      'Archive: init | up | down | serve | connect (setup) | preview | import | collect | list | export | tag | tags | suggest | routes | sync | search | agents\n' +
         'up | down   (the local Archive: bundled compose.yaml with Postgres, data in --home)\n' +
         'serve [--port 4700 --hostname 127.0.0.1] [--sync]   (DATABASE_URL; token from ARCHIVE_SERVER_TOKEN or --token-file)\n' +
         'import --file PATH --source codex|claude-code|chatgpt --project-id ID [--tag TAG]\n' +
         'collect --directory HISTORY --source codex|claude-code (--project-root CWD [--project-root ...] --project-id ID [--worktrees] [--subdirectories] | --catch-all) [--exclude PATH ...] [--atlas] [--watch]\n' +
         'collect --agent NAME [--watch]   (one collector from agents.json, routed against the others, re-read each scan)\n' +
-        'list | search --query TEXT [--remote]   [--project-id ID] [--source S] [--tag T] [--provider P] [--model M] [--effort E] [--access-path subscription|api|unknown]\n' +
+        'list | search --query TEXT [--remote]   [--project-id ID] [--source S] [--tag T] [--suggested T] [--exempt true|false] [--provider P] [--model M] [--effort E] [--access-path subscription|api|unknown]\n' +
         'export --id ID | tag --id ID [--tag TAG ...] [--untag TAG ...]\n' +
+        'tags list | tags define --tag TAG [--description TEXT] | tags remove --tag TAG   (the category tags the archive offers)\n' +
+        'suggest [--limit N] [--batch 8] [--concurrency 2] [--model claude-haiku-5-5] [--refresh]   (tag suggestions on the Claude subscription; test and Oracle runs are exempt)\n' +
         'pair --kingdom KINGDOM_API_URL [--name NAME] [--yes]   (register this Archive with Kingdom; claim the review code there, then confirm the owner)\n' +
         'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH)   (a remote Archive, for serve --sync)\n' +
         'connect --kind kingdom --url KINGDOM_API_URL --credential-file PATH --integration-id UUID --resource-id UUID --project-id ID   (a hosted Archive through Kingdom)\n' +
@@ -114,6 +122,16 @@ export async function runCli(args = Bun.argv.slice(2)) {
     );
     return;
   }
+  const flag = (value: string, name: string) => {
+    if (value !== 'true' && value !== 'false') throw new Error(`--${name} is true or false`);
+    return value === 'true';
+  };
+  const whole = (value: string, name: string, max: number) => {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > max)
+      throw new Error(`--${name} must be a whole number from 1 to ${max}`);
+    return parsed;
+  };
   const readToken = () =>
     existsSync(tokenFile) ? readFileSync(tokenFile, 'utf8').trim() : undefined;
   const init = () => {
@@ -322,7 +340,11 @@ export async function runCli(args = Bun.argv.slice(2)) {
     )
       throw new Error('Preview requires one --file or --directory and --source codex|claude-code');
     output(
-      previewImports(v.file ?? v.directory!, v.source as 'codex' | 'claude-code', Number(v.limit)),
+      previewImports(
+        v.file ?? v.directory!,
+        v.source as 'codex' | 'claude-code',
+        Number(v.limit ?? 100),
+      ),
     );
     return;
   }
@@ -348,9 +370,58 @@ export async function runCli(args = Bun.argv.slice(2)) {
     ...(v['access-path']
       ? { accessPath: v['access-path'] as 'subscription' | 'api' | 'unknown' }
       : {}),
+    ...(v.exempt === undefined ? {} : { exempt: flag(v.exempt, 'exempt') }),
+    ...(v.suggested ? { suggestedTag: v.suggested } : {}),
   };
   if (command === 'routes') output(await archive.routes());
-  else if (command === 'sync') {
+  else if (command === 'tags') {
+    const action = positionals[1] ?? 'list';
+    if (action === 'list') output(await archive.tagDefinitions());
+    else if (action === 'define' || action === 'remove') {
+      if (v.tag?.length !== 1) throw new Error(`tags ${action} requires one --tag`);
+      output(
+        action === 'define'
+          ? await archive.defineTag({
+              tag: v.tag[0]!,
+              ...(v.description ? { description: v.description } : {}),
+            })
+          : await archive.undefineTag({ tag: v.tag[0]! }),
+      );
+    } else throw new Error('Unknown tags command; use --help');
+  } else if (command === 'suggest') {
+    const { runSuggestions } = await import('./suggest');
+    const { claudeSuggestModel } = await import('./suggest-claude');
+    const concurrency = whole(v.concurrency!, 'concurrency', 8);
+    const model = await claudeSuggestModel({
+      home,
+      ...(v.model ? { model: v.model } : {}),
+      concurrency,
+    });
+    // Collectors' roots name the projects whose ids are opaque (a Foundry or Kingdom id).
+    const projectLabels: Record<string, string> = {};
+    for (const collector of readAgents(agentsFile)?.collectors ?? [])
+      if (collector.projectRoots.length)
+        projectLabels[collector.projectId] = [
+          ...new Set([projectLabels[collector.projectId], ...collector.projectRoots]),
+        ]
+          .filter(Boolean)
+          .join(', ');
+    try {
+      output(
+        await runSuggestions(archive, {
+          model,
+          batch: whole(v.batch!, 'batch', 20),
+          concurrency,
+          ...(v.limit ? { limit: whole(v.limit, 'limit', 100_000) } : {}),
+          refresh: v.refresh,
+          projectLabels,
+          progress: (line) => console.error(line),
+        }),
+      );
+    } finally {
+      await model.close();
+    }
+  } else if (command === 'sync') {
     const results = await archive.sync();
     output(results);
     if (results.some((r) => r.status.startsWith('failed'))) process.exitCode = 1;
@@ -470,7 +541,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       await archive.search({
         ...filter,
         query: v.query,
-        limit: Number(v.limit) > 100 ? 100 : Number(v.limit),
+        limit: Math.min(100, Number(v.limit ?? 100)),
       }),
     );
   else if (command === 'export' || command === 'tag') {

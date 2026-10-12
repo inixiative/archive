@@ -12,6 +12,7 @@ import {
 import { archiveReferenceSchema, archiveSnapshotSchema, selectChunks } from './index';
 import { KingdomGrantMissing, pairedDestination, pairedLibraries } from './kingdom';
 import { ArchiveConflict, ArchiveStore, archiveSettingsSchema, tagDefinitionSchema } from './store';
+import type { SuggestionResult } from './suggest';
 
 const ingestSchema = z.strictObject({
   snapshot: archiveSnapshotSchema,
@@ -31,6 +32,8 @@ const filterFields = {
   effort: z.string().min(1).max(40).optional(),
   provider: z.string().min(1).max(64).optional(),
   accessPath: z.enum(['subscription', 'api', 'unknown']).optional(),
+  exempt: z.boolean().optional(),
+  suggestedTag: z.string().min(1).max(120).optional(),
   limit: z.number().int().min(1).max(100).default(20),
   beforeId: archiveId.optional(),
 };
@@ -46,6 +49,13 @@ const tagSchema = z.strictObject({
   add: z.array(z.string()).max(100).optional(),
   remove: z.array(z.string()).max(100).optional(),
 });
+const suggestionQueueSchema = z.strictObject({
+  key: z.string().min(1).max(128),
+  limit: z.number().int().min(1).max(100).default(50),
+  beforeId: archiveId.optional(),
+  refresh: z.boolean().optional(),
+});
+const suggestionRecordSchema = z.strictObject({ results: z.array(z.unknown()).max(500) });
 const tagListSchema = z.strictObject({ actorId: z.string().min(1).max(256).optional() });
 const tagRemoveSchema = tagDefinitionSchema.pick({ tag: true, actorId: true });
 const destinationListSchema = z.strictObject({ projectId: filterFields.projectId });
@@ -167,6 +177,16 @@ export function createArchiveHandler(
           return json({ error: 'Archive unavailable' }, 404);
         return json({ data: await store.tag(input.archiveId, input) });
       }
+      if (path === '/api/v1/archive/suggestions/queue') {
+        const queue = await store.suggestionQueue(suggestionQueueSchema.parse(body));
+        return queue ? json({ data: queue }) : json({ error: 'Invalid cursor' }, 400);
+      }
+      if (path === '/api/v1/archive/suggestions/record')
+        return json({
+          data: await store.recordSuggestions(
+            suggestionRecordSchema.parse(body).results as SuggestionResult[],
+          ),
+        });
       if (path === '/api/v1/archive/delete') {
         const input = readSchema.pick({ archiveId: true }).parse(body);
         return (await store.delete(input.archiveId))

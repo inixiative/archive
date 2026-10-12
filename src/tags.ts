@@ -1,8 +1,11 @@
 import { z } from 'zod';
 import { type ArchiveReference, type ArchiveSnapshot, categorySuggestions } from './index';
 
-/** A conceptual tag the archive proposes; suggestions never route or authorize. */
-export type TagSuggestion = { tag: string; origin: 'heuristic' };
+/**
+ * A tag the archive proposes; suggestions never route or authorize, and a person applies them.
+ * `heuristic`: computed by a rule; `model`: the tagger's model suggested it.
+ */
+export type TagSuggestion = { tag: string; origin: 'heuristic' | 'model' };
 
 /**
  * An integration whose items sessions can reference. GitHub and Linear links are recognized

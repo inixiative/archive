@@ -121,11 +121,20 @@ The server manages routes over HTTP too, so Foundry can read and set them. Only 
 
 The archive owns its tag system. It keeps two different things apart:
 
-- **Tags** are concepts: the `atlas:<concept>` of repository files a session's tool calls touched (collectors with `--atlas`, from `atlas graph --json`), collector `--tag`s, and tags people add. Heuristic categories are offered as `suggestedTags`, computed on read and never stored.
+- **Tags** are concepts: the `atlas:<concept>` of repository files a session's tool calls touched (collectors with `--atlas`, from `atlas graph --json`), collector `--tag`s, and tags people add. **Suggestions** (`suggestedTags`) are never applied: heuristic categories (`origin: "heuristic"`), and the tagger's (`origin: "model"`, below). A person applies one with `tag --tag`; tags a person applied or removed never show as suggestions.
+- **Run tags** mark sessions that are not a person's work: `run:test` (Foundry's test fixtures: project `P`, the `watch-A`/`watch-B` threads, ACP client probes outside a project; and sessions whose working directory is a temp directory, a scratchpad or a `decision-receipts` directory) and `run:oracle` (Oracle eval workspaces, `.oracle` directories, bench run checkouts). Collectors add the working-directory ones at capture; the rest follow from the session's identity. An exempt session is kept but feeds nothing that learns from sessions: suggestions, retention scoring, correction mining (`foundry repeats`) or agent context. Readers pass `exempt: false`. Removing the run tag (`tag --untag run:test`) lifts the exemption.
 - **References** point at items in an integration. Collectors record the session's GitHub repository and branch (`owner/repo`, `owner/repo/tree/branch`); linked GitHub pull requests, issues and commits (`owner/repo#24`, `owner/repo@sha`) and Linear issues (`KEY-12`) are found in the text and counted. A link is a mention, not proof of work. The archive's settings list the integrations it references: GitHub and Linear are recognized natively, and any other integration names the link prefix of its items (for example `https://acme.atlassian.net/browse/`); the item is what follows. Prefixes are literal, so settings cannot make matching slow.
 
 ```sh
 bun run archive tag --id ARCHIVE_ID --tag reviewed --untag debugging
+```
+
+The **tagger** suggests, for every session that is not exempt: `junk` (empty, aborted, probes, accidental starts), up to three of the archive-wide category tags (`tags define`), and `project:<id>` when the session landed `unrouted` or without a project. It runs on the machine's Claude subscription: Claude Haiku 5.5 on primed, text-only Claude Code sessions from `@inixiative/agent-session` (no tools, MCP servers, user settings or instruction files; an API-key login is refused). A prefilter settles empty sessions without a model; the rest go in batches of short digests (counts, the first prompts, tools used, first and last replies), never whole transcripts. A session is asked about once per digest: it is due again only when it changes or when the prompt, model or tag definitions do. Each run prints its calls and tokens.
+
+```sh
+bun run archive tags define --tag debugging --description "Diagnosing and fixing a failure"
+bun run archive suggest [--limit N] [--batch 8] [--concurrency 2] [--refresh]
+bun run archive list --suggested junk --exempt false
 ```
 
 Tag edits apply to that archive without a new revision, survive re-capture, and do not sync. Offered tags are defined archive-wide or for one actor. Each session can name its **actor**: a `user`, a `service` such as an API-key run, or a `job` (its id is the job name), with the `integrationId` it ran under when there is one. An organization's archive mostly holds its members' work, filterable per person. Entries the model produced record its `model` and `effort` (from Claude Code assistant records and Codex turn context, per turn); listings summarize them per session as `models` and filter by `model` and `effort`.
@@ -146,9 +155,11 @@ All data endpoints are `POST /api/v1/archive/<action>` with a JSON body and `Aut
 | `delete` | `archiveId` | deleted |
 | `settings/read`, `settings/update` | `integrations?`, `retentionDays?` | settings |
 | `tags/list`, `tags/define`, `tags/remove` | `tag`, `actorId?`, `description?` | offered tags with usage counts |
+| `suggestions/queue` | `key`, `limit?`, `beforeId?`, `refresh?` | sessions due for suggestions, as digests; routed `projects` |
+| `suggestions/record` | `results` (`archiveId`, `digest`, `key`, `by`, `tags`) | recorded, stale (digest moved on), refused (undefined tag or exempt) |
 | `destinations/list`, `destinations/libraries`, `destinations/connect`, `destinations/remove`, `destinations/routes`, `destinations/sync` | see [Routing](#routing) | routes |
 
-Filters are `projectId`, `source`, `tag`, `actorId`, `model`, `effort`, `provider`, `accessPath` and `reference` (`{integration, ref}`); `archive list` and `archive search` take them as flags. Jev integration is not enabled. Session content must not be sent to Jev without selecting that service for the relevant ownership boundary.
+Filters are `projectId`, `source`, `tag`, `suggestedTag`, `exempt`, `actorId`, `model`, `effort`, `provider`, `accessPath` and `reference` (`{integration, ref}`); `archive list` and `archive search` take them as flags. Jev integration is not enabled. Session content must not be sent to Jev without selecting that service for the relevant ownership boundary.
 
 ## Limits
 
