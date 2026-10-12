@@ -17,7 +17,8 @@ export interface CollectionSource {
   tags?: string[];
 }
 
-function files(directory: string): string[] {
+/** Every transcript (`.jsonl`) under a directory, in order, without following links. */
+export function transcriptFiles(directory: string): string[] {
   const result: string[] = [];
   const visit = (path: string) => {
     const stat = lstatSync(path);
@@ -29,10 +30,10 @@ function files(directory: string): string[] {
   return result;
 }
 
-type SessionMetadata = { cwd: string; branch?: string; repository?: string };
+export type SessionMetadata = { cwd: string; branch?: string; repository?: string };
 
 /** Match provider metadata, never text/tags/model suggestions. No implicit parent-directory routing. */
-function sessionMetadata(
+export function sessionMetadata(
   file: string,
   source: CollectionSource['source'],
 ): SessionMetadata | undefined {
@@ -110,7 +111,7 @@ export async function collectSessions(archive: ArchiveWriter, config: Collection
   // Per scan: checkouts change between scans.
   const repositories = new Map<string, string | undefined>();
   const graphs = new Map<string, AtlasFileConcepts | undefined>();
-  for (const file of files(config.directory)) {
+  for (const file of transcriptFiles(config.directory)) {
     try {
       const meta = sessionMetadata(file, config.source);
       // Exact root selection avoids sweeping nested checkouts belonging to another organization.
