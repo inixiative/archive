@@ -1,11 +1,10 @@
 import { z } from 'zod';
-import { type ArchiveReference, type ArchiveSnapshot, categorySuggestions } from './index';
+import type { ArchiveReference, ArchiveSnapshot } from './index';
 
 /**
- * A tag the archive proposes; suggestions never route or authorize, and a person applies them.
- * `heuristic`: computed by a rule; `model`: the tagger's model suggested it.
+ * A tag the tagger's model proposes; suggestions never route or authorize, and a person applies them.
  */
-export type TagSuggestion = { tag: string; origin: 'heuristic' | 'model' };
+export type TagSuggestion = { tag: string; origin: 'model' };
 
 /**
  * An integration whose items sessions can reference. GitHub and Linear links are recognized
@@ -85,11 +84,6 @@ export function archiveReferences(
   return [...found.values()]
     .sort((a, b) => Number(b.recorded) - Number(a.recorded) || b.mentions - a.mentions)
     .slice(0, limit);
-}
-
-/** Every computed tag suggestion for an archive. */
-export function suggestTags(snapshot: ArchiveSnapshot): TagSuggestion[] {
-  return categorySuggestions(snapshot);
 }
 
 /** Recorded git context of a session, as GitHub references to its repository and branch. */

@@ -29,7 +29,7 @@ import {
   type SuggestionResult,
   sessionDigest,
 } from './suggest';
-import { archiveReferences, suggestTags, type TagSuggestion } from './tags';
+import { archiveReferences } from './tags';
 
 export {
   type ArchiveFilter,
@@ -58,7 +58,6 @@ const summarize = (snapshot: ArchiveSnapshot, settings: ArchiveSettings) => {
     capturedTags: tags,
     entries: entries.length,
     models: [...models.values()],
-    suggestedTags: suggestTags(snapshot),
     references: archiveReferences(snapshot, settings.integrations),
     /** What the tagger reads; absent from listings. */
     session: sessionDigest(snapshot) as SessionDigest | undefined,
@@ -111,16 +110,11 @@ type ArchiveRow = {
   suggestion: { digest: string; by: string; tags: string[] } | null;
 };
 /**
- * Tags are the base tags with this archive's edits applied. Suggestions are the tagger's and the
- * heuristics', minus what a person applied or removed: their edits always win.
+ * Tags are the base tags with this archive's edits applied. Suggestions are the tagger's, minus
+ * what a person applied or removed: their edits always win.
  */
 const listing = (row: ArchiveRow, filter: ArchiveFilter) => {
-  const {
-    capturedTags: _,
-    suggestedTags: heuristic,
-    session: __,
-    ...summary
-  } = row.summary as Summary;
+  const { capturedTags: _, session: __, ...summary } = row.summary as Summary;
   // Suggestions describe one digest; once the session moves on they no longer apply.
   const suggestion = row.suggestion?.digest === row.digest ? row.suggestion : null;
   const removed = new Set(row.tagEdits.filter((e) => !e.added).map((e) => e.tag));
@@ -130,19 +124,9 @@ const listing = (row: ArchiveRow, filter: ArchiveFilter) => {
       ...row.tagEdits.filter((e) => e.added).map((e) => e.tag),
     ]),
   ].filter((tag) => !removed.has(tag));
-  const suggested: TagSuggestion[] = [
-    ...(suggestion?.tags ?? []).map((tag) => ({
-      tag,
-      origin: 'model' as const,
-    })),
-    ...heuristic,
-  ];
-  const suggestedTags = suggested.filter(
-    (s, index) =>
-      !tags.includes(s.tag) &&
-      !removed.has(s.tag) &&
-      suggested.findIndex((other) => other.tag === s.tag) === index,
-  );
+  const suggestedTags = [...new Set(suggestion?.tags)]
+    .filter((tag) => !tags.includes(tag) && !removed.has(tag))
+    .map((tag) => ({ tag, origin: 'model' as const }));
   const { reference, model, effort } = filter;
   if (
     (filter.tag && !tags.includes(filter.tag)) ||

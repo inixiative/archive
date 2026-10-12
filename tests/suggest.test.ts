@@ -220,7 +220,6 @@ test('suggestions: due once per digest and key, never for exempt sessions, human
   ).toEqual({ recorded: 2, stale: 0, refused: 0, dropped: 3 });
   expect((await store.list()).find((a) => a.id === work.id)!.suggestedTags).toEqual([
     { tag: 'debugging', origin: 'model' },
-    { tag: 'testing', origin: 'heuristic' },
   ]);
   const recorded = await call(handler, 'suggestions/record', {
     results: [

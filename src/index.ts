@@ -200,20 +200,3 @@ export function selectChunks(chunks: ArchiveChunk[], query: string, budget = 204
     matchingChunks: ranked.length,
   };
 }
-
-export function categorySuggestions(snapshot: ArchiveSnapshot) {
-  const text = snapshot.entries
-    .filter((entry) => entry.kind === 'user')
-    .map((entry) => entry.text)
-    .join('\n')
-    .toLowerCase();
-  const categories = {
-    debugging: /\b(bug|error|fix|failure|regression)\b/,
-    documentation: /\b(docs|documentation|readme)\b/,
-    testing: /\b(test|tests|verification|qa)\b/,
-    design: /\b(design|architecture|diagram|proposal)\b/,
-  };
-  return Object.entries(categories)
-    .filter(([, pattern]) => pattern.test(text))
-    .map(([tag]) => ({ tag, origin: 'heuristic' as const }));
-}
