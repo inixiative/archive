@@ -438,6 +438,17 @@ test('a catch-all collector is unrouted with no roots; a named collector is rout
   expect(plan.exclude).toContain('/Users/me/scratch');
   expect(plan.exclude).toContain('.foundry/decision-receipts');
   expect(plan.server).toEqual({ url: 'http://127.0.0.1:4700' });
+  // A collector over another history directory is not a peer.
+  const elsewhere = {
+    ...collector,
+    name: 'claude-code.work',
+    directory: '/Users/me/.claude-work/projects',
+  };
+  expect(
+    collectorPlan({ collectors: [collector, elsewhere, catchAll] }, 'claude-code.work').peers.map(
+      (p) => p.directory,
+    ),
+  ).toEqual(['/Users/me/.claude-work/projects']);
   expect(() => collectorPlan(withCatchAll, 'missing')).toThrow('No collector named missing');
   expect(
     archiveDestinationSchema.safeParse({

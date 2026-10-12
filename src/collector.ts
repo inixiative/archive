@@ -9,9 +9,9 @@ import {
   realpathSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { importTranscriptFile } from './import-file';
-import { archiveKey, archiveSnapshotSchema, snapshotDigest } from './index';
+import { archiveKey, archiveSnapshotSchema, snapshotDigest, UNROUTED } from './index';
 import type { ArchiveClient } from './remote';
 import { type AtlasFileConcepts, atlasTags, provenanceReferences } from './tags';
 
@@ -138,7 +138,14 @@ function worktreesOf(root: string): string[] {
 
 /** Exact directories this collection accepts, re-read each scan so new worktrees join. */
 export function collectionRoots(config: CollectionSource): Set<string> {
-  const roots = config.projectRoots.map((root) => resolve(root));
+  // Providers record the real path (macOS /tmp is /private/tmp), so roots match by it too.
+  const roots = config.projectRoots.flatMap((root) => {
+    try {
+      return [...new Set([resolve(root), realpathSync(root)])];
+    } catch {
+      return [resolve(root)];
+    }
+  });
   return new Set(config.worktrees ? [...roots, ...roots.flatMap(worktreesOf)] : roots);
 }
 
@@ -173,28 +180,31 @@ export function routeSession(
 export type ArchiveWriter = Pick<ArchiveClient, 'sourceId' | 'head' | 'capture'>;
 
 /**
- * The access path the harness's login implies when a transcript is silent: Claude Code's
- * subscription login (`~/.claude.json` oauthAccount) unless its settings supply an API key, and
- * Codex's `auth.json` mode. Undefined when neither says.
+ * The access path the harness's login implies when a transcript is silent, read from the harness
+ * home that owns the history directory (`<claude config>/projects`, `<codex home>/sessions`):
+ * Claude Code's subscription login (`oauthAccount`) unless its settings supply an API key, and
+ * Codex's `auth.json` mode. Undefined when neither says; throws when a file exists but cannot be
+ * read, so a bad read never relabels sessions.
  */
 export function harnessAccess(
   source: CollectionSource['source'],
-  home = homedir(),
+  directory: string,
 ): 'subscription' | 'api' | undefined {
-  const json = (path: string) => {
-    try {
-      return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined;
-    } catch {
-      return undefined;
-    }
-  };
+  const json = (path: string) =>
+    existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined;
+  const harnessHome = dirname(resolve(directory));
   if (source === 'claude-code') {
-    const settings = json(join(home, '.claude/settings.json'));
+    const settings = json(join(harnessHome, 'settings.json'));
     if (settings?.apiKeyHelper || settings?.env?.ANTHROPIC_API_KEY) return 'api';
-    const account = json(join(home, '.claude.json'))?.oauthAccount;
+    // The default config directory keeps its login beside it, in ~/.claude.json.
+    const login =
+      harnessHome === join(homedir(), '.claude')
+        ? join(homedir(), '.claude.json')
+        : join(harnessHome, '.claude.json');
+    const account = json(login)?.oauthAccount;
     return account && typeof account === 'object' ? 'subscription' : undefined;
   }
-  const auth = json(join(home, '.codex/auth.json'));
+  const auth = json(join(harnessHome, 'auth.json'));
   if (auth?.auth_mode === 'chatgpt' || auth?.tokens) return 'subscription';
   if (auth?.auth_mode === 'apikey' || auth?.OPENAI_API_KEY) return 'api';
   return undefined;
@@ -202,7 +212,9 @@ export function harnessAccess(
 
 /**
  * What a watching collector remembers between scans: each file's size and mtime with the outcome,
- * so an untouched file is neither re-read nor re-sent. Keyed by the routing it was decided under.
+ * so an untouched file is neither re-read nor re-sent. Keyed by the routing and archive it was
+ * decided under; a stored session is re-checked against the server now and then, so one deleted
+ * there is captured again.
  */
 export type CollectorCache = Map<
   string,
@@ -212,17 +224,32 @@ export type CollectorCache = Map<
     routing: string;
     outcome: 'unchanged' | 'skipped' | 'failed';
     meta?: SessionMetadata;
+    stored?: { id: string; digest: string; checkedAt: number };
   }
 >;
+const REVALIDATE_MS = 10 * 60_000;
 
 export interface CollectOptions {
-  /** Every collector of this source, this one included; routing picks the most specific. */
+  /** Every collector of this source and directory, this one included; the most specific wins. */
   peers?: CollectionSource[];
   exclude?: string[];
   cache?: CollectorCache;
-  /** The harness login's access path; defaults to reading this machine's harness config. */
-  harness?: (source: CollectionSource['source']) => 'subscription' | 'api' | undefined;
+  /** The harness login's access path; defaults to reading the history directory's harness home. */
+  harness?: (
+    source: CollectionSource['source'],
+    directory: string,
+  ) => 'subscription' | 'api' | undefined;
+  now?: () => number;
 }
+
+/** A rejection the same snapshot will get again: invalid input or a refused write, not an outage. */
+const deterministic = (error: unknown) => {
+  const status = (error as { status?: unknown } | null)?.status;
+  return (
+    (error instanceof Error && error.name === 'ZodError') ||
+    (typeof status === 'number' && status >= 400 && status < 500 && status !== 409)
+  );
+};
 
 export async function collectSessions(
   archive: ArchiveWriter,
@@ -230,10 +257,11 @@ export async function collectSessions(
   options: CollectOptions = {},
 ) {
   const sourceId = await archive.sourceId();
+  const now = options.now ?? Date.now;
   const peers = options.peers ?? [config];
   const exclude = options.exclude ?? defaultExclusions();
   const cache: CollectorCache = options.cache ?? new Map();
-  const routing = JSON.stringify([config, peers, exclude]);
+  const routing = JSON.stringify([sourceId, config, peers, exclude]);
   const result = { imported: 0, unchanged: 0, skipped: 0, failed: 0 };
   // Per scan: checkouts change between scans.
   const rootSets = new Map<CollectionSource, Set<string>>();
@@ -254,11 +282,30 @@ export async function collectSessions(
         known.mtimeMs === before.mtimeMs &&
         known.routing === routing
       ) {
-        result[known.outcome]++;
-        continue;
+        const stored = known.stored;
+        if (!stored || now() - stored.checkedAt < REVALIDATE_MS) {
+          result[known.outcome]++;
+          continue;
+        }
+        if ((await archive.head(stored.id))?.digest === stored.digest) {
+          stored.checkedAt = now();
+          result.unchanged++;
+          continue;
+        }
       }
-      const remember = (outcome: 'unchanged' | 'skipped' | 'failed', meta?: SessionMetadata) =>
-        cache.set(file, { size: before.size, mtimeMs: before.mtimeMs, routing, outcome, meta });
+      const remember = (
+        outcome: 'unchanged' | 'skipped' | 'failed',
+        meta?: SessionMetadata,
+        stored?: { id: string; digest: string },
+      ) =>
+        cache.set(file, {
+          size: before.size,
+          mtimeMs: before.mtimeMs,
+          routing,
+          outcome,
+          meta,
+          ...(stored ? { stored: { ...stored, checkedAt: now() } } : {}),
+        });
       // A transcript's first cwd never changes, so it is read once per file.
       const meta = known?.meta ?? sessionMetadata(file, config.source);
       if (!meta) {
@@ -307,21 +354,43 @@ export async function collectSessions(
       });
       if (references.length) snapshot.references = references;
       if (snapshot.runtime?.accessPath === 'unknown') {
-        if (harness === null) harness = (options.harness ?? harnessAccess)(config.source);
+        if (harness === null)
+          harness = (options.harness ?? harnessAccess)(config.source, config.directory);
         if (harness)
           snapshot.runtime = { ...snapshot.runtime, accessPath: harness, evidence: 'harness' };
       }
-      const old = await archive.head(archiveKey(snapshot));
-      if (old && old.projectId !== config.projectId) {
+      const id = archiveKey(snapshot);
+      const old = await archive.head(id);
+      // A session belongs to one project; only one the catch-all held moves to its routed project.
+      if (old && old.projectId !== config.projectId && old.projectId !== UNROUTED) {
         result.failed++;
+        remember('failed', meta);
         continue;
       }
       // An unchanged session is not sent again: the server already holds this digest.
       // Digest what the server will: the schema orders keys, and fields set above were appended.
-      if (old?.digest === snapshotDigest(archiveSnapshotSchema.parse(snapshot))) result.unchanged++;
-      else if ((await archive.capture(snapshot)).changed) result.imported++;
-      else result.unchanged++;
-      remember('unchanged', meta);
+      let digest: string;
+      try {
+        digest = snapshotDigest(archiveSnapshotSchema.parse(snapshot));
+      } catch {
+        // Over the archive's limits: the same bytes are refused again.
+        result.failed++;
+        remember('failed', meta);
+        continue;
+      }
+      if (old?.digest === digest) result.unchanged++;
+      else {
+        try {
+          const captured = await archive.capture(snapshot);
+          digest = captured.digest;
+          result[captured.changed ? 'imported' : 'unchanged']++;
+        } catch (error) {
+          result.failed++;
+          if (deterministic(error)) remember('failed', meta);
+          continue;
+        }
+      }
+      remember('unchanged', meta, { id, digest });
     } catch {
       result.failed++;
     } // Partial/malformed files remain intact and retry on the next scan.

@@ -335,14 +335,13 @@ export async function runCli(args = Bun.argv.slice(2)) {
   const token = process.env.ARCHIVE_TOKEN ?? readToken();
   if (!token) throw new Error('No Archive token: run `archive init` or set ARCHIVE_TOKEN');
   const agentsFile = join(home, 'agents.json');
-  // A named collector writes to the server agents.json declares, unless --url overrides it.
-  const serverUrl =
-    v.url ?? (v.agent ? readAgents(agentsFile)?.server?.url : undefined) ?? DEFAULT_URL;
-  const archive = new ArchiveClient({ url: serverUrl, token });
+  const archive = new ArchiveClient({ url: v.url ?? DEFAULT_URL, token });
+  if ((command === 'list' || command === 'search') && (v.tag?.length ?? 0) > 1)
+    throw new Error('Filter by one --tag at a time');
   const filter = {
     ...(v['project-id'] ? { projectId: v['project-id'] } : {}),
     ...(v.source ? { source: v.source as 'claude-code' | 'codex' | 'foundry' | 'chatgpt' } : {}),
-    ...(v.tag?.length === 1 ? { tag: v.tag[0] } : {}),
+    ...(v.tag?.length ? { tag: v.tag[0] } : {}),
     ...(v.provider ? { provider: v.provider } : {}),
     ...(v.model ? { model: v.model } : {}),
     ...(v.effort ? { effort: v.effort } : {}),
@@ -412,6 +411,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         collector,
         peers: [collector],
         exclude: [...defaultExclusions(), ...(v.exclude ?? [])],
+        server: undefined as { url: string } | undefined,
       };
     };
     // A named collector re-reads agents.json each scan, so its routing follows edits without a restart.
@@ -423,6 +423,9 @@ export async function runCli(args = Bun.argv.slice(2)) {
     };
     plan();
     const cache: CollectorCache = new Map();
+    // A named collector writes to the server agents.json declares (unless --url), re-read each scan.
+    let client = archive;
+    let clientUrl = v.url ?? DEFAULT_URL;
     let stopped = false;
     const stop = () => {
       stopped = true;
@@ -430,10 +433,26 @@ export async function runCli(args = Bun.argv.slice(2)) {
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
     do {
+      let current: ReturnType<typeof plan>;
       try {
-        const { collector, peers, exclude } = plan();
+        current = plan();
+      } catch (error) {
+        if (!v.watch) throw error;
+        console.error(
+          JSON.stringify({ collect: 'agents.json unusable', error: (error as Error).message }),
+        );
+        for (let i = 0; !stopped && i < 30; i++) await Bun.sleep(1000);
+        continue;
+      }
+      try {
+        const { collector, peers, exclude, server } = current;
+        const url = v.url ?? server?.url ?? DEFAULT_URL;
+        if (url !== clientUrl) {
+          client = new ArchiveClient({ url, token });
+          clientUrl = url;
+        }
         const started = Date.now();
-        const result = await collectSessions(archive, collector, { peers, exclude, cache });
+        const result = await collectSessions(client, collector, { peers, exclude, cache });
         output({ ...result, ms: Date.now() - started });
         if (!v.watch && result.failed) process.exitCode = 1;
       } catch (error) {

@@ -127,12 +127,18 @@ export async function routingPreview(
 }
 
 /**
- * Deliveries that failed, and when each may be tried again. A rejected archive is retried after
- * 30 seconds, doubling per failure up to 30 minutes, instead of re-sending it every sync.
+ * Deliveries that failed, and when each may be tried again: per archive and destination, and per
+ * destination while it is unreachable. A retry waits 30 seconds, doubling per failure up to 30
+ * minutes; a new revision of the archive is tried at once.
  */
-export type SyncBackoff = Map<string, { failures: number; until: number }>;
+export type SyncBackoff = Map<string, { failures: number; until: number; digest?: string }>;
 const BACKOFF_BASE_MS = 30_000;
 const BACKOFF_MAX_MS = 30 * 60_000;
+/** No HTTP answer, or a 5xx: the destination is down, not refusing this archive. */
+const outage = (message: string) => {
+  const status = Number(/\((\d{3})\)/.exec(message)?.[1]);
+  return !status || status >= 500;
+};
 
 export async function syncArchives(
   store: ArchiveStore,
@@ -140,40 +146,61 @@ export async function syncArchives(
   options: { backoff?: SyncBackoff; now?: () => number } = {},
 ): Promise<SyncResult[]> {
   const now = options.now ?? Date.now;
+  const backoff = options.backoff;
   const results: SyncResult[] = [];
-  for (const archive of await store.list())
+  const seen = new Set<string>();
+  const delay = (failures: number) =>
+    Math.min(BACKOFF_BASE_MS * 2 ** (failures - 1), BACKOFF_MAX_MS);
+  const archives = await store.list();
+  for (const archive of archives)
     for (const destination of destinations.filter((d) => d.projectId === archive.projectId)) {
-      const key = JSON.stringify([archive.id, destinationIdentity(destination)]);
-      const waiting = options.backoff?.get(key);
-      if (waiting && now() < waiting.until) {
+      const identity = destinationIdentity(destination);
+      const key = JSON.stringify([archive.id, identity]);
+      const down = JSON.stringify(['destination', identity]);
+      seen.add(key).add(down);
+      const deferred = (until: number) =>
         results.push({
           id: archive.id,
           destination: destination.url,
-          status: `deferred until ${new Date(waiting.until).toISOString()}`,
+          status: `deferred until ${new Date(until).toISOString()}`,
         });
+      const circuit = backoff?.get(down);
+      if (circuit && now() < circuit.until) {
+        deferred(circuit.until);
+        continue;
+      }
+      const waiting = backoff?.get(key);
+      if (waiting && now() < waiting.until && waiting.digest === archive.digest) {
+        deferred(waiting.until);
         continue;
       }
       try {
         const result = await publishArchive(store, archive.id, destination);
-        options.backoff?.delete(key);
+        backoff?.delete(key);
+        backoff?.delete(down);
         results.push({
           id: archive.id,
           destination: destination.url,
           status: result.unchanged ? 'unchanged' : 'published',
         });
       } catch (error) {
-        const failures = (waiting?.failures ?? 0) + 1;
-        options.backoff?.set(key, {
-          failures,
-          until: now() + Math.min(BACKOFF_BASE_MS * 2 ** (failures - 1), BACKOFF_MAX_MS),
-        });
+        const message = error instanceof Error ? error.message : String(error);
+        if (outage(message)) {
+          const failures = (circuit?.failures ?? 0) + 1;
+          backoff?.set(down, { failures, until: now() + delay(failures) });
+        } else {
+          const failures = (waiting?.failures ?? 0) + 1;
+          backoff?.set(key, { failures, until: now() + delay(failures), digest: archive.digest });
+        }
         results.push({
           id: archive.id,
           destination: destination.url,
-          status: `failed; local revision retained: ${error instanceof Error ? error.message : String(error)}`,
+          status: `failed; local revision retained: ${message}`,
         });
       }
     }
+  // Archives that were deleted, or routes that were removed, leave no entries behind.
+  for (const key of backoff?.keys() ?? []) if (!seen.has(key)) backoff?.delete(key);
   return results;
 }
 

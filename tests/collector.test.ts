@@ -400,3 +400,75 @@ test('a Codex subagent rollout is its own session, though its parent replays fir
     ),
   ).toThrow('identity mismatch');
 });
+
+test('a refused session is not retried until it changes; the catch-all hands sessions to their project; a deleted archive is captured again', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'archive-refused-'));
+  const store = await freshStore();
+  let heads = 0;
+  const writer = {
+    sourceId: () => store.sourceId(),
+    head: (id: string) => {
+      heads++;
+      return store.head(id);
+    },
+    capture: (snapshot: unknown) => store.capture(snapshot),
+  };
+  const session = (id: string, cwd: string) =>
+    writeFileSync(
+      join(dir, `${id}.jsonl`),
+      JSON.stringify({
+        sessionId: id,
+        cwd,
+        type: 'user',
+        uuid: `${id}-1`,
+        message: { content: 'Work' },
+      }),
+    );
+  const base = { directory: dir, source: 'claude-code' as const, subdirectories: true };
+  const unrouted = { ...base, projectId: 'unrouted', projectRoots: [], catchAll: true };
+  const a = { ...base, projectId: 'a', projectRoots: ['/work/a'] };
+  const b = { ...base, projectId: 'b', projectRoots: ['/work/b'] };
+  const harness = () => undefined;
+  let clock = 0;
+  const now = () => clock;
+  try {
+    session('one', '/work/a/x');
+    // Captured by the catch-all before project a had a collector.
+    expect(
+      await collectSessions(writer, unrouted, { peers: [unrouted], harness, now }),
+    ).toMatchObject({ imported: 1 });
+    // Once a claims it, a takes it over from unrouted.
+    expect(await collectSessions(writer, a, { peers: [a, unrouted], harness, now })).toMatchObject({
+      imported: 1,
+    });
+    expect((await store.list()).map((x) => x.projectId)).toEqual(['a']);
+    // Another project may not take it: refused once, then not re-read or re-asked.
+    const cache: CollectorCache = new Map();
+    const moved = { ...b, projectRoots: ['/work/a/x'] };
+    expect(
+      await collectSessions(writer, moved, { peers: [moved], harness, cache, now }),
+    ).toMatchObject({ failed: 1 });
+    heads = 0;
+    expect(
+      await collectSessions(writer, moved, { peers: [moved], harness, cache, now }),
+    ).toMatchObject({ failed: 1 });
+    expect(heads).toBe(0);
+    // A stored session is re-checked every 10 minutes; one deleted on the server comes back.
+    const own: CollectorCache = new Map();
+    expect(
+      await collectSessions(writer, a, { peers: [a], harness, cache: own, now }),
+    ).toMatchObject({ unchanged: 1 });
+    await store.delete((await store.list())[0]!.id);
+    expect(
+      await collectSessions(writer, a, { peers: [a], harness, cache: own, now }),
+    ).toMatchObject({ unchanged: 1 });
+    expect(await store.list()).toEqual([]);
+    clock += 10 * 60_000;
+    expect(
+      await collectSessions(writer, a, { peers: [a], harness, cache: own, now }),
+    ).toMatchObject({ imported: 1 });
+    expect((await store.list()).length).toBe(1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

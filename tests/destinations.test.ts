@@ -217,3 +217,53 @@ test('a failed delivery backs off, doubling per failure, and clears once deliver
     server.stop(true);
   }
 });
+
+test('an unreachable destination is skipped for every archive until it is due; a new revision retries at once', async () => {
+  const store = await freshStore();
+  const first = await store.capture(snapshot('circuit', 'circuit-1'));
+  await store.capture(snapshot('circuit', 'circuit-2'));
+  process.env.ARCHIVE_BACKOFF_TEST_TOKEN = token;
+  const down = [
+    {
+      kind: 'archive' as const,
+      projectId: 'circuit',
+      url: 'http://127.0.0.1:9/',
+      tokenEnv: 'ARCHIVE_BACKOFF_TEST_TOKEN',
+    },
+  ];
+  const backoff: SyncBackoff = new Map();
+  let clock = 1_000_000;
+  const statuses = async () =>
+    (await syncArchives(store, down, { backoff, now: () => clock })).map(
+      (r) => r.status.split(' ')[0],
+    );
+  // One connection failure defers the destination's other archives in the same cycle.
+  expect((await statuses()).sort()).toEqual(['deferred', 'failed;']);
+  clock += 10_000;
+  expect(await statuses()).toEqual(['deferred', 'deferred']);
+
+  // A refused archive waits, but its next revision is tried at once.
+  let calls = 0;
+  const server = Bun.serve({
+    port: 0,
+    fetch: () => {
+      calls++;
+      return Response.json({ error: 'Invalid archive request' }, { status: 400 });
+    },
+  });
+  try {
+    const refusing = [{ ...down[0]!, url: server.url.href }];
+    const only = async () =>
+      (await syncArchives(store, refusing, { backoff, now: () => clock })).find(
+        (r) => r.id === first.id,
+      )!.status;
+    expect(await only()).toStartWith('failed');
+    expect(await only()).toStartWith('deferred');
+    await store.capture({ ...snapshot('circuit', 'circuit-1'), title: 'Revised', capturedAt: 2 });
+    calls = 0;
+    expect(await only()).toStartWith('failed');
+    expect(calls).toBeGreaterThan(0);
+  } finally {
+    server.stop(true);
+  }
+});

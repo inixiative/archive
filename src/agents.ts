@@ -120,7 +120,10 @@ export function collectorPlan(config: AgentsConfig, name: string) {
     ...(c.catchAll ? { catchAll: true } : {}),
     ...(c.atlas ? { atlas: true } : {}),
   });
-  const named = config.collectors.filter((c) => c.source === collector.source);
+  // Collectors over the same history compete for its sessions; another directory is another history.
+  const named = config.collectors.filter(
+    (c) => c.source === collector.source && resolve(c.directory) === resolve(collector.directory),
+  );
   const peers = named.map(source);
   return {
     collector: peers[named.indexOf(collector)]!,
@@ -352,21 +355,24 @@ export function installAgents(config: AgentsConfig, options: AgentHostOptions = 
   // Write and load one unit at a time. A unit that fails to load gets its old file back (or none),
   // so the next install sees it as changed and loads it, instead of trusting a stale running copy.
   const install = (label: string, content?: string) => {
-    if (content !== undefined) {
-      write(h.file(label), content);
-      if (h.platform === 'linux') h.systemctl('daemon-reload');
-    }
     try {
+      if (content !== undefined) {
+        write(h.file(label), content);
+        if (h.platform === 'linux') h.systemctl('daemon-reload');
+      }
       h.load(label);
       loaded.push(label);
     } catch (error) {
-      if (content !== undefined) {
-        const old = previous.get(label);
+      failed.push({ label, error: error instanceof Error ? error.message : String(error) });
+      if (content === undefined) return;
+      const old = previous.get(label);
+      try {
         if (old === undefined) rmSync(h.file(label), { force: true });
         else write(h.file(label), old);
         if (h.platform === 'linux') h.systemctl('daemon-reload');
-      }
-      failed.push({ label, error: error instanceof Error ? error.message : String(error) });
+        // Loading stopped the unit that ran before; bring it back as it was.
+        if (old !== undefined) h.load(label);
+      } catch {}
     }
   };
   for (const { label, content } of plan.write) install(label, content);
