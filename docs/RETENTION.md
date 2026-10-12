@@ -2,7 +2,7 @@
 
 > **PROPOSAL. Needs Aron's yes before anything is built.** It changes what the `retentionDays` setting means and adds a usefulness score, so it falls under "talk the plan through before changing what something means." Nothing here is implemented.
 
-**Basis:** Archive `origin/main` 0.13.0 (`cdbb8ac`), Foundry `origin/main` (`f040582`; foundry-core `src/feedback/correction.ts` from `e10b2f0`), Oracle `origin/main`, and the live local Archive on Aron's machine, read 2026-10-12. Path prefixes: `ar/` = `archive/src`, `pf/` = `foundry/packages/foundry/src`, `pc/` = `foundry/packages/core/src`, `or/` = `oracle/src`.
+**Basis:** Archive `origin/main` 0.13.0 (`44d97a0`), Foundry `origin/main` (`f040582`; foundry-core `src/feedback/correction.ts` from `e10b2f0`), Oracle `origin/main`, and the live local Archive on Aron's machine, read 2026-10-12. Path prefixes: `ar/` = `archive/src`, `pf/` = `foundry/packages/foundry/src`, `pc/` = `foundry/packages/core/src`, `or/` = `oracle/src`.
 
 ## 1. Intent
 
