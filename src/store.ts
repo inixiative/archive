@@ -23,7 +23,6 @@ import {
 } from './schemas';
 import {
   JUNK_TAG,
-  PREFILTER,
   PROJECT_TAG_PREFIX,
   type SessionDigest,
   type SuggestionDue,
@@ -134,7 +133,7 @@ const listing = (row: ArchiveRow, filter: ArchiveFilter) => {
   const suggested: TagSuggestion[] = [
     ...(suggestion?.tags ?? []).map((tag) => ({
       tag,
-      origin: suggestion!.by === PREFILTER ? ('heuristic' as const) : ('model' as const),
+      origin: 'model' as const,
     })),
     ...heuristic,
   ];

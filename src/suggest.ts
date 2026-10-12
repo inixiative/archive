@@ -7,8 +7,6 @@ import type { TagDefinition } from './schemas';
 export const JUNK_TAG = 'junk';
 /** `project:<projectId>`: the project a weakly routed session belongs to. */
 export const PROJECT_TAG_PREFIX = 'project:';
-/** The `by` of suggestions the prefilter made without asking a model. */
-export const PREFILTER = 'prefilter';
 
 /** What the tagger reads of a session: bounded excerpts and counts, never the whole transcript. */
 export type SessionDigest = {
@@ -91,14 +89,6 @@ export function sessionDigest(snapshot: ArchiveSnapshot): SessionDigest {
     replies,
     aborted,
   };
-}
-
-/** Junk without asking a model: nothing typed or tasked, and nothing done. */
-export function prefilter(digest: SessionDigest): string[] | undefined {
-  const { counts } = digest;
-  const nothingDone = counts.assistant === 0 && counts.toolCalls === 0;
-  if (nothingDone && (digest.aborted || (!counts.prompts && !digest.task))) return [JUNK_TAG];
-  return undefined;
 }
 
 export const SUGGEST_PROMPT = `You sort archived coding-agent sessions. You get the category tags and projects first, then sessions (S1, S2, ...): title, counts, the first prompts the person typed (or a subagent's task), tools used, and the first and last replies.
@@ -252,7 +242,6 @@ export interface SuggestReport {
   model: string;
   /** Sessions whose suggestions were missing or out of date. */
   due: number;
-  prefiltered: number;
   asked: number;
   recorded: number;
   stale: number;
@@ -287,7 +276,7 @@ async function pool<T>(
 
 /**
  * Suggests tags for every session that is due: not exempt, and without suggestions for its current
- * digest and this key. The prefilter settles empty sessions; the rest go to the model in batches.
+ * digest and this key. Every due session goes to the model, in batches.
  * A batch the model fails is split and asked again; a run of failures stops the run.
  */
 export async function runSuggestions(
@@ -305,7 +294,6 @@ export async function runSuggestions(
   const report: SuggestReport = {
     model: model.model,
     due: 0,
-    prefiltered: 0,
     asked: 0,
     recorded: 0,
     stale: 0,
@@ -364,16 +352,8 @@ export async function runSuggestions(
       projects: new Set(page.projects),
       weak: (digest: SessionDigest) => !digest.projectId || digest.projectId === 'unrouted',
     };
-    const settled: SuggestionResult[] = [];
-    const ask: SuggestionDue[] = [];
-    for (const item of page.items) {
-      const tags = prefilter(item.session);
-      if (tags) {
-        report.prefiltered++;
-        settled.push({ archiveId: item.archiveId, digest: item.digest, key, by: PREFILTER, tags });
-      } else ask.push(item);
-    }
-    await record(settled);
+    // The model judges every due session; the only skip is an unchanged digest (the queue).
+    const ask = page.items;
     const batches: SuggestionDue[][] = [];
     for (let i = 0; i < ask.length; i += batchSize) batches.push(ask.slice(i, i + batchSize));
     const classify = async (batch: SuggestionDue[], slot: number): Promise<void> => {
@@ -439,9 +419,7 @@ export async function runSuggestions(
       for (const item of missing) await classify([item], slot);
     };
     await pool(batches, concurrency, classify);
-    options.progress?.(
-      `${report.due} due · ${report.prefiltered} prefiltered · ${report.asked} suggested · ${report.calls} calls`,
-    );
+    options.progress?.(`${report.due} due · ${report.asked} suggested · ${report.calls} calls`);
     if (!page.nextCursor) break;
     beforeId = page.nextCursor;
   }

@@ -1,14 +1,25 @@
-import { realpathSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 /**
  * Runs that are not a person's work: tests and probes (`run:test`), Oracle and bench evaluations
  * (`run:oracle`). An exempt session is kept, but never feeds curation, suggestions, retention
  * scoring, correction mining or agent context. A person removing the tag lifts the exemption.
+ *
+ * Exemption rests on explicit stamps from the harness that ran the session:
+ * - a `run:test` / `run:oracle` tag on the snapshot (a writer's own tags, `collect --tag`);
+ * - `ARCHIVE_RUN=test|oracle` in the environment of a process that writes snapshots;
+ * - a `.archive-run` file holding `test` or `oracle` in the session's working directory or an
+ *   ancestor, written by the runner that made the workspace (`stampRunDirectory`).
  */
 export const RUN_TAGS = { test: 'run:test', oracle: 'run:oracle' } as const;
 export type RunKind = keyof typeof RUN_TAGS;
+export const RUN_ENV = 'ARCHIVE_RUN';
+export const RUN_MARKER = '.archive-run';
+
+const runKind = (value: unknown): RunKind | undefined =>
+  value === 'test' || value === 'oracle' ? value : undefined;
 
 /** The run kind a session's tags exempt it as, if any; `run:oracle` wins over `run:test`. */
 export function exemptRun(tags: readonly string[]): RunKind | undefined {
@@ -17,7 +28,36 @@ export function exemptRun(tags: readonly string[]): RunKind | undefined {
   return undefined;
 }
 
-/** Foundry's test fixtures: project `P`, the watcher threads, and ACP client probes outside a project. */
+/** The run tag this process is stamped with (`ARCHIVE_RUN`), for snapshots it writes. */
+export function stampedRun(env: Record<string, string | undefined> = process.env) {
+  const kind = runKind(env[RUN_ENV]?.trim());
+  return kind && RUN_TAGS[kind];
+}
+
+/** Marks a workspace a test or eval harness made, so sessions run in it are exempt. */
+export function stampRunDirectory(directory: string, kind: RunKind) {
+  writeFileSync(join(directory, RUN_MARKER), `${kind}\n`);
+}
+
+/** The run tag a `.archive-run` file in the working directory or an ancestor stamps. */
+export function markedRun(cwd: string): string | undefined {
+  for (let directory = resolve(cwd); ; directory = dirname(directory)) {
+    const marker = join(directory, RUN_MARKER);
+    if (existsSync(marker)) {
+      try {
+        const kind = runKind(readFileSync(marker, 'utf8').trim());
+        if (kind) return RUN_TAGS[kind];
+      } catch {}
+    }
+    if (directory === dirname(directory)) return undefined;
+  }
+}
+
+/**
+ * INTERIM inference, until every fixture and runner stamps explicitly; delete once they do.
+ * Foundry's test fixtures as they exist today: project `P`, the watcher threads, and ACP client
+ * probes outside a project.
+ */
 export function identityRunTags(session: {
   source: string;
   sessionId: string;
@@ -50,12 +90,12 @@ const under = (cwd: string, root: string) => cwd === root || cwd.startsWith(`${r
 const segments = (cwd: string) => cwd.split('/').filter(Boolean);
 
 /**
- * The run tag a session's working directory implies. Oracle: its eval and environment-check
- * workspaces, a `.oracle` directory, and bench run checkouts. Test: decision receipts (Foundry's
- * and every primed decision host's), agent scratchpads, and anything else under a temp directory
- * (VCR scenarios, live-test and controlled-transport fixtures).
+ * INTERIM inference from a working directory, for sessions no harness stamped; delete once the
+ * fixtures and runners that make these directories write `.archive-run`. Oracle: its eval
+ * workspaces, a `.oracle` directory, bench run checkouts. Test: decision receipts, agent
+ * scratchpads, anything under a temp directory.
  */
-export function cwdRunTag(cwd: string): string | undefined {
+export function inferredRunTag(cwd: string): string | undefined {
   const parts = segments(cwd);
   const temporary = temporaryRoots().some((root) => under(cwd, root));
   if (
@@ -70,3 +110,6 @@ export function cwdRunTag(cwd: string): string | undefined {
     return RUN_TAGS.test;
   return undefined;
 }
+
+/** The run tag for a session in this working directory: its stamp, else the interim inference. */
+export const cwdRunTag = (cwd: string) => markedRun(cwd) ?? inferredRunTag(cwd);

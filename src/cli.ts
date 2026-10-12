@@ -26,6 +26,7 @@ import {
   kingdomDirectory,
   readDestinations,
 } from './config';
+import { stampedRun } from './exemption';
 import { importTranscriptFile } from './import-file';
 import { pairWithKingdom, verifyKingdomDestination } from './kingdom';
 import { previewImports } from './preview';
@@ -453,7 +454,8 @@ export async function runCli(args = Bun.argv.slice(2)) {
             sessionId: v['session-id'],
             title: v.title,
           });
-    snapshot.tags = [...new Set(v.tag ?? [])];
+    const run = stampedRun();
+    snapshot.tags = [...new Set([...(run ? [run] : []), ...(v.tag ?? [])])];
     output({
       ...(await archive.capture(snapshot)),
       entries: snapshot.entries.length,

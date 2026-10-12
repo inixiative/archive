@@ -1,15 +1,21 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { collectSessions, defaultExclusions, routeSession } from '../src/collector';
-import { cwdRunTag, exemptRun, identityRunTags, RUN_TAGS } from '../src/exemption';
+import {
+  cwdRunTag,
+  exemptRun,
+  identityRunTags,
+  markedRun,
+  RUN_TAGS,
+  stampedRun,
+  stampRunDirectory,
+} from '../src/exemption';
 import { archiveSnapshotSchema } from '../src/index';
 import { createArchiveHandler } from '../src/server';
 import {
-  PREFILTER,
   parseSuggestions,
-  prefilter,
   runSuggestions,
   type SuggestionArchive,
   type SuggestModel,
@@ -79,7 +85,28 @@ test('identity rules exempt Foundry test fixtures, never a project ACP thread', 
   expect(exemptRun(['debugging'])).toBeUndefined();
 });
 
-test('working directories of tests, decisions, Oracle and bench runs carry a run tag', () => {
+test('explicit stamps: a run marker file, the ARCHIVE_RUN environment', () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'archive-stamp-')));
+  try {
+    const work = join(dir, 'run', 'work');
+    mkdirSync(work, { recursive: true });
+    expect(markedRun(work)).toBeUndefined();
+    stampRunDirectory(join(dir, 'run'), 'oracle');
+    expect(markedRun(work)).toBe(RUN_TAGS.oracle);
+    // The stamp wins over the interim inference (a temp directory reads as a test).
+    expect(cwdRunTag(work)).toBe(RUN_TAGS.oracle);
+    writeFileSync(join(work, '.archive-run'), 'something else\n');
+    expect(markedRun(work)).toBe(RUN_TAGS.oracle);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  expect(stampedRun({ ARCHIVE_RUN: 'test' })).toBe(RUN_TAGS.test);
+  expect(stampedRun({ ARCHIVE_RUN: 'oracle ' })).toBe(RUN_TAGS.oracle);
+  expect(stampedRun({ ARCHIVE_RUN: 'yes' })).toBeUndefined();
+  expect(stampedRun({})).toBeUndefined();
+});
+
+test('interim inference: working directories of tests, decisions, Oracle and bench runs', () => {
   const temp = realpathSync(tmpdir());
   expect(cwdRunTag(join(temp, 'native-text-controlled-abc'))).toBe(RUN_TAGS.test);
   expect(cwdRunTag('/private/tmp/claude-501/x/scratchpad')).toBe(RUN_TAGS.test);
@@ -234,12 +261,18 @@ test('suggestions: due once per digest and key, never for exempt sessions, human
   const [fixture] = await store.list({ exempt: 'only' });
   expect(
     await store.recordSuggestions([
-      { archiveId: fixture!.id, digest: fixture!.digest, key: 'k1', by: PREFILTER, tags: ['junk'] },
+      {
+        archiveId: fixture!.id,
+        digest: fixture!.digest,
+        key: 'k1',
+        by: 'claude-haiku-5-5',
+        tags: ['junk'],
+      },
     ]),
   ).toEqual({ recorded: 0, stale: 0, refused: 1, dropped: 0 });
 });
 
-test('the prefilter settles empty sessions; digests stay bounded', () => {
+test('digests are bounded excerpts and counts; the model sees every session', () => {
   const empty = sessionDigest(
     snapshot('e', {
       entries: [
@@ -253,7 +286,7 @@ test('the prefilter settles empty sessions; digests stay bounded', () => {
       ],
     }),
   );
-  expect(prefilter(empty)).toEqual(['junk']);
+  expect(empty.counts).toEqual({ prompts: 0, assistant: 0, toolCalls: 0, events: 1 });
   const aborted = sessionDigest(
     snapshot('a', {
       entries: [
@@ -268,7 +301,7 @@ test('the prefilter settles empty sessions; digests stay bounded', () => {
       ],
     }),
   );
-  expect(prefilter(aborted)).toEqual(['junk']);
+  expect(aborted).toMatchObject({ aborted: true, prompts: ['Refactor everything'] });
   const subagent = sessionDigest(
     snapshot('s/agent-1', {
       lineage: { kind: 'subagent', parentSessionId: 's', agentType: 'Explore' },
@@ -284,7 +317,6 @@ test('the prefilter settles empty sessions; digests stay bounded', () => {
       ],
     }),
   );
-  expect(prefilter(subagent)).toBeUndefined();
   expect(subagent).toMatchObject({
     task: 'Find the retention code',
     tools: [['Grep', 1]],
@@ -358,8 +390,12 @@ test('runSuggestions batches, splits failed batches, counts tokens and never re-
         fail = false;
         throw new Error('rate limited');
       }
+      const blocks = input.split(/^## S\d+$/m).slice(1);
       const answer = Object.fromEntries(
-        sessions.map((_, i) => [`S${i + 1}`, { junk: false, tags: ['debugging'], project: null }]),
+        blocks.map((block, i) => [
+          `S${i + 1}`,
+          { junk: block.includes('Session empty'), tags: ['debugging'], project: null },
+        ]),
       );
       return { content: JSON.stringify(answer), tokens: { input: 100, output: 10, cacheRead: 50 } };
     },
@@ -378,8 +414,7 @@ test('runSuggestions batches, splits failed batches, counts tokens and never re-
   expect(report).toMatchObject({
     model: 'fake-haiku',
     due: 6,
-    prefiltered: 1,
-    asked: 5,
+    asked: 6,
     recorded: 6,
     stale: 0,
     refused: 0,
@@ -388,14 +423,20 @@ test('runSuggestions batches, splits failed batches, counts tokens and never re-
     failedCalls: 1,
     errors: { 'rate limited': 1 },
     tokens: { input: 300, output: 30, cacheRead: 150, cacheWrite: 0 },
-    tags: { junk: 1, debugging: 5 },
+    tags: { junk: 1, debugging: 6 },
   });
   expect(inputs.join('\n')).not.toContain('Session fixture');
   const again = await runSuggestions(archive, { model, batch: 4 });
   expect(again).toMatchObject({ due: 0, calls: 0 });
   const listed = await store.list({ suggestedTag: 'junk' });
   expect(listed.map((a) => [a.sessionId, a.suggestedTags])).toEqual([
-    ['empty', [{ tag: 'junk', origin: 'heuristic' }]],
+    [
+      'empty',
+      [
+        { tag: 'junk', origin: 'model' },
+        { tag: 'debugging', origin: 'model' },
+      ],
+    ],
   ]);
 });
 
@@ -423,7 +464,6 @@ test('decision processes get an allowlisted environment; Foundry events are neve
     }),
   );
   expect(foundry.task).toBeUndefined();
-  expect(prefilter(foundry)).toEqual(['junk']);
 });
 
 test('a session captured before summaries held its digest is digested once from its snapshot', async () => {

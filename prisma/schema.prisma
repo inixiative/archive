@@ -105,7 +105,7 @@ model Suggestion {
   /// The tagger's prompt, model and tag definitions, hashed; a change makes them due again.
   /// New projects do not: `suggest --refresh` asks again.
   key       String
-  /// The model that suggested, or `prefilter` when no model was asked.
+  /// The model that suggested.
   by        String
   tags      String[]
   at        Float
