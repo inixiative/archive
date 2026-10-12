@@ -32,11 +32,30 @@ const injectedTags = [
   'in-app-browser-context',
   'external_codex_apps_open_page',
   'send_user_message_question_reply',
+  'turn_aborted',
 ].join('|');
 /** Prompts Codex writes in the user's role. */
 const injectedPreamble = /^(?:# In app browser:|The following is the Codex agent history)/;
-/** Nothing but tag blocks: markup a harness or tool wrote, whatever its tag. */
-const onlyTagBlocks = /^(?:\s*<([A-Za-z][\w-]*)(?:\s[^>]*)?>[\s\S]*?<\/\1>\s*)+$/;
+/**
+ * Nothing but blocks of harness-style tags such as `<codex_internal_context>`: `snake_case` or
+ * `kebab-case` names, unlike markup a person pastes. A linear scan, since a backtracking pattern is
+ * exponential on many sibling blocks.
+ */
+function onlyTagBlocks(text: string) {
+  const open = /\s*<([a-z][a-z0-9]*(?:[_-][a-z0-9]+)+)(?:\s[^>]*)?>/y;
+  let at = 0;
+  let blocks = 0;
+  while (at < text.length) {
+    open.lastIndex = at;
+    const match = open.exec(text);
+    if (!match) return blocks > 0 && !text.slice(at).trim();
+    const close = text.indexOf(`</${match[1]}>`, open.lastIndex);
+    if (close < 0) return false;
+    at = close + match[1]!.length + 3;
+    blocks++;
+  }
+  return blocks > 0;
+}
 const injectedBlock = new RegExp(`<(${injectedTags})(?:\\s[^>]*)?>[\\s\\S]*?</\\1>`, 'g');
 const injectedOpening = new RegExp(`^<(?:${injectedTags})(?:>|\\s)`);
 /** Foundry's native-session envelope; the person's text is the first User Message section. */
@@ -56,7 +75,7 @@ export function typedPrompt(text: string) {
     !prompt ||
     injectedOpening.test(prompt) ||
     injectedPreamble.test(prompt) ||
-    onlyTagBlocks.test(prompt) ||
+    onlyTagBlocks(prompt) ||
     /^\[Request interrupted by user/.test(prompt)
   )
     return undefined;
@@ -102,7 +121,7 @@ export function importTranscriptLines(
       sessionId ??= id;
       const originator = row.payload?.originator;
       if (typeof originator === 'string')
-        scripted = originator === 'codex_exec' || !/^codex/i.test(originator);
+        scripted = !/^codex/i.test(originator) || /^codex_(?:exec|sdk|mcp)/.test(originator);
     }
     if (options.source === 'claude-code' && row.sessionId) {
       // Subagent transcripts reuse their parent's sessionId; each is its own archive.
@@ -137,6 +156,11 @@ export function importTranscriptLines(
                 : typeof row.entrypoint === 'string' && row.entrypoint.startsWith('sdk')),
           )
         : scripted && row.type === 'response_item' && row.payload?.role === 'user';
+    // User text is a user entry only when the person typed it; markers and injected blocks are events.
+    const textKind = (role: 'user' | 'assistant', content: unknown) =>
+      role === 'user' && (written || typeof content !== 'string' || !typedPrompt(content))
+        ? 'event'
+        : role;
     const timestamp = typeof row.timestamp === 'number' ? row.timestamp : Date.parse(row.timestamp);
     const add = (kind: ArchiveEntry['kind'], content: unknown, suffix: string, callId?: string) => {
       if (typeof content !== 'string' || !content.length) return;
@@ -153,10 +177,10 @@ export function importTranscriptLines(
           'Supported transcript content exceeds the archive size limit; no archive imported',
         );
       seen.set(id, identity);
-      // Claude Code marks expanded commands and caveats as meta: a title only when nothing was typed.
-      if ((kind === 'user' || written) && !prompt && !row.isCompactSummary) {
+      // A prompt someone else wrote (an expansion, a subagent's task) titles the session only when nothing was typed.
+      if (!prompt && !row.isCompactSummary) {
         if (kind === 'user') prompt = typedPrompt(content);
-        else metaPrompt ??= typedPrompt(content);
+        else if (kind === 'event' && written) metaPrompt ??= typedPrompt(content);
       }
       entries.push({
         id,
@@ -183,11 +207,7 @@ export function importTranscriptLines(
         if (p.type === 'message' && ['user', 'assistant'].includes(p.role)) {
           for (const [i, block] of (p.content ?? []).entries()) {
             if (['input_text', 'output_text', 'text'].includes(block.type))
-              add(
-                p.role === 'user' && (written || !typedPrompt(block.text ?? '')) ? 'event' : p.role,
-                block.text,
-                `text-${i}`,
-              );
+              add(textKind(p.role, block.text), block.text, `text-${i}`);
             else omissions.add('Non-text message content is not included');
           }
         } else if (['function_call', 'custom_tool_call'].includes(p.type)) {
@@ -224,11 +244,10 @@ export function importTranscriptLines(
       }
     } else if (['user', 'assistant'].includes(row.type) && row.message) {
       const blocks = row.message.content;
-      const textKind = written ? 'event' : row.type;
-      if (typeof blocks === 'string') add(textKind, blocks, 'text');
+      if (typeof blocks === 'string') add(textKind(row.type, blocks), blocks, 'text');
       else if (Array.isArray(blocks))
         for (const [i, block] of blocks.entries()) {
-          if (block.type === 'text') add(textKind, block.text, `text-${i}`);
+          if (block.type === 'text') add(textKind(row.type, block.text), block.text, `text-${i}`);
           else if (block.type === 'tool_use')
             add(
               'tool-call',

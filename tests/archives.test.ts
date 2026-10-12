@@ -276,9 +276,9 @@ describe('Claude Code titles are the first message the person typed', () => {
     expect(result.title).toBe('Why are titles wrong?');
     expect(result.entries.map((entry) => entry.kind)).toEqual([
       'event',
-      'user',
-      'user',
-      'user',
+      'event',
+      'event',
+      'event',
       'event',
       'user',
     ]);
@@ -545,4 +545,13 @@ test('Claude Code SDK sessions without an origin are not typed by the person', (
   );
   expect(imported.entries.map((entry) => entry.kind)).toEqual(['event', 'user', 'user']);
   expect(imported.title).toBe('Typed in the terminal');
+});
+
+test('tag-only detection is linear and leaves pasted markup typed', () => {
+  const started = performance.now();
+  const blocks = '<a-b>x</a-b>'.repeat(40_000);
+  expect(typedPrompt(`${blocks}tail`)).toBe(`${blocks}tail`);
+  expect(typedPrompt(blocks)).toBeUndefined();
+  expect(performance.now() - started).toBeLessThan(2_000);
+  expect(typedPrompt('<div>Why is this centered?</div>')).toBe('<div>Why is this centered?</div>');
 });
