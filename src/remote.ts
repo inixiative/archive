@@ -176,7 +176,7 @@ export class ArchiveClient {
     );
   }
   recordSuggestions(results: SuggestionResult[]) {
-    return this.request<{ recorded: number; stale: number; refused: number }>(
+    return this.request<{ recorded: number; stale: number; refused: number; dropped: number }>(
       'suggestions/record',
       { results },
     );

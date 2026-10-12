@@ -16,6 +16,7 @@ import {
   sessionDigest,
   suggestionKey,
 } from '../src/suggest';
+import { decisionEnvironment } from '../src/suggest-claude';
 import { freshStore } from './db';
 
 const token = 'synthetic-archive-test-token-0000000000';
@@ -132,8 +133,8 @@ test('a collector tags sessions from a test working directory it was told to col
       projectId: 'foundry',
     });
     expect(result.imported).toBe(1);
-    expect((await store.list())[0].tags).toEqual([RUN_TAGS.test]);
-    expect(await store.list({ exempt: false })).toEqual([]);
+    expect(await store.list()).toEqual([]);
+    expect((await store.list({ exempt: 'include' }))[0]!.tags).toEqual([RUN_TAGS.test]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -145,17 +146,17 @@ test('exempt sessions filter out of list and search; removing the run tag lifts 
   const work = await store.capture(snapshot('work'));
   const fixture = await store.capture(snapshot('fixture', { source: 'foundry', projectId: 'P' }));
   const oracle = await store.capture(snapshot('eval', { tags: [RUN_TAGS.oracle] }));
-  expect((await store.list()).find((a) => a.id === fixture.id)?.tags).toEqual([RUN_TAGS.test]);
-  expect((await store.list({ exempt: false })).map((a) => a.id)).toEqual([work.id]);
-  expect((await store.list({ exempt: true })).map((a) => a.id).sort()).toEqual(
+  expect((await store.list({ exempt: 'include' })).find((a) => a.id === fixture.id)?.tags).toEqual([
+    RUN_TAGS.test,
+  ]);
+  expect((await store.list()).map((a) => a.id)).toEqual([work.id]);
+  expect((await store.list({ exempt: 'only' })).map((a) => a.id).sort()).toEqual(
     [fixture.id, oracle.id].sort(),
   );
-  const found = await call(handler, 'search', { query: 'login', exempt: false });
+  const found = await call(handler, 'search', { query: 'login' });
   expect(found.body.data.archives.map((a) => a.archiveId)).toEqual([work.id]);
   expect((await store.tag(fixture.id, { remove: [RUN_TAGS.test] })).tags).toEqual([]);
-  expect((await store.list({ exempt: false })).map((a) => a.id).sort()).toEqual(
-    [work.id, fixture.id].sort(),
-  );
+  expect((await store.list()).map((a) => a.id).sort()).toEqual([work.id, fixture.id].sort());
   expect((await store.tag(fixture.id, { add: [RUN_TAGS.test] })).tags).toEqual([RUN_TAGS.test]);
 });
 
@@ -176,40 +177,32 @@ test('suggestions: due once per digest and key, never for exempt sessions, human
     counts: { prompts: 1, assistant: 1, toolCalls: 0 },
     prompts: ['Fix the flaky login test'],
   });
+  const result = (archiveId: string, digest: string, tags: string[]) => ({
+    archiveId,
+    digest,
+    key: 'k1',
+    by: 'claude-haiku-5-5',
+    tags,
+  });
+  // Tags the archive does not offer are dropped; a project only for a weakly routed session.
+  expect(
+    await store.recordSuggestions([
+      result(work.id, work.digest, ['undefined-tag', 'project:template', 'debugging']),
+      result(stray.id, stray.digest, ['project:nowhere']),
+    ]),
+  ).toEqual({ recorded: 2, stale: 0, refused: 0, dropped: 3 });
+  expect((await store.list()).find((a) => a.id === work.id)!.suggestedTags).toEqual([
+    { tag: 'debugging', origin: 'model' },
+    { tag: 'testing', origin: 'heuristic' },
+  ]);
   const recorded = await call(handler, 'suggestions/record', {
     results: [
-      {
-        archiveId: work.id,
-        digest: work.digest,
-        key: 'k1',
-        by: 'claude-haiku-5-5',
-        tags: ['debugging', 'testing'],
-      },
-      {
-        archiveId: stray.id,
-        digest: stray.digest,
-        key: 'k1',
-        by: 'claude-haiku-5-5',
-        tags: ['project:template'],
-      },
-      { archiveId: stray.id, digest: 'f'.repeat(64), key: 'k1', by: 'claude-haiku-5-5', tags: [] },
-      {
-        archiveId: work.id,
-        digest: work.digest,
-        key: 'k1',
-        by: 'claude-haiku-5-5',
-        tags: ['undefined-tag'],
-      },
-      {
-        archiveId: work.id,
-        digest: work.digest,
-        key: 'k1',
-        by: 'claude-haiku-5-5',
-        tags: ['project:nowhere'],
-      },
+      result(work.id, work.digest, ['debugging', 'testing']),
+      result(stray.id, stray.digest, ['project:template']),
+      result(stray.id, 'f'.repeat(64), []),
     ],
   });
-  expect(recorded.body.data as unknown).toEqual({ recorded: 2, stale: 1, refused: 2 });
+  expect(recorded.body.data as unknown).toEqual({ recorded: 2, stale: 1, refused: 0, dropped: 0 });
   const listed = (await store.list()).find((a) => a.id === work.id)!;
   expect(listed.tags).toEqual([]);
   expect(listed.suggestedTags).toEqual([
@@ -230,17 +223,20 @@ test('suggestions: due once per digest and key, never for exempt sessions, human
   const edited = (await store.list()).find((a) => a.id === work.id)!;
   expect(edited.tags).toEqual(['testing']);
   expect(edited.suggestedTags).toEqual([]);
-  // A new digest makes the session due again; the old suggestions still show until replaced.
+  // A new digest makes the session due again, and the old suggestions no longer show.
+  await store.tag(work.id, { remove: ['testing'] });
+  await store.recordSuggestions([result(work.id, work.digest, ['debugging', 'junk'])]);
   const grown = await store.capture({ ...snapshot('work'), capturedAt: 2_000, title: 'Longer' });
+  expect((await store.list({ suggestedTag: 'junk' })).map((a) => a.id)).toEqual([]);
   const due = await store.suggestionQueue({ key: 'k1', limit: 10 });
   expect(due?.items.map((i) => [i.archiveId, i.digest])).toEqual([[work.id, grown.digest]]);
   // Exempt sessions are refused even when asked directly.
-  const [fixture] = await store.list({ exempt: true });
+  const [fixture] = await store.list({ exempt: 'only' });
   expect(
     await store.recordSuggestions([
       { archiveId: fixture!.id, digest: fixture!.digest, key: 'k1', by: PREFILTER, tags: ['junk'] },
     ]),
-  ).toEqual({ recorded: 0, stale: 0, refused: 1 });
+  ).toEqual({ recorded: 0, stale: 0, refused: 1, dropped: 0 });
 });
 
 test('the prefilter settles empty sessions; digests stay bounded', () => {
@@ -401,4 +397,44 @@ test('runSuggestions batches, splits failed batches, counts tokens and never re-
   expect(listed.map((a) => [a.sessionId, a.suggestedTags])).toEqual([
     ['empty', [{ tag: 'junk', origin: 'heuristic' }]],
   ]);
+});
+
+test('decision processes get an allowlisted environment; Foundry events are never a task', () => {
+  process.env.ANTHROPIC_BASE_URL = 'https://elsewhere.example';
+  process.env.CLAUDE_CODE_USE_BEDROCK = '1';
+  try {
+    const env = decisionEnvironment();
+    expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
+    expect(env.CLAUDE_CODE_USE_BEDROCK).toBeUndefined();
+    expect(env.DATABASE_URL).toBeUndefined();
+    expect(env.CLAUDE_CODE_DISABLE_CLAUDE_MDS).toBe('1');
+    expect(env.PATH).toBe(process.env.PATH);
+  } finally {
+    delete process.env.ANTHROPIC_BASE_URL;
+    delete process.env.CLAUDE_CODE_USE_BEDROCK;
+  }
+  const foundry = sessionDigest(
+    snapshot('t', {
+      source: 'foundry',
+      entries: [
+        { id: 'e', kind: 'event', text: 'Status check', timestamp: 1, sourceRef: 'turn:1' },
+        { id: 'f', kind: 'event', text: '{"status":"failed"}', timestamp: 2, sourceRef: 'turn:2' },
+      ],
+    }),
+  );
+  expect(foundry.task).toBeUndefined();
+  expect(prefilter(foundry)).toEqual(['junk']);
+});
+
+test('a session captured before summaries held its digest is digested once from its snapshot', async () => {
+  const store = await freshStore();
+  const { id } = await store.capture(snapshot('old'));
+  const row = await store.db.archive.findUniqueOrThrow({ where: { id } });
+  const { session: _, ...summary } = row.summary as Record<string, unknown>;
+  await store.db.archive.update({ where: { id }, data: { summary: summary as object } });
+  const queue = await store.suggestionQueue({ key: 'k', limit: 5 });
+  expect(queue?.items[0]?.session.prompts).toEqual(['Fix the flaky login test']);
+  const after = await store.db.archive.findUniqueOrThrow({ where: { id } });
+  expect((after.summary as { session?: unknown }).session).toBeDefined();
+  expect((await store.list())[0]).not.toHaveProperty('session');
 });

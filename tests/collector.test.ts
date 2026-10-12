@@ -240,9 +240,10 @@ test('an unchanged session is not sent again, and an untouched file is not read 
     session('one', 'First');
     session('two', 'Second');
     expect(await collectSessions(writer, config, { harness })).toMatchObject({ imported: 2 });
-    expect((await store.list())[0]!.references).toEqual([
-      expect.objectContaining({ integration: 'github' }),
-    ]);
+    // The checkout is in a temp directory, so its sessions are test runs.
+    const [listed] = await store.list({ exempt: 'only' });
+    expect(listed!.tags).toEqual(['run:test']);
+    expect(listed!.references).toEqual([expect.objectContaining({ integration: 'github' })]);
     expect(calls.capture).toBe(2);
     // A restarted collector compares digests: nothing is sent.
     const cache: CollectorCache = new Map();

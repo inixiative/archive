@@ -66,7 +66,9 @@ export function sessionDigest(snapshot: ArchiveSnapshot): SessionDigest {
       tools.set(name, (tools.get(name) ?? 0) + 1);
     } else if (entry.kind === 'event') {
       counts.events++;
-      task ??= typedPrompt(entry.text);
+      // A subagent's task or an SDK caller's prompt; Foundry's events are structured records.
+      if (snapshot.source !== 'foundry' && !entry.text.trimStart().startsWith('{'))
+        task ??= typedPrompt(entry.text);
     }
   }
   if (lastReply !== undefined && counts.assistant > 1) replies.push(clip(lastReply, REPLY_CHARS));
@@ -227,6 +229,7 @@ export interface SuggestionArchive {
     recorded: number;
     stale: number;
     refused: number;
+    dropped: number;
   }>;
 }
 
@@ -254,6 +257,8 @@ export interface SuggestReport {
   recorded: number;
   stale: number;
   refused: number;
+  /** Suggested tags the archive does not offer, left out. */
+  dropped: number;
   /** Sessions the model never answered. */
   unanswered: number;
   calls: number;
@@ -264,7 +269,7 @@ export interface SuggestReport {
   tags: Record<string, number>;
 }
 
-const PAGE = 50;
+const PAGE = 20;
 const STOP_AFTER = 6;
 
 async function pool<T>(
@@ -305,6 +310,7 @@ export async function runSuggestions(
     recorded: 0,
     stale: 0,
     refused: 0,
+    dropped: 0,
     unanswered: 0,
     calls: 0,
     failedCalls: 0,
@@ -322,10 +328,19 @@ export async function runSuggestions(
   };
   const record = async (results: SuggestionResult[]) => {
     if (!results.length) return;
-    const outcome = await archive.recordSuggestions(results);
+    let outcome: Awaited<ReturnType<SuggestionArchive['recordSuggestions']>>;
+    try {
+      outcome = await archive.recordSuggestions(results);
+    } catch (error) {
+      // Not recorded: the sessions stay due for the next run.
+      failure(`record: ${error instanceof Error ? error.message : String(error)}`);
+      report.unanswered += results.length;
+      return;
+    }
     report.recorded += outcome.recorded;
     report.stale += outcome.stale;
     report.refused += outcome.refused;
+    report.dropped += outcome.dropped;
     for (const result of results)
       for (const tag of result.tags) report.tags[tag] = (report.tags[tag] ?? 0) + 1;
   };

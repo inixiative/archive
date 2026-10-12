@@ -108,7 +108,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'import --file PATH --source codex|claude-code|chatgpt --project-id ID [--tag TAG]\n' +
         'collect --directory HISTORY --source codex|claude-code (--project-root CWD [--project-root ...] --project-id ID [--worktrees] [--subdirectories] | --catch-all) [--exclude PATH ...] [--atlas] [--watch]\n' +
         'collect --agent NAME [--watch]   (one collector from agents.json, routed against the others, re-read each scan)\n' +
-        'list | search --query TEXT [--remote]   [--project-id ID] [--source S] [--tag T] [--suggested T] [--exempt true|false] [--provider P] [--model M] [--effort E] [--access-path subscription|api|unknown]\n' +
+        'list | search --query TEXT [--remote]   [--project-id ID] [--source S] [--tag T] [--suggested T] [--exempt exclude|include|only] [--provider P] [--model M] [--effort E] [--access-path subscription|api|unknown]\n' +
         'export --id ID | tag --id ID [--tag TAG ...] [--untag TAG ...]\n' +
         'tags list | tags define --tag TAG [--description TEXT] | tags remove --tag TAG   (the category tags the archive offers)\n' +
         'suggest [--limit N] [--batch 8] [--concurrency 2] [--model claude-haiku-5-5] [--refresh]   (tag suggestions on the Claude subscription; test and Oracle runs are exempt)\n' +
@@ -122,9 +122,10 @@ export async function runCli(args = Bun.argv.slice(2)) {
     );
     return;
   }
-  const flag = (value: string, name: string) => {
-    if (value !== 'true' && value !== 'false') throw new Error(`--${name} is true or false`);
-    return value === 'true';
+  const exemptMode = (value: string): 'exclude' | 'include' | 'only' => {
+    if (value !== 'exclude' && value !== 'include' && value !== 'only')
+      throw new Error('--exempt is exclude, include or only');
+    return value;
   };
   const whole = (value: string, name: string, max: number) => {
     const parsed = Number(value);
@@ -370,7 +371,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
     ...(v['access-path']
       ? { accessPath: v['access-path'] as 'subscription' | 'api' | 'unknown' }
       : {}),
-    ...(v.exempt === undefined ? {} : { exempt: flag(v.exempt, 'exempt') }),
+    ...(v.exempt === undefined ? {} : { exempt: exemptMode(v.exempt) }),
     ...(v.suggested ? { suggestedTag: v.suggested } : {}),
   };
   if (command === 'routes') output(await archive.routes());
@@ -389,6 +390,9 @@ export async function runCli(args = Bun.argv.slice(2)) {
       );
     } else throw new Error('Unknown tags command; use --help');
   } else if (command === 'suggest') {
+    // Session content goes to this machine's own Claude login, so only this machine's Archive is read.
+    if (!['127.0.0.1', 'localhost', '[::1]'].includes(new URL(v.url ?? DEFAULT_URL).hostname))
+      throw new Error('suggest reads only this machine’s Archive');
     const { runSuggestions } = await import('./suggest');
     const { claudeSuggestModel } = await import('./suggest-claude');
     const concurrency = whole(v.concurrency!, 'concurrency', 8);

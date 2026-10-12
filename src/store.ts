@@ -25,6 +25,7 @@ import {
   JUNK_TAG,
   PREFILTER,
   PROJECT_TAG_PREFIX,
+  type SessionDigest,
   type SuggestionDue,
   type SuggestionResult,
   sessionDigest,
@@ -60,6 +61,8 @@ const summarize = (snapshot: ArchiveSnapshot, settings: ArchiveSettings) => {
     models: [...models.values()],
     suggestedTags: suggestTags(snapshot),
     references: archiveReferences(snapshot, settings.integrations),
+    /** What the tagger reads; absent from listings. */
+    session: sessionDigest(snapshot) as SessionDigest | undefined,
   };
 };
 type Summary = ReturnType<typeof summarize>;
@@ -106,14 +109,21 @@ type ArchiveRow = {
   digest: string;
   summary: Prisma.JsonValue;
   tagEdits: { tag: string; added: boolean }[];
-  suggestion: { by: string; tags: string[] } | null;
+  suggestion: { digest: string; by: string; tags: string[] } | null;
 };
 /**
  * Tags are the base tags with this archive's edits applied. Suggestions are the tagger's and the
  * heuristics', minus what a person applied or removed: their edits always win.
  */
 const listing = (row: ArchiveRow, filter: ArchiveFilter) => {
-  const { capturedTags: _, suggestedTags: heuristic, ...summary } = row.summary as Summary;
+  const {
+    capturedTags: _,
+    suggestedTags: heuristic,
+    session: __,
+    ...summary
+  } = row.summary as Summary;
+  // Suggestions describe one digest; once the session moves on they no longer apply.
+  const suggestion = row.suggestion?.digest === row.digest ? row.suggestion : null;
   const removed = new Set(row.tagEdits.filter((e) => !e.added).map((e) => e.tag));
   const tags = [
     ...new Set([
@@ -122,9 +132,9 @@ const listing = (row: ArchiveRow, filter: ArchiveFilter) => {
     ]),
   ].filter((tag) => !removed.has(tag));
   const suggested: TagSuggestion[] = [
-    ...(row.suggestion?.tags ?? []).map((tag) => ({
+    ...(suggestion?.tags ?? []).map((tag) => ({
       tag,
-      origin: row.suggestion!.by === PREFILTER ? ('heuristic' as const) : ('model' as const),
+      origin: suggestion!.by === PREFILTER ? ('heuristic' as const) : ('model' as const),
     })),
     ...heuristic,
   ];
@@ -137,7 +147,7 @@ const listing = (row: ArchiveRow, filter: ArchiveFilter) => {
   const { reference, model, effort } = filter;
   if (
     (filter.tag && !tags.includes(filter.tag)) ||
-    (filter.exempt !== undefined && Boolean(exemptRun(tags)) !== filter.exempt) ||
+    (filter.exempt !== 'include' && Boolean(exemptRun(tags)) !== (filter.exempt === 'only')) ||
     (filter.suggestedTag && !suggestedTags.some((s) => s.tag === filter.suggestedTag)) ||
     (model && !summary.models.some((m) => m.model === model)) ||
     (effort && !summary.models.some((m) => m.effort === effort && (!model || m.model === model))) ||
@@ -271,7 +281,7 @@ export class ArchiveStore {
           ...(filter.accessPath ? { accessPath: filter.accessPath } : {}),
           ...(cursor === undefined ? {} : { seq: { lt: cursor } }),
         },
-        include: { tagEdits: true, suggestion: { select: { by: true, tags: true } } },
+        include: { tagEdits: true, suggestion: { select: { digest: true, by: true, tags: true } } },
         orderBy: { seq: 'desc' },
         take: BATCH,
       });
@@ -422,7 +432,7 @@ export class ArchiveStore {
       where: { actorId: { in: ['', actorId ?? ''] } },
       orderBy: { tag: 'asc' },
     });
-    const archives = await this.list(actorId ? { actorId } : {});
+    const archives = await this.list({ exempt: 'include', ...(actorId ? { actorId } : {}) });
     return rows.map((row) => ({
       tag: row.tag,
       ...(row.actorId ? { actorId: row.actorId } : {}),
@@ -513,7 +523,7 @@ export class ArchiveStore {
       if (!before) return undefined;
       cursor = before.seq;
     }
-    const due: { id: string; revision: number; digest: string }[] = [];
+    const due: { id: string; revision: number; digest: string; summary: Prisma.JsonValue }[] = [];
     let nextCursor: string | null = null;
     scan: for (;;) {
       const rows = await this.db.archive.findMany({
@@ -524,7 +534,8 @@ export class ArchiveStore {
       });
       for (const row of rows) {
         const current = row.suggestion?.digest === row.digest && row.suggestion.key === input.key;
-        if ((current && !input.refresh) || exemptRun(listing(row, {})[0]!.tags)) continue;
+        if ((current && !input.refresh) || exemptRun(listing(row, { exempt: 'include' })[0]!.tags))
+          continue;
         due.push(row);
         if (due.length >= input.limit) {
           nextCursor = row.id;
@@ -536,16 +547,23 @@ export class ArchiveStore {
     }
     const items: SuggestionDue[] = [];
     for (const archive of due) {
-      const row = await this.db.revision.findUnique({
-        where: { archiveId_revision: { archiveId: archive.id, revision: archive.revision } },
-        select: { snapshot: true },
-      });
-      if (!row) continue;
-      items.push({
-        archiveId: archive.id,
-        digest: archive.digest,
-        session: sessionDigest(archiveSnapshotSchema.parse(row.snapshot)),
-      });
+      let session = (archive.summary as Summary).session;
+      if (!session) {
+        // Captured before summaries carried the digest: computed once and stored.
+        const row = await this.db.revision.findUnique({
+          where: { archiveId_revision: { archiveId: archive.id, revision: archive.revision } },
+          select: { snapshot: true },
+        });
+        if (!row) continue;
+        session = sessionDigest(archiveSnapshotSchema.parse(row.snapshot));
+        await this.db.archive.updateMany({
+          where: { id: archive.id, digest: archive.digest },
+          data: {
+            summary: { ...(archive.summary as Summary), session } as Prisma.InputJsonValue,
+          },
+        });
+      }
+      items.push({ archiveId: archive.id, digest: archive.digest, session });
     }
     return { items, projects: await this.projects(), nextCursor };
   }
@@ -560,9 +578,10 @@ export class ArchiveStore {
     return rows.flatMap((row) => (row.projectId ? [row.projectId] : []));
   }
   /**
-   * Records the tagger's suggestions. One for a digest that is no longer current is stale and
-   * dropped; one naming a tag this archive does not offer (archive-wide definitions, `junk`,
-   * `project:<routed project>`) is refused. Exempt sessions are refused too.
+   * Records the tagger's suggestions. One for a digest that is no longer current is stale; one for
+   * an exempt session is refused. Tags this archive does not offer are dropped: archive-wide
+   * definitions and `junk` are offered, and `project:<routed project>` only for a session that is
+   * unrouted or has no project.
    */
   async recordSuggestions(results: SuggestionResult[], now = Date.now()) {
     const parsed = z
@@ -584,7 +603,7 @@ export class ArchiveStore {
       ).map((d) => d.tag),
     ]);
     const projects = new Set(await this.projects());
-    const outcome = { recorded: 0, stale: 0, refused: 0 };
+    const outcome = { recorded: 0, stale: 0, refused: 0, dropped: 0 };
     for (const result of parsed) {
       const row = await this.db.archive.findUnique({
         where: { id: result.archiveId },
@@ -594,25 +613,20 @@ export class ArchiveStore {
         outcome.stale++;
         continue;
       }
-      if (
-        exemptRun(listing(row, {})[0]!.tags) ||
-        !result.tags.every(
-          (tag) =>
-            offered.has(tag) ||
-            (tag.startsWith(PROJECT_TAG_PREFIX) &&
-              projects.has(tag.slice(PROJECT_TAG_PREFIX.length))),
-        )
-      ) {
+      if (exemptRun(listing(row, { exempt: 'include' })[0]!.tags)) {
         outcome.refused++;
         continue;
       }
-      const fields = {
-        digest: result.digest,
-        key: result.key,
-        by: result.by,
-        tags: result.tags,
-        at: now,
-      };
+      const weak = !row.projectId || row.projectId === UNROUTED;
+      const tags = result.tags.filter(
+        (tag) =>
+          offered.has(tag) ||
+          (weak &&
+            tag.startsWith(PROJECT_TAG_PREFIX) &&
+            projects.has(tag.slice(PROJECT_TAG_PREFIX.length))),
+      );
+      outcome.dropped += result.tags.length - tags.length;
+      const fields = { digest: result.digest, key: result.key, by: result.by, tags, at: now };
       await this.db.suggestion.upsert({
         where: { archiveId: result.archiveId },
         create: { archiveId: result.archiveId, ...fields },

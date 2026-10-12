@@ -32,7 +32,7 @@ const filterFields = {
   effort: z.string().min(1).max(40).optional(),
   provider: z.string().min(1).max(64).optional(),
   accessPath: z.enum(['subscription', 'api', 'unknown']).optional(),
-  exempt: z.boolean().optional(),
+  exempt: z.enum(['exclude', 'include', 'only']).optional(),
   suggestedTag: z.string().min(1).max(120).optional(),
   limit: z.number().int().min(1).max(100).default(20),
   beforeId: archiveId.optional(),
@@ -51,7 +51,7 @@ const tagSchema = z.strictObject({
 });
 const suggestionQueueSchema = z.strictObject({
   key: z.string().min(1).max(128),
-  limit: z.number().int().min(1).max(100).default(50),
+  limit: z.number().int().min(1).max(100).default(20),
   beforeId: archiveId.optional(),
   refresh: z.boolean().optional(),
 });
@@ -287,6 +287,8 @@ export async function startArchiveServer(options: {
       port: options.port ?? 4700,
       hostname: options.hostname ?? '127.0.0.1',
       maxRequestBodySize: 65_000_000,
+      // Seconds; a suggestion queue page may read large snapshots that have no stored digest yet.
+      idleTimeout: 255,
       fetch: createArchiveHandler(store, options.token, options.config),
     });
     return {

@@ -102,7 +102,8 @@ model Suggestion {
   archiveId String   @id
   /// The archive digest the suggestions describe; a new digest makes them due again.
   digest    String
-  /// The tagger's prompt, model, tag definitions and projects, hashed; a change makes them due again.
+  /// The tagger's prompt, model and tag definitions, hashed; a change makes them due again.
+  /// New projects do not: `suggest --refresh` asks again.
   key       String
   /// The model that suggested, or `prefilter` when no model was asked.
   by        String
