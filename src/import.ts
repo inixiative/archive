@@ -119,9 +119,12 @@ export function importTranscriptLines(
       if (sessionId && id && id !== sessionId)
         throw new Error('Transcript session identity mismatch');
       sessionId ??= id;
-      const originator = row.payload?.originator;
+      // Subagent and guardian threads, and `codex exec`, are driven by an agent or a script.
+      const { originator, source } = row.payload ?? {};
       if (typeof originator === 'string')
         scripted = !/^codex/i.test(originator) || /^codex_(?:exec|sdk|mcp)/.test(originator);
+      if (source === 'exec' || (source && typeof source === 'object' && 'subagent' in source))
+        scripted = true;
     }
     if (options.source === 'claude-code' && row.sessionId) {
       // Subagent transcripts reuse their parent's sessionId; each is its own archive.

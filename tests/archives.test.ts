@@ -493,10 +493,10 @@ test('Codex AGENTS.md instructions are not the title', () => {
 });
 
 test('Codex: injected and scripted prompts are events, and an interruption is recorded', () => {
-  const codex = (originator: string) =>
+  const codex = (originator: string, source: unknown = 'vscode') =>
     importTranscript(
       [
-        { type: 'session_meta', payload: { id: `codex-${originator}`, originator } },
+        { type: 'session_meta', payload: { id: `codex-${originator}`, originator, source } },
         {
           type: 'response_item',
           payload: {
@@ -523,6 +523,9 @@ test('Codex: injected and scripted prompts are events, and an interruption is re
   ]);
   expect(codex('codex_exec').filter(([kind]) => kind === 'user')).toEqual([]);
   expect(codex('inixiative-bench').filter(([kind]) => kind === 'user')).toEqual([]);
+  expect(
+    codex('Codex Desktop', { subagent: { other: 'guardian' } }).filter(([kind]) => kind === 'user'),
+  ).toEqual([]);
 });
 
 test('Claude Code SDK sessions without an origin are not typed by the person', () => {
