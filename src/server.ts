@@ -29,6 +29,8 @@ const filterFields = {
   reference: archiveReferenceSchema.optional(),
   model: z.string().min(1).max(200).optional(),
   effort: z.string().min(1).max(40).optional(),
+  provider: z.string().min(1).max(64).optional(),
+  accessPath: z.enum(['subscription', 'api', 'unknown']).optional(),
   limit: z.number().int().min(1).max(100).default(20),
   beforeId: archiveId.optional(),
 };
@@ -145,6 +147,8 @@ export function createArchiveHandler(
             title: a.title,
             projectId: a.projectId,
             actor: a.actor,
+            runtime: a.runtime,
+            lineage: a.lineage,
             models: a.models,
             tags: a.tags,
             suggestedTags: a.suggestedTags,

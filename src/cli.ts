@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import {
   agentStatus,
+  collectorPlan,
   defaultHistoryDirectory,
   defaultHome,
   installAgents,
@@ -16,8 +17,8 @@ import {
   writeAgents,
 } from './agents';
 import { importChatGPTThread } from './chatgpt';
-import { archiveRequest, searchRemotes, syncArchives } from './client';
-import { collectSessions } from './collector';
+import { archiveRequest, type SyncBackoff, searchRemotes, syncArchives } from './client';
+import { type CollectorCache, collectSessions, defaultExclusions, UNROUTED } from './collector';
 import {
   archiveDestinationSchema,
   connectDestination,
@@ -66,6 +67,14 @@ export async function runCli(args = Bun.argv.slice(2)) {
       query: { type: 'string', default: '' },
       'project-root': { type: 'string', multiple: true },
       worktrees: { type: 'boolean', default: false },
+      subdirectories: { type: 'boolean', default: false },
+      'catch-all': { type: 'boolean', default: false },
+      exclude: { type: 'string', multiple: true },
+      agent: { type: 'string' },
+      provider: { type: 'string' },
+      model: { type: 'string' },
+      effort: { type: 'string' },
+      'access-path': { type: 'string' },
       atlas: { type: 'boolean', default: false },
       tag: { type: 'string', multiple: true },
       untag: { type: 'string', multiple: true },
@@ -91,14 +100,16 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'up | down   (the local Archive: bundled compose.yaml with Postgres, data in --home)\n' +
         'serve [--port 4700 --hostname 127.0.0.1] [--sync]   (DATABASE_URL; token from ARCHIVE_SERVER_TOKEN or --token-file)\n' +
         'import --file PATH --source codex|claude-code|chatgpt --project-id ID [--tag TAG]\n' +
-        'collect --directory HISTORY --source codex|claude-code --project-root EXACT_CWD [--project-root ...] [--worktrees] [--atlas] --project-id ID [--watch]\n' +
-        'list | export --id ID | tag --id ID [--tag TAG ...] [--untag TAG ...] | search --query TEXT [--remote]\n' +
+        'collect --directory HISTORY --source codex|claude-code (--project-root CWD [--project-root ...] --project-id ID [--worktrees] [--subdirectories] | --catch-all) [--exclude PATH ...] [--atlas] [--watch]\n' +
+        'collect --agent NAME [--watch]   (one collector from agents.json, routed against the others, re-read each scan)\n' +
+        'list | search --query TEXT [--remote]   [--project-id ID] [--source S] [--tag T] [--provider P] [--model M] [--effort E] [--access-path subscription|api|unknown]\n' +
+        'export --id ID | tag --id ID [--tag TAG ...] [--untag TAG ...]\n' +
         'pair --kingdom KINGDOM_API_URL [--name NAME] [--yes]   (register this Archive with Kingdom; claim the review code there, then confirm the owner)\n' +
         'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH)   (a remote Archive, for serve --sync)\n' +
         'connect --kind kingdom --url KINGDOM_API_URL --credential-file PATH --integration-id UUID --resource-id UUID --project-id ID   (a hosted Archive through Kingdom)\n' +
         'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
-        'agents add-collector --name N --source codex|claude-code --project-id ID --project-root DIR [--project-root ...] [--directory HISTORY] [--worktrees] [--atlas]\n' +
-        'agents remove-collector --name N | server --url URL | install | uninstall | status\n' +
+        'agents add-collector --name N --source codex|claude-code (--project-id ID --project-root DIR [--project-root ...] [--worktrees] [--subdirectories] | --catch-all) [--directory HISTORY] [--atlas]\n' +
+        'agents remove-collector --name N | exclude [--exclude PATH ...] | server --url URL | install | uninstall | status\n' +
         `Data commands talk to the Archive server at --url (default ${DEFAULT_URL}) with the token in --token-file (default <home>/server.token) or ARCHIVE_TOKEN.`,
     );
     return;
@@ -170,10 +181,12 @@ export async function runCli(args = Bun.argv.slice(2)) {
     output({ listening: instance.server.url.href, sync: v.sync });
     let stopped = false;
     // One process owns the database connection: the server and its sync share it.
+    // Failed deliveries back off across cycles instead of being re-sent every 30 seconds.
+    const backoff: SyncBackoff = new Map();
     const sync = (async () => {
       while (v.sync && !stopped) {
         try {
-          const results = await syncArchives(instance.store, readDestinations(config));
+          const results = await syncArchives(instance.store, readDestinations(config), { backoff });
           const failed = results.filter((r) => r.status.startsWith('failed'));
           if (failed.length) console.error(JSON.stringify({ sync: 'failed', archives: failed }));
         } catch {
@@ -258,8 +271,11 @@ export async function runCli(args = Bun.argv.slice(2)) {
     const action = positionals[1];
     const base = { collectors: [], ...current };
     if (action === 'add-collector') {
-      if (!v.name || !v['project-id'] || !v['project-root'] || !v.source)
-        throw new Error('add-collector requires --name, --source, --project-id and --project-root');
+      const catchAll = v['catch-all'];
+      if (!v.name || !v.source || (!catchAll && (!v['project-id'] || !v['project-root'])))
+        throw new Error(
+          'add-collector requires --name, --source, and --project-id with --project-root (or --catch-all)',
+        );
       const source = v.source as 'codex' | 'claude-code';
       output(
         writeAgents(
@@ -268,13 +284,18 @@ export async function runCli(args = Bun.argv.slice(2)) {
             name: v.name,
             source,
             directory: resolve(v.directory ?? defaultHistoryDirectory(source)),
-            projectId: v['project-id'],
-            projectRoots: v['project-root'].map((root) => resolve(root)),
+            projectId: catchAll ? UNROUTED : v['project-id']!,
+            projectRoots: catchAll ? [] : v['project-root']!.map((root) => resolve(root)),
             ...(v.worktrees ? { worktrees: true } : {}),
+            ...(v.subdirectories ? { subdirectories: true } : {}),
+            ...(catchAll ? { catchAll: true } : {}),
             ...(v.atlas ? { atlas: true } : {}),
           }),
         ),
       );
+    } else if (action === 'exclude') {
+      const { exclude: _, ...rest } = base;
+      output(writeAgents(file, { ...rest, ...(v.exclude?.length ? { exclude: v.exclude } : {}) }));
     } else if (action === 'remove-collector') {
       if (!v.name) throw new Error('remove-collector requires --name');
       output(
@@ -313,7 +334,22 @@ export async function runCli(args = Bun.argv.slice(2)) {
   }
   const token = process.env.ARCHIVE_TOKEN ?? readToken();
   if (!token) throw new Error('No Archive token: run `archive init` or set ARCHIVE_TOKEN');
-  const archive = new ArchiveClient({ url: v.url ?? DEFAULT_URL, token });
+  const agentsFile = join(home, 'agents.json');
+  // A named collector writes to the server agents.json declares, unless --url overrides it.
+  const serverUrl =
+    v.url ?? (v.agent ? readAgents(agentsFile)?.server?.url : undefined) ?? DEFAULT_URL;
+  const archive = new ArchiveClient({ url: serverUrl, token });
+  const filter = {
+    ...(v['project-id'] ? { projectId: v['project-id'] } : {}),
+    ...(v.source ? { source: v.source as 'claude-code' | 'codex' | 'foundry' | 'chatgpt' } : {}),
+    ...(v.tag?.length === 1 ? { tag: v.tag[0] } : {}),
+    ...(v.provider ? { provider: v.provider } : {}),
+    ...(v.model ? { model: v.model } : {}),
+    ...(v.effort ? { effort: v.effort } : {}),
+    ...(v['access-path']
+      ? { accessPath: v['access-path'] as 'subscription' | 'api' | 'unknown' }
+      : {}),
+  };
   if (command === 'routes') output(await archive.routes());
   else if (command === 'sync') {
     const results = await archive.sync();
@@ -349,15 +385,44 @@ export async function runCli(args = Bun.argv.slice(2)) {
       entries: snapshot.entries.length,
       coverage: snapshot.coverage,
     });
-  } else if (command === 'list') output(await archive.list());
+  } else if (command === 'list') output(await archive.list(filter));
   else if (command === 'collect') {
-    if (
-      !v.directory ||
-      !v['project-root'] ||
-      !v['project-id'] ||
-      !['codex', 'claude-code'].includes(v.source ?? '')
-    )
-      throw new Error('Collect requires --directory, --source, --project-root and --project-id');
+    const flagged = () => {
+      const catchAll = v['catch-all'];
+      if (
+        !v.directory ||
+        !['codex', 'claude-code'].includes(v.source ?? '') ||
+        (!catchAll && (!v['project-root'] || !v['project-id']))
+      )
+        throw new Error(
+          'Collect requires --agent, or --directory, --source and --project-root with --project-id (or --catch-all)',
+        );
+      const collector = {
+        directory: v.directory,
+        source: v.source as 'codex' | 'claude-code',
+        projectRoots: catchAll ? [] : v['project-root']!,
+        projectId: catchAll ? UNROUTED : v['project-id']!,
+        worktrees: v.worktrees,
+        subdirectories: v.subdirectories,
+        catchAll,
+        atlas: v.atlas,
+        tags: v.tag,
+      };
+      return {
+        collector,
+        peers: [collector],
+        exclude: [...defaultExclusions(), ...(v.exclude ?? [])],
+      };
+    };
+    // A named collector re-reads agents.json each scan, so its routing follows edits without a restart.
+    const plan = () => {
+      if (!v.agent) return flagged();
+      const config = readAgents(agentsFile);
+      if (!config) throw new Error('No agents.json; declare agents first');
+      return collectorPlan(config, v.agent);
+    };
+    plan();
+    const cache: CollectorCache = new Map();
     let stopped = false;
     const stop = () => {
       stopped = true;
@@ -366,16 +431,10 @@ export async function runCli(args = Bun.argv.slice(2)) {
     process.once('SIGTERM', stop);
     do {
       try {
-        const result = await collectSessions(archive, {
-          directory: v.directory,
-          source: v.source as 'codex' | 'claude-code',
-          projectRoots: v['project-root'],
-          worktrees: v.worktrees,
-          atlas: v.atlas,
-          projectId: v['project-id'],
-          tags: v.tag,
-        });
-        output(result);
+        const { collector, peers, exclude } = plan();
+        const started = Date.now();
+        const result = await collectSessions(archive, collector, { peers, exclude, cache });
+        output({ ...result, ms: Date.now() - started });
         if (!v.watch && result.failed) process.exitCode = 1;
       } catch (error) {
         // The server may be starting; a watching collector retries.
@@ -390,6 +449,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
   } else if (command === 'search')
     output(
       await archive.search({
+        ...filter,
         query: v.query,
         limit: Number(v.limit) > 100 ? 100 : Number(v.limit),
       }),

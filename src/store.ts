@@ -144,6 +144,8 @@ export class ArchiveStore {
           source: snapshot.source,
           projectId: snapshot.projectId ?? null,
           actorId: snapshot.actor?.id ?? null,
+          provider: snapshot.runtime?.provider ?? null,
+          accessPath: snapshot.runtime?.accessPath ?? null,
           capturedAt: snapshot.capturedAt,
           summary: summarize(snapshot, settings) as Prisma.InputJsonValue,
         };
@@ -217,6 +219,8 @@ export class ArchiveStore {
           ...(filter.projectId ? { projectId: filter.projectId } : {}),
           ...(filter.source ? { source: filter.source } : {}),
           ...(filter.actorId ? { actorId: filter.actorId } : {}),
+          ...(filter.provider ? { provider: filter.provider } : {}),
+          ...(filter.accessPath ? { accessPath: filter.accessPath } : {}),
           ...(cursor === undefined ? {} : { seq: { lt: cursor } }),
         },
         include: { tagEdits: true },

@@ -1,5 +1,6 @@
-import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
 import { type ImportOptions, importTranscriptLines } from './import';
+import { archiveLineageSchema } from './index';
 
 /** Bound raw record memory while skipping unsupported payloads from long native histories. */
 export function importTranscriptFile(file: string, options: ImportOptions) {
@@ -41,5 +42,31 @@ export function importTranscriptFile(file: string, options: ImportOptions) {
       closeSync(descriptor);
     }
   }
-  return importTranscriptLines(lines(), options);
+  const snapshot = importTranscriptLines(lines(), options);
+  if (options.source === 'claude-code' && snapshot.lineage) {
+    const meta = subagentMeta(file);
+    if (meta) snapshot.lineage = archiveLineageSchema.parse({ ...snapshot.lineage, ...meta });
+  }
+  return snapshot;
+}
+
+/** Claude Code writes `agent-<id>.meta.json` beside a subagent transcript: its type, task and depth. */
+function subagentMeta(file: string) {
+  const path = file.replace(/\.jsonl$/, '.meta.json');
+  if (path === file || !existsSync(path)) return undefined;
+  let meta: Record<string, unknown>;
+  try {
+    meta = JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    return undefined;
+  }
+  const text = (value: unknown, max: number) =>
+    typeof value === 'string' && value ? value.slice(0, max) : undefined;
+  const fields = {
+    agentType: text(meta.agentType, 200),
+    description: text(meta.description, 500),
+    toolUseId: text(meta.toolUseId, 256),
+    depth: Number.isInteger(meta.spawnDepth) ? (meta.spawnDepth as number) : undefined,
+  };
+  return Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined));
 }

@@ -1,4 +1,9 @@
-import { type ArchiveEntry, type ArchiveSnapshot, archiveSnapshotSchema } from './index';
+import {
+  type ArchiveEntry,
+  type ArchiveLineage,
+  type ArchiveSnapshot,
+  archiveSnapshotSchema,
+} from './index';
 
 export interface ImportOptions {
   source: 'codex' | 'claude-code';
@@ -102,6 +107,11 @@ export function importTranscriptLines(
   let turn: { model?: string; effort?: string } = {};
   // A Codex session started by a script (codex exec, a custom originator) has no typed prompts.
   let scripted = false;
+  let metaSeen = false;
+  let lineage: ArchiveLineage | undefined;
+  const text = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
+  const optional = <K extends string>(key: K, value: string | undefined) =>
+    (value ? { [key]: value } : {}) as Partial<Record<K, string>>;
   for (const rawLine of lines) {
     index++;
     const line = rawLine.trim();
@@ -115,16 +125,35 @@ export function importTranscriptLines(
     if (!row || typeof row !== 'object' || Array.isArray(row))
       throw new Error(`Invalid transcript record at line ${index + 1}`);
     if (options.source === 'codex' && row.type === 'session_meta') {
-      const id = row.payload?.id;
+      const meta = row.payload ?? {};
+      const id = meta.id;
+      // A subagent or forked rollout starts with its own meta, then replays its parent's history,
+      // parent meta included. The first meta is the session; a later one is lineage, not identity.
+      if (metaSeen && lineage) continue;
       if (sessionId && id && id !== sessionId)
         throw new Error('Transcript session identity mismatch');
       sessionId ??= id;
+      metaSeen = true;
       // Subagent and guardian threads, and `codex exec`, are driven by an agent or a script.
-      const { originator, source } = row.payload ?? {};
+      const { originator, source } = meta;
       if (typeof originator === 'string')
         scripted = !/^codex/i.test(originator) || /^codex_(?:exec|sdk|mcp)/.test(originator);
+      const spawn =
+        source && typeof source === 'object' && 'subagent' in source
+          ? source.subagent?.thread_spawn
+          : undefined;
       if (source === 'exec' || (source && typeof source === 'object' && 'subagent' in source))
         scripted = true;
+      const parent = text(spawn?.parent_thread_id) ?? text(meta.parent_thread_id);
+      const forked = text(meta.forked_from_id);
+      if (parent || forked)
+        lineage = {
+          kind: source && typeof source === 'object' && 'subagent' in source ? 'subagent' : 'fork',
+          parentSessionId: (parent ?? forked)!,
+          ...optional('agentType', text(spawn?.agent_role ?? meta.agent_role)),
+          ...optional('agentName', text(spawn?.agent_nickname ?? meta.agent_nickname)),
+          ...(Number.isInteger(spawn?.depth) ? { depth: spawn.depth } : {}),
+        };
     }
     if (options.source === 'claude-code' && row.sessionId) {
       // Subagent transcripts reuse their parent's sessionId; each is its own archive.
@@ -134,8 +163,9 @@ export function importTranscriptLines(
           : row.sessionId;
       if (sessionId && sessionId !== id) throw new Error('Mixed transcript sessions');
       sessionId = id;
+      if (row.isSidechain && typeof row.agentId === 'string')
+        lineage ??= { kind: 'subagent', parentSessionId: row.sessionId };
     }
-    const text = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
     if (options.source === 'codex' && row.type === 'turn_context')
       turn = { model: text(row.payload?.model), effort: text(row.payload?.effort) };
     const producer =

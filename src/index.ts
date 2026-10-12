@@ -3,6 +3,8 @@ import { getEncoding } from 'js-tiktoken';
 import { z } from 'zod';
 
 const identifier = z.string().min(1).max(256);
+/** The projectId a catch-all collector gives sessions no other collector claims. It never leaves the machine. */
+export const UNROUTED = 'unrouted';
 export const archiveEntrySchema = z.strictObject({
   id: identifier,
   turnId: identifier.optional(),
@@ -28,6 +30,26 @@ export const archiveReferenceSchema = z.strictObject({
   integration: z.string().regex(/^[a-z0-9-]{1,64}$/),
   ref: z.string().min(1).max(300),
 });
+/**
+ * How the session reached its model: the provider, and whether it ran on a subscription or an API
+ * key. `evidence` says where the access path came from: the transcript itself, or the harness's
+ * login when the transcript is silent (its state at capture).
+ */
+export const archiveRuntimeSchema = z.strictObject({
+  provider: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+  accessPath: z.enum(['subscription', 'api', 'unknown']),
+  evidence: z.enum(['transcript', 'harness']).optional(),
+});
+/** The session that started this one: a subagent's parent, or the thread a fork copied. */
+export const archiveLineageSchema = z.strictObject({
+  kind: z.enum(['subagent', 'fork']),
+  parentSessionId: identifier,
+  agentType: z.string().min(1).max(200).optional(),
+  agentName: z.string().min(1).max(200).optional(),
+  description: z.string().min(1).max(500).optional(),
+  toolUseId: identifier.optional(),
+  depth: z.number().int().nonnegative().max(100).optional(),
+});
 export const archiveSnapshotSchema = z
   .strictObject({
     schemaVersion: z.literal(1),
@@ -37,6 +59,8 @@ export const archiveSnapshotSchema = z
     title: z.string().min(1).max(500),
     projectId: identifier.optional(),
     actor: archiveActorSchema.optional(),
+    runtime: archiveRuntimeSchema.optional(),
+    lineage: archiveLineageSchema.optional(),
     /** Recorded references, such as the session's repository and branch. Linked ones are found in the text. */
     references: z.array(archiveReferenceSchema).max(100).optional(),
     tags: z.array(z.string().min(1).max(120)).max(100),
@@ -60,6 +84,8 @@ export type ArchiveSnapshot = z.infer<typeof archiveSnapshotSchema>;
 export type ArchiveEntry = z.infer<typeof archiveEntrySchema>;
 export type ArchiveActor = z.infer<typeof archiveActorSchema>;
 export type ArchiveReference = z.infer<typeof archiveReferenceSchema>;
+export type ArchiveRuntime = z.infer<typeof archiveRuntimeSchema>;
+export type ArchiveLineage = z.infer<typeof archiveLineageSchema>;
 export interface ArchiveChunk {
   id: string;
   entryId: string;

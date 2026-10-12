@@ -37,4 +37,6 @@ export interface ArchiveFilter {
   reference?: { integration: string; ref: string };
   model?: string;
   effort?: string;
+  provider?: string;
+  accessPath?: 'subscription' | 'api' | 'unknown';
 }

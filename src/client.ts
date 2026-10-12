@@ -126,21 +126,47 @@ export async function routingPreview(
   }));
 }
 
+/**
+ * Deliveries that failed, and when each may be tried again. A rejected archive is retried after
+ * 30 seconds, doubling per failure up to 30 minutes, instead of re-sending it every sync.
+ */
+export type SyncBackoff = Map<string, { failures: number; until: number }>;
+const BACKOFF_BASE_MS = 30_000;
+const BACKOFF_MAX_MS = 30 * 60_000;
+
 export async function syncArchives(
   store: ArchiveStore,
   destinations: ArchiveDestination[],
+  options: { backoff?: SyncBackoff; now?: () => number } = {},
 ): Promise<SyncResult[]> {
+  const now = options.now ?? Date.now;
   const results: SyncResult[] = [];
   for (const archive of await store.list())
     for (const destination of destinations.filter((d) => d.projectId === archive.projectId)) {
+      const key = JSON.stringify([archive.id, destinationIdentity(destination)]);
+      const waiting = options.backoff?.get(key);
+      if (waiting && now() < waiting.until) {
+        results.push({
+          id: archive.id,
+          destination: destination.url,
+          status: `deferred until ${new Date(waiting.until).toISOString()}`,
+        });
+        continue;
+      }
       try {
         const result = await publishArchive(store, archive.id, destination);
+        options.backoff?.delete(key);
         results.push({
           id: archive.id,
           destination: destination.url,
           status: result.unchanged ? 'unchanged' : 'published',
         });
       } catch (error) {
+        const failures = (waiting?.failures ?? 0) + 1;
+        options.backoff?.set(key, {
+          failures,
+          until: now() + Math.min(BACKOFF_BASE_MS * 2 ** (failures - 1), BACKOFF_MAX_MS),
+        });
         results.push({
           id: archive.id,
           destination: destination.url,

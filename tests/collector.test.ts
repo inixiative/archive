@@ -2,7 +2,14 @@ import { expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { collectionRoots, collectSessions } from '../src/collector';
+import {
+  type CollectionSource,
+  type CollectorCache,
+  collectionRoots,
+  collectSessions,
+  routeSession,
+} from '../src/collector';
+import { importTranscript } from '../src/import';
 import { importTranscriptFile } from '../src/import-file';
 import { freshStore } from './db';
 
@@ -186,4 +193,210 @@ test('a stored session titled with injected content is retitled on the next scan
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('an unchanged session is not sent again, and an untouched file is not read again', async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'archive-unchanged-')));
+  // A checkout with a GitHub remote, so the snapshot gains references after import.
+  const repo = join(dir, 'repo');
+  mkdirSync(repo);
+  for (const args of [
+    ['init', '-q'],
+    ['remote', 'add', 'origin', 'https://github.com/inixiative/archive.git'],
+  ])
+    expect(Bun.spawnSync(['git', '-C', repo, ...args]).success).toBe(true);
+  const store = await freshStore();
+  const calls = { head: 0, capture: 0 };
+  const writer = {
+    sourceId: () => store.sourceId(),
+    head: (id: string) => {
+      calls.head++;
+      return store.head(id);
+    },
+    capture: (snapshot: unknown) => {
+      calls.capture++;
+      return store.capture(snapshot);
+    },
+  };
+  const session = (id: string, text: string) =>
+    writeFileSync(
+      join(dir, `${id}.jsonl`),
+      JSON.stringify({
+        sessionId: id,
+        cwd: repo,
+        type: 'user',
+        uuid: `${id}-1`,
+        message: { content: text },
+      }),
+    );
+  const config = {
+    directory: dir,
+    source: 'claude-code' as const,
+    projectId: 'a',
+    projectRoots: [repo],
+  };
+  const harness = () => 'subscription' as const;
+  try {
+    session('one', 'First');
+    session('two', 'Second');
+    expect(await collectSessions(writer, config, { harness })).toMatchObject({ imported: 2 });
+    expect((await store.list())[0]!.references).toEqual([
+      expect.objectContaining({ integration: 'github' }),
+    ]);
+    expect(calls.capture).toBe(2);
+    // A restarted collector compares digests: nothing is sent.
+    const cache: CollectorCache = new Map();
+    expect(await collectSessions(writer, config, { harness, cache })).toMatchObject({
+      unchanged: 2,
+    });
+    expect(calls).toEqual({ head: 4, capture: 2 });
+    // A watching collector skips files whose size and mtime have not moved.
+    expect(await collectSessions(writer, config, { harness, cache })).toMatchObject({
+      unchanged: 2,
+    });
+    expect(calls).toEqual({ head: 4, capture: 2 });
+    session('two', 'Second, edited');
+    expect(await collectSessions(writer, config, { harness, cache })).toMatchObject({
+      imported: 1,
+      unchanged: 1,
+    });
+    expect(calls.capture).toBe(3);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the longest root wins; subdirectories, exclusions and the catch-all route the rest', async () => {
+  const inixiative: CollectionSource = {
+    directory: '/h',
+    source: 'claude-code',
+    projectId: 'inixiative',
+    projectRoots: ['/w'],
+    subdirectories: true,
+  };
+  const kingdom = { ...inixiative, projectId: 'kingdom', projectRoots: ['/w/kingdom'] };
+  const tribe = {
+    ...inixiative,
+    projectId: 'tribe',
+    projectRoots: ['/w/tribe'],
+    subdirectories: false,
+  };
+  const fixtures = {
+    ...inixiative,
+    projectId: 'fixtures',
+    projectRoots: ['/tmp/fixture'],
+    subdirectories: false,
+  };
+  const unrouted = {
+    ...inixiative,
+    projectId: 'unrouted',
+    projectRoots: [],
+    catchAll: true,
+    subdirectories: false,
+  };
+  const peers = [inixiative, kingdom, tribe, fixtures, unrouted];
+  const route = (cwd: string) =>
+    routeSession(cwd, peers, { exclude: ['/tmp', '.foundry/decision-receipts'] })?.projectId;
+  expect(route('/w')).toBe('inixiative');
+  expect(route('/w/kingdom')).toBe('kingdom');
+  expect(route('/w/kingdom/apps/api')).toBe('kingdom');
+  expect(route('/w/kingdomish')).toBe('inixiative');
+  expect(route('/w/tribe')).toBe('tribe');
+  // An exact-only root claims no subdirectories; the broader root does.
+  expect(route('/w/tribe/apps')).toBe('inixiative');
+  expect(route('/elsewhere')).toBe('unrouted');
+  // Exclusions stop subdirectory and catch-all matches; an exact root is explicit.
+  expect(route('/tmp/probe')).toBeUndefined();
+  expect(route('/tmp/fixture')).toBe('fixtures');
+  expect(route('/w/foundry/.foundry/decision-receipts/r1')).toBeUndefined();
+
+  const dir = mkdtempSync(join(tmpdir(), 'archive-route-'));
+  const store = await freshStore();
+  try {
+    const session = (id: string, cwd: string) =>
+      writeFileSync(
+        join(dir, `${id}.jsonl`),
+        JSON.stringify({
+          sessionId: id,
+          cwd,
+          type: 'user',
+          uuid: `${id}-1`,
+          message: { content: 'Work' },
+        }),
+      );
+    session('k', '/w/kingdom/apps/api');
+    session('i', '/w/notes');
+    session('u', '/elsewhere');
+    session('t', '/tmp/probe');
+    const options = {
+      peers: [inixiative, kingdom, unrouted].map((c) => ({ ...c, directory: dir })),
+      exclude: ['/tmp'],
+    };
+    const [i, k, u] = options.peers as [CollectionSource, CollectionSource, CollectionSource];
+    expect(await collectSessions(store, k, options)).toMatchObject({ imported: 1, skipped: 3 });
+    expect(await collectSessions(store, i, options)).toMatchObject({ imported: 1, skipped: 3 });
+    expect(await collectSessions(store, u, options)).toMatchObject({ imported: 1, skipped: 3 });
+    expect(new Set((await store.list()).map((a) => `${a.sessionId}:${a.projectId}`))).toEqual(
+      new Set(['k:kingdom', 'i:inixiative', 'u:unrouted']),
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a Codex subagent rollout is its own session, though its parent replays first', () => {
+  const child = '01a073a0-498b-7db2-99e3-4339c7d0058d';
+  const parent = '01a0739f-c6d1-7160-a8ea-d2a555776324';
+  const rows = [
+    {
+      type: 'session_meta',
+      payload: {
+        id: child,
+        forked_from_id: parent,
+        cwd: '/w',
+        originator: 'Codex Desktop',
+        source: { subagent: { thread_spawn: { parent_thread_id: parent, depth: 1 } } },
+      },
+    },
+    {
+      type: 'session_meta',
+      payload: { id: parent, cwd: '/w', originator: 'Codex Desktop', source: 'vscode' },
+    },
+    {
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'Review this' }],
+      },
+    },
+    {
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'Done' }],
+      },
+    },
+  ];
+  const snapshot = importTranscript(rows.map((r) => JSON.stringify(r)).join('\n'), {
+    source: 'codex',
+    sourceId: crypto.randomUUID(),
+  });
+  expect(snapshot.sessionId).toBe(child);
+  // The parent's meta does not make the subagent's prompt a typed one.
+  expect(snapshot.entries.map((e) => e.kind)).toEqual(['event', 'assistant']);
+  const [, second] = rows;
+  expect(() =>
+    importTranscript(
+      [
+        JSON.stringify({ type: 'session_meta', payload: { id: 'a', cwd: '/w' } }),
+        JSON.stringify(second),
+      ].join('\n'),
+      {
+        source: 'codex',
+        sourceId: crypto.randomUUID(),
+      },
+    ),
+  ).toThrow('identity mismatch');
 });

@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { type SyncBackoff, syncArchives } from '../src/client';
 import {
   connectDestination,
   destinationIdentity,
@@ -169,4 +170,50 @@ test('a server without configuration has no destination endpoints', async () => 
     }),
   );
   expect(response.status).toBe(404);
+});
+
+test('a failed delivery backs off, doubling per failure, and clears once delivered', async () => {
+  const store = await freshStore();
+  const { id } = await store.capture(snapshot('backoff', 'backoff-1'));
+  let accept = false;
+  const server = Bun.serve({
+    port: 0,
+    fetch: async (request) => {
+      if (!accept) return Response.json({ error: 'Invalid archive request' }, { status: 400 });
+      const { snapshot: sent } = (await request.json()) as { snapshot: unknown };
+      return Response.json({ data: await (await freshStore('remote')).capture(sent) });
+    },
+  });
+  process.env.ARCHIVE_BACKOFF_TEST_TOKEN = token;
+  const destinations = [
+    {
+      kind: 'archive' as const,
+      projectId: 'backoff',
+      url: server.url.href,
+      tokenEnv: 'ARCHIVE_BACKOFF_TEST_TOKEN',
+    },
+  ];
+  const backoff: SyncBackoff = new Map();
+  let clock = 1_000_000;
+  const sync = async () =>
+    (await syncArchives(store, destinations, { backoff, now: () => clock })).find(
+      (r) => r.id === id,
+    )!.status;
+  try {
+    expect(await sync()).toStartWith('failed');
+    clock += 29_000;
+    expect(await sync()).toStartWith('deferred');
+    clock += 1_000;
+    expect(await sync()).toStartWith('failed');
+    // The second failure waits 60 seconds.
+    clock += 59_000;
+    expect(await sync()).toStartWith('deferred');
+    clock += 1_000;
+    accept = true;
+    expect(await sync()).toBe('published');
+    expect(backoff.size).toBe(0);
+    expect(await sync()).toBe('unchanged');
+  } finally {
+    server.stop(true);
+  }
 });

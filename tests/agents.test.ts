@@ -17,6 +17,7 @@ import {
   agentStatus,
   agentsConfigSchema,
   agentUnits,
+  collectorPlan,
   defaultHome,
   installAgents,
   packageCliPath,
@@ -102,20 +103,8 @@ test('units run this package CLI with the runtime and add --home only when non-d
   ]);
   expect(units[0]!.args.slice(2)).toEqual([
     'collect',
-    '--url',
-    'http://127.0.0.1:4700',
-    '--directory',
-    '/Users/me/.claude/projects',
-    '--source',
-    'claude-code',
-    '--project-root',
-    '/Users/me/code/kingdom',
-    '--project-root',
-    '/Users/me/code/kingdom & co',
-    '--worktrees',
-    '--atlas',
-    '--project-id',
-    'kingdom',
+    '--agent',
+    'claude-code.kingdom',
     '--watch',
     '--home',
     home,
@@ -127,14 +116,8 @@ test('units run this package CLI with the runtime and add --home only when non-d
     '/bin/bun',
     '/pkg/src/cli.ts',
     'collect',
-    '--directory',
-    '/Users/me/.codex/sessions',
-    '--source',
-    'codex',
-    '--project-root',
-    '/Users/me/code/kingdom',
-    '--project-id',
-    'kingdom',
+    '--agent',
+    'codex.kingdom',
     '--watch',
   ]);
 });
@@ -142,10 +125,13 @@ test('units run this package CLI with the runtime and add --home only when non-d
 test('plist and systemd unit rendering', () => {
   const [unit] = agentUnits(config, unitOptions('/tmp/h'));
   const plist = renderPlist(unit!);
+  expect(renderPlist({ ...unit!, args: [...unit!.args, 'a & <b>'] })).toContain(
+    '<string>a &amp; &lt;b&gt;</string>',
+  );
   expect(plist).toContain(
     '<key>Label</key>\n  <string>com.inixiative.archive.collect.claude-code.kingdom</string>',
   );
-  expect(plist).toContain('<string>/Users/me/code/kingdom &amp; co</string>');
+  expect(plist).toContain('<string>claude-code.kingdom</string>');
   expect(plist).toContain('<key>KeepAlive</key>\n  <true/>');
   expect(plist).toContain('<key>RunAtLoad</key>\n  <true/>');
   expect(plist).toContain('<key>ThrottleInterval</key>\n  <integer>30</integer>');
@@ -160,7 +146,6 @@ test('plist and systemd unit rendering', () => {
   }
   const service = renderSystemdUnit({ ...unit!, args: [...unit!.args, '100%', '$HOME', 'a"b'] });
   expect(service).toContain('ExecStart="/bin/bun" "/pkg/src/cli.ts" "collect"');
-  expect(service).toContain('"/Users/me/code/kingdom & co"');
   expect(service).toContain('"100%%" "$$HOME" "a\\"b"');
   expect(service).toContain('Restart=always\nRestartSec=30');
   expect(service).toContain(
@@ -420,4 +405,86 @@ test('token files: exactly one credential source, private regular file, read at 
   } finally {
     await instance.close();
   }
+});
+
+test('a catch-all collector is unrouted with no roots; a named collector is routed against its source peers', () => {
+  const catchAll = {
+    name: 'claude-code.unrouted',
+    source: 'claude-code' as const,
+    directory: '/Users/me/.claude/projects',
+    projectId: 'unrouted',
+    projectRoots: [],
+    catchAll: true,
+  };
+  const withCatchAll = {
+    ...config,
+    exclude: ['/Users/me/scratch'],
+    collectors: [collector, codex, catchAll],
+  };
+  expect(agentsConfigSchema.safeParse(withCatchAll).success).toBe(true);
+  expect(
+    agentsConfigSchema.safeParse({ collectors: [{ ...catchAll, projectId: 'kingdom' }] }).success,
+  ).toBe(false);
+  expect(
+    agentsConfigSchema.safeParse({ collectors: [{ ...catchAll, projectRoots: ['/w'] }] }).success,
+  ).toBe(false);
+  expect(
+    agentsConfigSchema.safeParse({ collectors: [{ ...collector, projectId: 'unrouted' }] }).success,
+  ).toBe(false);
+  const plan = collectorPlan(withCatchAll, 'claude-code.unrouted');
+  expect(plan.collector).toMatchObject({ catchAll: true, projectId: 'unrouted' });
+  expect(plan.peers.map((p) => p.projectId)).toEqual(['kingdom', 'unrouted']);
+  expect(plan.peers[1]).toBe(plan.collector);
+  expect(plan.exclude).toContain('/Users/me/scratch');
+  expect(plan.exclude).toContain('.foundry/decision-receipts');
+  expect(plan.server).toEqual({ url: 'http://127.0.0.1:4700' });
+  expect(() => collectorPlan(withCatchAll, 'missing')).toThrow('No collector named missing');
+  expect(
+    archiveDestinationSchema.safeParse({
+      kind: 'archive',
+      projectId: 'unrouted',
+      url: 'https://a.example/',
+      tokenEnv: 'T',
+    }).success,
+  ).toBe(false);
+});
+
+test('a unit that fails to load does not stop the others, and is reloaded by the next install', () => {
+  const home = temp(),
+    dir = join(temp(), 'LaunchAgents');
+  mkdirSync(dir);
+  const codexFile = join(dir, 'com.inixiative.archive.collect.codex.kingdom.plist');
+  const claudeFile = join(dir, 'com.inixiative.archive.collect.claude-code.kingdom.plist');
+  // Both units run an older version.
+  writeFileSync(codexFile, 'old codex');
+  writeFileSync(claudeFile, 'old claude');
+  const running = new Set(['codex.kingdom', 'claude-code.kingdom']);
+  const failing = new Set(['claude-code.kingdom']);
+  const run: AgentRunner = (argv) => {
+    const name = (argv.at(-1) ?? '').replace(/.*collect\.|\.plist$/g, '');
+    if (argv[1] === 'print') return { code: running.has(name) ? 0 : 1, stdout: '', stderr: '' };
+    if (argv[1] === 'bootout') running.delete(name);
+    if (argv[1] === 'bootstrap') {
+      if (failing.has(name)) return { code: 1, stdout: '', stderr: 'nope' };
+      running.add(name);
+    }
+    return { code: 0, stdout: '', stderr: '' };
+  };
+  const options = {
+    dir,
+    run,
+    uid: 501,
+    sleep: () => {},
+    platform: 'darwin' as const,
+    ...unitOptions(home),
+  };
+  expect(() => installAgents(config, options)).toThrow('claude-code.kingdom');
+  // The unit that loaded runs the new file; the one that failed keeps its old file.
+  expect(readFileSync(codexFile, 'utf8')).toContain('<string>--agent</string>');
+  expect(readFileSync(claudeFile, 'utf8')).toBe('old claude');
+  failing.clear();
+  const again = installAgents(config, options);
+  expect(again.loaded).toEqual(['com.inixiative.archive.collect.claude-code.kingdom']);
+  expect(again.unchanged).toEqual(['com.inixiative.archive.collect.codex.kingdom']);
+  expect(readFileSync(claudeFile, 'utf8')).toContain('<string>--agent</string>');
 });

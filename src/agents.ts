@@ -17,6 +17,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { type CollectionSource, defaultExclusions, UNROUTED } from './collector';
 
 export const defaultHome = () => join(homedir(), '.local/share/archive');
 export const AGENT_LABEL_PREFIX = 'com.inixiative.archive.';
@@ -25,22 +26,40 @@ export const defaultHistoryDirectory = (source: 'claude-code' | 'codex') =>
   join(homedir(), source === 'codex' ? '.codex/sessions' : '.claude/projects');
 
 const absolute = z.string().max(4096).refine(isAbsolute, 'Path must be absolute');
-export const collectorAgentSchema = z.strictObject({
-  name: z
-    .string()
-    .max(64)
-    .regex(/^[a-z0-9]+(?:[.-][a-z0-9]+)*$/),
-  source: z.enum(['claude-code', 'codex']),
-  directory: absolute,
-  projectId: z.string().min(1).max(256),
-  projectRoots: z.array(absolute).min(1).max(100),
-  worktrees: z.boolean().optional(),
-  atlas: z.boolean().optional(),
-});
+export const collectorAgentSchema = z
+  .strictObject({
+    name: z
+      .string()
+      .max(64)
+      .regex(/^[a-z0-9]+(?:[.-][a-z0-9]+)*$/),
+    source: z.enum(['claude-code', 'codex']),
+    directory: absolute,
+    projectId: z.string().min(1).max(256),
+    projectRoots: z.array(absolute).max(100),
+    worktrees: z.boolean().optional(),
+    subdirectories: z.boolean().optional(),
+    /** Every session no other collector of this source claims; projectId `unrouted`, never synced. */
+    catchAll: z.boolean().optional(),
+    atlas: z.boolean().optional(),
+  })
+  .superRefine((c, ctx) => {
+    if (c.catchAll && (c.projectId !== UNROUTED || c.projectRoots.length))
+      ctx.addIssue({
+        code: 'custom',
+        message: `A catch-all collector has projectId ${UNROUTED} and no roots`,
+      });
+    if (!c.catchAll && (c.projectId === UNROUTED || !c.projectRoots.length))
+      ctx.addIssue({
+        code: 'custom',
+        message: `A collector needs a root and a projectId other than ${UNROUTED}`,
+      });
+  });
 export const agentsConfigSchema = z
   .strictObject({
     /** The Archive server collectors write to; the token is the home's `server.token`. */
     server: z.strictObject({ url: z.url() }).optional(),
+    /** Added to the default exclusions (temp directories, Foundry decision receipts). */
+    exclude: z.array(z.string().min(1).max(4096)).max(100).optional(),
     collectors: z.array(collectorAgentSchema).max(100),
   })
   .refine(
@@ -82,21 +101,33 @@ export interface AgentUnitOptions {
 }
 export const packageCliPath = () => fileURLToPath(new URL('./cli.ts', import.meta.url));
 
-export function collectorArgs(c: CollectorAgent, server?: { url: string }) {
-  return [
-    'collect',
-    ...(server ? ['--url', server.url] : []),
-    '--directory',
-    c.directory,
-    '--source',
-    c.source,
-    ...c.projectRoots.flatMap((root) => ['--project-root', root]),
-    ...(c.worktrees ? ['--worktrees'] : []),
-    ...(c.atlas ? ['--atlas'] : []),
-    '--project-id',
-    c.projectId,
-    '--watch',
-  ];
+/** A unit runs one named collector; it re-reads agents.json each scan, so edits apply live. */
+export function collectorArgs(c: CollectorAgent) {
+  return ['collect', '--agent', c.name, '--watch'];
+}
+
+/** A named collector, the peers it is routed against, its exclusions and server, from agents.json. */
+export function collectorPlan(config: AgentsConfig, name: string) {
+  const collector = config.collectors.find((c) => c.name === name);
+  if (!collector) throw new Error(`No collector named ${name} in agents.json`);
+  const source = (c: CollectorAgent): CollectionSource => ({
+    directory: c.directory,
+    source: c.source,
+    projectRoots: c.projectRoots,
+    projectId: c.projectId,
+    ...(c.worktrees ? { worktrees: true } : {}),
+    ...(c.subdirectories ? { subdirectories: true } : {}),
+    ...(c.catchAll ? { catchAll: true } : {}),
+    ...(c.atlas ? { atlas: true } : {}),
+  });
+  const named = config.collectors.filter((c) => c.source === collector.source);
+  const peers = named.map(source);
+  return {
+    collector: peers[named.indexOf(collector)]!,
+    peers,
+    exclude: [...defaultExclusions(), ...(config.exclude ?? [])],
+    server: config.server,
+  };
 }
 
 /** One supervised unit per declared agent. */
@@ -114,7 +145,7 @@ export function agentUnits(config: AgentsConfig, options: AgentUnitOptions): Age
       stderr: join(home, 'logs', `${label}.err.log`),
     };
   };
-  return config.collectors.map((c) => unit(`collect.${c.name}`, collectorArgs(c, config.server)));
+  return config.collectors.map((c) => unit(`collect.${c.name}`, collectorArgs(c)));
 }
 
 const xml = (value: string) =>
@@ -310,23 +341,46 @@ export function installAgents(config: AgentsConfig, options: AgentHostOptions = 
   }));
   const plan = planAgents(units, installed, h.platform, h.dir);
   h.remove(plan.remove);
-  for (const { file, content } of plan.write) {
+  const previous = new Map(installed.map((i) => [i.label, i.content]));
+  const write = (file: string, content: string) => {
     const temp = `${file}.${randomUUID()}.tmp`;
     writeFileSync(temp, content, { mode: 0o644, flag: 'wx' });
     renameSync(temp, file);
-  }
-  if (h.platform === 'linux' && plan.write.length) h.systemctl('daemon-reload');
+  };
+  const loaded: string[] = [];
+  const failed: { label: string; error: string }[] = [];
+  // Write and load one unit at a time. A unit that fails to load gets its old file back (or none),
+  // so the next install sees it as changed and loads it, instead of trusting a stale running copy.
+  const install = (label: string, content?: string) => {
+    if (content !== undefined) {
+      write(h.file(label), content);
+      if (h.platform === 'linux') h.systemctl('daemon-reload');
+    }
+    try {
+      h.load(label);
+      loaded.push(label);
+    } catch (error) {
+      if (content !== undefined) {
+        const old = previous.get(label);
+        if (old === undefined) rmSync(h.file(label), { force: true });
+        else write(h.file(label), old);
+        if (h.platform === 'linux') h.systemctl('daemon-reload');
+      }
+      failed.push({ label, error: error instanceof Error ? error.message : String(error) });
+    }
+  };
+  for (const { label, content } of plan.write) install(label, content);
   // Unchanged units that are not running are loaded again.
-  const reload = [
-    ...plan.write.map((w) => w.label),
-    ...plan.unchanged.filter((label) => !h.loaded(label).loaded),
-  ];
-  for (const label of reload) h.load(label);
+  for (const label of plan.unchanged) if (!h.loaded(label).loaded) install(label);
+  if (failed.length)
+    throw new Error(
+      `Archive agents failed to load: ${failed.map((f) => `${f.label} (${f.error})`).join('; ')}`,
+    );
   return {
     platform: h.platform,
     dir: h.dir,
-    loaded: reload,
-    unchanged: plan.unchanged.filter((l) => !reload.includes(l)),
+    loaded,
+    unchanged: plan.unchanged.filter((l) => !loaded.includes(l)),
     removed: plan.remove,
   };
 }

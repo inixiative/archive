@@ -28,6 +28,9 @@ model Archive {
   source     String
   projectId  String?
   actorId    String?
+  /// The model provider (anthropic, openai) and the access path (subscription, api, unknown).
+  provider   String?
+  accessPath String?
   capturedAt Float
   summary    Json
 
@@ -38,6 +41,8 @@ model Archive {
 
   @@index([projectId])
   @@index([actorId])
+  @@index([provider])
+  @@index([accessPath])
   @@map("archives")
 }
 

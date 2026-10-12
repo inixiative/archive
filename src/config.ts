@@ -13,8 +13,13 @@ import {
 } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import { z } from 'zod';
+import { UNROUTED } from './index';
 
-const projectId = z.string().min(1).max(256);
+const projectId = z
+  .string()
+  .min(1)
+  .max(256)
+  .refine((id) => id !== UNROUTED, `${UNROUTED} sessions stay on this machine`);
 /** A remote Archive this one syncs to directly with its server token. */
 const archiveDestination = z
   .strictObject({
