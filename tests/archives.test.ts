@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { importTranscript } from '../src/import';
+import { importTranscript, typedPrompt } from '../src/import';
 import { archiveSnapshotSchema, chunkArchive, selectChunks, snapshotDigest } from '../src/index';
 import { ArchiveStore } from '../src/store';
 import { freshStore, testDatabaseUrl } from './db';
@@ -274,7 +274,14 @@ describe('Claude Code titles are the first message the person typed', () => {
       { message: { role: 'user', content: [{ type: 'text', text: 'Why are titles wrong?' }] } },
     ]);
     expect(result.title).toBe('Why are titles wrong?');
-    expect(result.entries.filter((entry) => entry.kind === 'user')).toHaveLength(6);
+    expect(result.entries.map((entry) => entry.kind)).toEqual([
+      'event',
+      'user',
+      'user',
+      'user',
+      'event',
+      'user',
+    ]);
   });
 
   test('system reminders are skipped as their own block or as a prefix', () => {
@@ -392,6 +399,36 @@ describe('Claude Code titles are the first message the person typed', () => {
     ).toBe('[Image #1]\n\n\nCompare Foundry and Figma');
   });
 
+  test('only what the person typed is a user entry; the rest are events', () => {
+    const result = claude([
+      { origin: { kind: 'human' }, message: { role: 'user', content: 'Merge it once green' } },
+      { message: { role: 'user', content: 'Typed before origins were recorded' } },
+      {
+        isMeta: true,
+        origin: { kind: 'peer', from: 'a1' },
+        message: { role: 'user', content: 'Status from another agent' },
+      },
+      {
+        origin: { kind: 'task-notification' },
+        message: { role: 'user', content: '<task-notification>done</task-notification>' },
+      },
+      { isMeta: true, message: { role: 'user', content: 'Expanded skill text' } },
+      { isCompactSummary: true, message: { role: 'user', content: 'Summary of earlier work' } },
+    ]);
+    expect(result.entries.map((entry) => [entry.kind, entry.text])).toEqual([
+      ['user', 'Merge it once green'],
+      ['user', 'Typed before origins were recorded'],
+      ['event', 'Status from another agent'],
+      ['event', '<task-notification>done</task-notification>'],
+      ['event', 'Expanded skill text'],
+      ['event', 'Summary of earlier work'],
+    ]);
+    expect(result.title).toBe('Merge it once green');
+    expect(typedPrompt('<system-reminder>x</system-reminder>Use the helper')).toBe(
+      'Use the helper',
+    );
+  });
+
   test('a prompt only Claude Code wrote titles the session when nothing was typed', () => {
     expect(
       claude([
@@ -453,4 +490,59 @@ test('Codex AGENTS.md instructions are not the title', () => {
       sourceId: snapshot().sourceId,
     }).title,
   ).toBe('Rename the sync endpoint');
+});
+
+test('Codex: injected and scripted prompts are events, and an interruption is recorded', () => {
+  const codex = (originator: string) =>
+    importTranscript(
+      [
+        { type: 'session_meta', payload: { id: `codex-${originator}`, originator } },
+        {
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: '<environment_context>cwd</environment_context>' },
+              { type: 'input_text', text: '<heartbeat>tick</heartbeat>' },
+              { type: 'input_text', text: 'Run the full check' },
+            ],
+          },
+        },
+        { type: 'event_msg', payload: { type: 'turn_aborted', reason: 'interrupted' } },
+      ]
+        .map((row) => JSON.stringify(row))
+        .join('\n'),
+      { source: 'codex', sourceId: snapshot().sourceId },
+    ).entries.map((entry) => [entry.kind, entry.text]);
+  expect(codex('Codex Desktop')).toEqual([
+    ['event', '<environment_context>cwd</environment_context>'],
+    ['event', '<heartbeat>tick</heartbeat>'],
+    ['user', 'Run the full check'],
+    ['event', '[Request interrupted by user]'],
+  ]);
+  expect(codex('codex_exec').filter(([kind]) => kind === 'user')).toEqual([]);
+  expect(codex('inixiative-bench').filter(([kind]) => kind === 'user')).toEqual([]);
+});
+
+test('Claude Code SDK sessions without an origin are not typed by the person', () => {
+  const rows = [
+    { entrypoint: 'sdk-cli', message: { role: 'user', content: 'PONG smoke' } },
+    { entrypoint: 'cli', message: { role: 'user', content: 'Typed in the terminal' } },
+    {
+      entrypoint: 'sdk-cli',
+      origin: { kind: 'human' },
+      message: { role: 'user', content: 'Typed in an SDK host' },
+    },
+  ];
+  const imported = importTranscript(
+    rows
+      .map((row, index) =>
+        JSON.stringify({ sessionId: 'sdk', uuid: `s-${index}`, type: 'user', ...row }),
+      )
+      .join('\n'),
+    { source: 'claude-code', sourceId: snapshot().sourceId },
+  );
+  expect(imported.entries.map((entry) => entry.kind)).toEqual(['event', 'user', 'user']);
+  expect(imported.title).toBe('Typed in the terminal');
 });

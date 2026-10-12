@@ -27,7 +27,16 @@ const injectedTags = [
   'user_instructions',
   'permissions',
   'INSTRUCTIONS',
+  'codex_internal_context',
+  'heartbeat',
+  'in-app-browser-context',
+  'external_codex_apps_open_page',
+  'send_user_message_question_reply',
 ].join('|');
+/** Prompts Codex writes in the user's role. */
+const injectedPreamble = /^(?:# In app browser:|The following is the Codex agent history)/;
+/** Nothing but tag blocks: markup a harness or tool wrote, whatever its tag. */
+const onlyTagBlocks = /^(?:\s*<([A-Za-z][\w-]*)(?:\s[^>]*)?>[\s\S]*?<\/\1>\s*)+$/;
 const injectedBlock = new RegExp(`<(${injectedTags})(?:\\s[^>]*)?>[\\s\\S]*?</\\1>`, 'g');
 const injectedOpening = new RegExp(`^<(?:${injectedTags})(?:>|\\s)`);
 /** Foundry's native-session envelope; the person's text is the first User Message section. */
@@ -35,7 +44,7 @@ const foundryUserMessage =
   /^# User Message[ \t]*\n([\s\S]*?)(?=\n# (?:User Message|Assistant Message|Foundry Injection)[ \t]*\n|(?![\s\S]))/m;
 
 /** What the person typed in a user message, without injected content; undefined when nothing is left. */
-function typedPrompt(text: string) {
+export function typedPrompt(text: string) {
   let prompt = text
     .replace(injectedBlock, '')
     .replace(/<\/?pasted_content(?:\s[^>]*)?>/g, '')
@@ -43,7 +52,13 @@ function typedPrompt(text: string) {
     .trim();
   if (/^# (?:System Context|User Message)[ \t]*\n/.test(prompt))
     prompt = prompt.match(foundryUserMessage)?.[1].trim() ?? '';
-  if (!prompt || injectedOpening.test(prompt) || /^\[Request interrupted by user/.test(prompt))
+  if (
+    !prompt ||
+    injectedOpening.test(prompt) ||
+    injectedPreamble.test(prompt) ||
+    onlyTagBlocks.test(prompt) ||
+    /^\[Request interrupted by user/.test(prompt)
+  )
     return undefined;
   return prompt;
 }
@@ -66,6 +81,8 @@ export function importTranscriptLines(
   let contentBytes = 0;
   // Codex states the model per turn; Claude Code per assistant record.
   let turn: { model?: string; effort?: string } = {};
+  // A Codex session started by a script (codex exec, a custom originator) has no typed prompts.
+  let scripted = false;
   for (const rawLine of lines) {
     index++;
     const line = rawLine.trim();
@@ -83,6 +100,9 @@ export function importTranscriptLines(
       if (sessionId && id && id !== sessionId)
         throw new Error('Transcript session identity mismatch');
       sessionId ??= id;
+      const originator = row.payload?.originator;
+      if (typeof originator === 'string')
+        scripted = originator === 'codex_exec' || !/^codex/i.test(originator);
     }
     if (options.source === 'claude-code' && row.sessionId) {
       // Subagent transcripts reuse their parent's sessionId; each is its own archive.
@@ -102,6 +122,21 @@ export function importTranscriptLines(
         : row.type === 'assistant'
           ? { model: text(row.message?.model), effort: text(row.effort) }
           : {};
+    // A user record the person did not type: an expansion, a compaction summary, a subagent's prompt,
+    // a message from the harness, another agent or an SDK caller, or a scripted Codex session's prompt.
+    // It is kept as an event, not a user turn.
+    const written =
+      options.source === 'claude-code'
+        ? row.type === 'user' &&
+          Boolean(
+            row.isMeta ||
+              row.isCompactSummary ||
+              row.isSidechain ||
+              (row.origin && typeof row.origin === 'object'
+                ? row.origin.kind !== 'human'
+                : typeof row.entrypoint === 'string' && row.entrypoint.startsWith('sdk')),
+          )
+        : scripted && row.type === 'response_item' && row.payload?.role === 'user';
     const timestamp = typeof row.timestamp === 'number' ? row.timestamp : Date.parse(row.timestamp);
     const add = (kind: ArchiveEntry['kind'], content: unknown, suffix: string, callId?: string) => {
       if (typeof content !== 'string' || !content.length) return;
@@ -119,8 +154,8 @@ export function importTranscriptLines(
         );
       seen.set(id, identity);
       // Claude Code marks expanded commands and caveats as meta: a title only when nothing was typed.
-      if (kind === 'user' && !prompt && !row.isCompactSummary) {
-        if (!row.isMeta) prompt = typedPrompt(content);
+      if ((kind === 'user' || written) && !prompt && !row.isCompactSummary) {
+        if (kind === 'user') prompt = typedPrompt(content);
         else metaPrompt ??= typedPrompt(content);
       }
       entries.push({
@@ -139,12 +174,20 @@ export function importTranscriptLines(
       });
     };
     if (options.source === 'codex') {
-      if (row.type === 'response_item') {
+      // Codex records the person stopping a turn as its own event; Claude Code writes this marker.
+      if (row.type === 'event_msg' && row.payload?.type === 'turn_aborted') {
+        if (row.payload.reason === 'interrupted')
+          add('event', '[Request interrupted by user]', 'aborted');
+      } else if (row.type === 'response_item') {
         const p = row.payload ?? {};
         if (p.type === 'message' && ['user', 'assistant'].includes(p.role)) {
           for (const [i, block] of (p.content ?? []).entries()) {
             if (['input_text', 'output_text', 'text'].includes(block.type))
-              add(p.role, block.text, `text-${i}`);
+              add(
+                p.role === 'user' && (written || !typedPrompt(block.text ?? '')) ? 'event' : p.role,
+                block.text,
+                `text-${i}`,
+              );
             else omissions.add('Non-text message content is not included');
           }
         } else if (['function_call', 'custom_tool_call'].includes(p.type)) {
@@ -181,10 +224,11 @@ export function importTranscriptLines(
       }
     } else if (['user', 'assistant'].includes(row.type) && row.message) {
       const blocks = row.message.content;
-      if (typeof blocks === 'string') add(row.type, blocks, 'text');
+      const textKind = written ? 'event' : row.type;
+      if (typeof blocks === 'string') add(textKind, blocks, 'text');
       else if (Array.isArray(blocks))
         for (const [i, block] of blocks.entries()) {
-          if (block.type === 'text') add(row.type, block.text, `text-${i}`);
+          if (block.type === 'text') add(textKind, block.text, `text-${i}`);
           else if (block.type === 'tool_use')
             add(
               'tool-call',
