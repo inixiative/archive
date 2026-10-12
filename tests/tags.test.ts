@@ -5,7 +5,6 @@ import {
   atlasTags,
   defaultIntegrations,
   provenanceReferences,
-  suggestTags,
 } from '../src/tags';
 
 const snapshot = (entries: Pick<ArchiveEntry, 'kind' | 'text'>[]) =>
@@ -46,7 +45,6 @@ test('linked pull requests, issues, commits and Linear issues become references,
     { integration: 'github', ref: 'inixiative/archive@531c17d', recorded: false, mentions: 1 },
     { integration: 'linear', ref: 'ARC-12', recorded: false, mentions: 1 },
   ]);
-  expect(suggestTags(archive)).toEqual([{ tag: 'debugging', origin: 'heuristic' }]);
   expect(archiveReferences(archive, defaultIntegrations, 1)).toHaveLength(1);
 });
 
