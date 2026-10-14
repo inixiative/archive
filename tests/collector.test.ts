@@ -345,7 +345,7 @@ test('the longest root wins; subdirectories, exclusions and the catch-all route 
   }
 });
 
-test('a Codex subagent rollout is its own session, though its parent replays first', () => {
+test('a Codex subagent rollout is its own session, with its parent as lineage and without the copied parent history', () => {
   const child = '01a073a0-498b-7db2-99e3-4339c7d0058d';
   const parent = '01a0739f-c6d1-7160-a8ea-d2a555776324';
   const rows = [
@@ -356,12 +356,64 @@ test('a Codex subagent rollout is its own session, though its parent replays fir
         forked_from_id: parent,
         cwd: '/w',
         originator: 'Codex Desktop',
-        source: { subagent: { thread_spawn: { parent_thread_id: parent, depth: 1 } } },
+        model_provider: 'openai',
+        source: {
+          subagent: {
+            thread_spawn: {
+              parent_thread_id: parent,
+              depth: 1,
+              agent_nickname: 'Gibbs',
+              agent_role: 'reviewer',
+            },
+          },
+        },
       },
     },
     {
       type: 'session_meta',
       payload: { id: parent, cwd: '/w', originator: 'Codex Desktop', source: 'vscode' },
+    },
+    // The parent's history, copied in at the spawn: its archive already holds it.
+    {
+      type: 'turn_context',
+      payload: { turn_id: '01a0739f-d000-7000-8000-000000000001', model: 'gpt-6-sol' },
+    },
+    {
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'Plan the parent work' }],
+      },
+    },
+    {
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'Parent reply' }],
+      },
+    },
+    {
+      type: 'response_item',
+      payload: { type: 'function_call', name: 'shell', arguments: '{}', call_id: 'parent-call' },
+    },
+    {
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'developer',
+        content: [{ type: 'input_text', text: '<multi_agent_role>You are an agent' }],
+      },
+    },
+    { type: 'event_msg', payload: { type: 'thread_settings_applied' } },
+    {
+      type: 'turn_context',
+      payload: {
+        turn_id: '01a073a0-49a0-7000-8000-000000000002',
+        model: 'gpt-6-astra',
+        effort: 'high',
+      },
     },
     {
       type: 'response_item',
@@ -379,14 +431,48 @@ test('a Codex subagent rollout is its own session, though its parent replays fir
         content: [{ type: 'output_text', text: 'Done' }],
       },
     },
+    { type: 'event_msg', payload: { type: 'token_count', rate_limits: { plan_type: 'pro' } } },
   ];
   const snapshot = importTranscript(rows.map((r) => JSON.stringify(r)).join('\n'), {
     source: 'codex',
     sourceId: crypto.randomUUID(),
   });
   expect(snapshot.sessionId).toBe(child);
+  expect(snapshot.lineage).toEqual({
+    kind: 'subagent',
+    parentSessionId: parent,
+    agentType: 'reviewer',
+    agentName: 'Gibbs',
+    depth: 1,
+  });
+  expect(snapshot.runtime).toEqual({
+    provider: 'openai',
+    accessPath: 'subscription',
+    evidence: 'transcript',
+  });
   // The parent's meta does not make the subagent's prompt a typed one.
-  expect(snapshot.entries.map((e) => e.kind)).toEqual(['event', 'assistant']);
+  expect(snapshot.entries.map((e) => [e.kind, e.text])).toEqual([
+    ['event', 'Review this'],
+    ['assistant', 'Done'],
+  ]);
+  expect(snapshot.entries[1]).toMatchObject({ model: 'gpt-6-astra', effort: 'high' });
+  expect(snapshot.coverage.omissions).toContain(
+    'History copied from the parent session is left to the parent archive',
+  );
+  // A rollout holding only the copied history has nothing of its own yet.
+  expect(() =>
+    importTranscript(
+      rows
+        .slice(0, 8)
+        .map((r) => JSON.stringify(r))
+        .join('\n'),
+      {
+        source: 'codex',
+        sourceId: crypto.randomUUID(),
+      },
+    ),
+  ).toThrow('contain supported records');
+  // Two unrelated sessions in one file are still refused.
   const [, second] = rows;
   expect(() =>
     importTranscript(
@@ -400,6 +486,105 @@ test('a Codex subagent rollout is its own session, though its parent replays fir
       },
     ),
   ).toThrow('identity mismatch');
+});
+
+test('Claude subagent runs carry lineage from meta.json; runtime is tagged and filterable', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'archive-subagent-'));
+  const store = await freshStore();
+  const parent = 'c100a93c-aa39-490b-b4da-02e6c8c8108d';
+  try {
+    mkdirSync(join(dir, parent, 'subagents'), { recursive: true });
+    const row = (extra: object) =>
+      JSON.stringify({ sessionId: parent, cwd: '/work/a', uuid: crypto.randomUUID(), ...extra });
+    writeFileSync(
+      join(dir, `${parent}.jsonl`),
+      [
+        row({ type: 'user', message: { content: 'Plan it' } }),
+        row({
+          type: 'assistant',
+          effort: 'medium',
+          message: { model: 'claude-opus-5-5', content: [{ type: 'text', text: 'Ok' }] },
+        }),
+        row({
+          type: 'assistant',
+          quotaLimits: { rateLimitType: 'five_hour', status: 'rejected' },
+          message: { model: '<synthetic>', content: [{ type: 'text', text: 'Limit' }] },
+        }),
+      ].join('\n'),
+    );
+    const agent = join(dir, parent, 'subagents', 'agent-a0802a504cb2dd9ca');
+    writeFileSync(
+      `${agent}.jsonl`,
+      [
+        row({
+          type: 'user',
+          isSidechain: true,
+          agentId: 'a0802a504cb2dd9ca',
+          message: { content: 'Review it' },
+        }),
+        row({
+          type: 'assistant',
+          isSidechain: true,
+          agentId: 'a0802a504cb2dd9ca',
+          effort: 'high',
+          message: { model: 'claude-sonnet-5', content: [{ type: 'text', text: 'Reviewed' }] },
+        }),
+      ].join('\n'),
+    );
+    writeFileSync(
+      `${agent}.meta.json`,
+      JSON.stringify({
+        agentType: 'general-purpose',
+        description: 'Adversarial review',
+        toolUseId: 'toolu_1',
+        spawnDepth: 1,
+      }),
+    );
+    const config = {
+      directory: dir,
+      source: 'claude-code' as const,
+      projectId: 'a',
+      projectRoots: ['/work/a'],
+    };
+    expect(await collectSessions(store, config, { harness: () => 'subscription' })).toMatchObject({
+      imported: 2,
+    });
+    const listed = await store.list();
+    const run = listed.find((a) => a.lineage)!;
+    expect(run.sessionId).toBe(`${parent}/agent-a0802a504cb2dd9ca`);
+    expect(run.lineage).toEqual({
+      kind: 'subagent',
+      parentSessionId: parent,
+      agentType: 'general-purpose',
+      description: 'Adversarial review',
+      toolUseId: 'toolu_1',
+      depth: 1,
+    });
+    // The subagent's transcript is silent on access, so the harness login says it.
+    expect(run.runtime).toEqual({
+      provider: 'anthropic',
+      accessPath: 'subscription',
+      evidence: 'harness',
+    });
+    expect(run.models).toEqual([{ model: 'claude-sonnet-5', effort: 'high', entries: 1 }]);
+    const main = listed.find((a) => !a.lineage)!;
+    expect(main.runtime).toEqual({
+      provider: 'anthropic',
+      accessPath: 'subscription',
+      evidence: 'transcript',
+    });
+    expect((await store.list({ provider: 'anthropic', accessPath: 'subscription' })).length).toBe(
+      2,
+    );
+    expect(await store.list({ provider: 'openai' })).toEqual([]);
+    expect(await store.list({ accessPath: 'api' })).toEqual([]);
+    expect(
+      (await store.list({ model: 'claude-sonnet-5', effort: 'high' })).map((a) => a.id),
+    ).toEqual([run.id]);
+    expect(await store.list({ model: 'claude-sonnet-5', effort: 'medium' })).toEqual([]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('a refused session is not retried until it changes; the catch-all hands sessions to their project; a deleted archive is captured again', async () => {
