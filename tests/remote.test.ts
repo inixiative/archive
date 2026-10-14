@@ -101,3 +101,44 @@ test('localArchive reaches this machine’s server once a token exists', async (
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('the server reads gzip bodies and refuses other encodings', async () => {
+  await freshStore('serve');
+  const server = await startArchiveServer({
+    databaseUrl: testDatabaseUrl('serve'),
+    token,
+    port: 0,
+  });
+  try {
+    const info = (encoding: string, body: Uint8Array | string) =>
+      fetch(new URL('api/v1/archive/info', server.server.url), {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-encoding': encoding },
+        body,
+      });
+    const zipped = await info('gzip', Bun.gzipSync('{}'));
+    expect(zipped.status).toBe(200);
+    expect(((await zipped.json()) as { data: { sourceId: string } }).data.sourceId).toBe(
+      await server.store.sourceId(),
+    );
+    expect((await info('gzip', 'not gzip')).status).toBe(400);
+    expect((await info('br', '{}')).status).toBe(415);
+  } finally {
+    await server.close();
+  }
+});
+
+test('a refusal carries the server’s reason, even from a proxy page', async () => {
+  const refusing = (response: Response) =>
+    new ArchiveClient({
+      url: 'https://archive.test/',
+      token,
+      fetch: (async () => response) as unknown as typeof fetch,
+    }).list();
+  await expect(
+    refusing(Response.json({ error: 'Archive unavailable' }, { status: 404 })),
+  ).rejects.toThrow('Archive unavailable');
+  await expect(
+    refusing(new Response('<html><title>Blocked</title></html>', { status: 403 })),
+  ).rejects.toThrow('<title>Blocked</title>');
+});

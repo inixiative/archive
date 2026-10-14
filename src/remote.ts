@@ -45,6 +45,18 @@ export class ArchiveRequestError extends Error {
   }
 }
 
+/** The server's reason for refusing a request: its JSON `error`, else the start of the raw body (a proxy's page). */
+export async function refusalDetail(response: Response) {
+  const text = (await response.text().catch(() => '')).trim();
+  try {
+    const body = JSON.parse(text) as { error?: unknown; message?: unknown };
+    const error = body.error as { message?: unknown } | string | undefined;
+    const message = typeof error === 'string' ? error : (error?.message ?? body.message);
+    if (typeof message === 'string') return message.slice(0, 500);
+  } catch {}
+  return text.replace(/\s+/g, ' ').slice(0, 500) || undefined;
+}
+
 /**
  * An Archive server over HTTP. Collectors, the CLI and Foundry write through this; only the
  * server holds the database.
@@ -70,10 +82,12 @@ export class ArchiveClient {
         body: JSON.stringify(body),
       },
     );
-    const payload = (await response.json().catch(() => ({}))) as { data?: T; error?: string };
     if (!response.ok)
-      throw new ArchiveRequestError(response.status, payload.error ?? `Archive ${action} failed`);
-    return payload.data as T;
+      throw new ArchiveRequestError(
+        response.status,
+        (await refusalDetail(response)) ?? `Archive ${action} failed`,
+      );
+    return ((await response.json()) as { data: T }).data;
   }
   async sourceId() {
     this.cachedSourceId ??= (await this.request<{ sourceId: string }>('info')).sourceId;
