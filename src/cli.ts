@@ -101,10 +101,11 @@ export async function runCli(args = Bun.argv.slice(2)) {
   const home = resolve(v.home!),
     config = v.config ?? destinationsFile(home),
     tokenFile = v['token-file'] ? resolve(v['token-file']) : join(home, 'server.token');
-  const output = (value: unknown) => console.log(JSON.stringify(value, null, 2));
+  // Not console.log: with Prisma loaded, console.log to a pipe stops at 64 KB.
+  const output = (value: unknown) => process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
   const command = positionals[0];
   if (v.help || !command) {
-    console.log(
+    process.stdout.write(
       'Archive: init | up | down | serve | connect (setup) | preview | import | collect | list | export | tag | tags | suggest | routes | sync | search | agents\n' +
         'up | down   (the local Archive: bundled compose.yaml with Postgres, data in --home)\n' +
         'serve [--port 4700 --hostname 127.0.0.1] [--sync]   (DATABASE_URL; token from ARCHIVE_SERVER_TOKEN or --token-file)\n' +
@@ -121,7 +122,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
         'agents add-collector --name N --source codex|claude-code (--project-id ID --project-root DIR [--project-root ...] [--worktrees] [--subdirectories] | --catch-all) [--directory HISTORY] [--atlas]\n' +
         'agents remove-collector --name N | exclude [--exclude PATH ...] | server --url URL | install | uninstall | status\n' +
-        `Data commands talk to the Archive server at --url (default ${DEFAULT_URL}) with the token in --token-file (default <home>/server.token) or ARCHIVE_TOKEN.`,
+        `Data commands talk to the Archive server at --url (default ${DEFAULT_URL}) with the token in --token-file (default <home>/server.token) or ARCHIVE_TOKEN.\n`,
     );
     return;
   }

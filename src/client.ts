@@ -6,7 +6,7 @@ import {
   destinationToken,
   destinationUrl,
 } from './config';
-import type { RoutingPreview, SyncResult } from './remote';
+import { ArchiveRequestError, type RoutingPreview, refusalDetail, type SyncResult } from './remote';
 import type { ArchiveStore } from './store';
 
 export { type ArchiveDestination, archiveDestinationSchema } from './config';
@@ -30,11 +30,20 @@ export async function archiveRequest(
     method: 'POST',
     redirect: 'error',
     signal: AbortSignal.timeout(action === 'ingest' ? sessionWriteTimeoutMs : 30_000),
-    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-    body: JSON.stringify(body),
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+      'content-encoding': 'gzip',
+    },
+    body: Bun.gzipSync(JSON.stringify(body)),
   });
-  if (!response.ok)
-    throw new Error(`Archive request rejected (${response.status}); local archive retained`);
+  if (!response.ok) {
+    const detail = await refusalDetail(response);
+    throw new ArchiveRequestError(
+      response.status,
+      `Archive request rejected (${response.status})${detail ? `: ${detail}` : ''}; local archive retained`,
+    );
+  }
   return response.json() as Promise<{ data: any }>;
 }
 
@@ -135,9 +144,9 @@ export type SyncBackoff = Map<string, { failures: number; until: number; digest?
 const BACKOFF_BASE_MS = 30_000;
 const BACKOFF_MAX_MS = 30 * 60_000;
 /** No HTTP answer, or a 5xx: the destination is down, not refusing this archive. */
-const outage = (message: string) => {
-  const status = Number(/\((\d{3})\)/.exec(message)?.[1]);
-  return !status || status >= 500;
+const outage = (error: unknown) => {
+  const status = (error as { status?: unknown } | null)?.status;
+  return typeof status !== 'number' || status >= 500;
 };
 
 export async function syncArchives(
@@ -185,7 +194,7 @@ export async function syncArchives(
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (outage(message)) {
+        if (outage(error)) {
           const failures = (circuit?.failures ?? 0) + 1;
           backoff?.set(down, { failures, until: now() + delay(failures) });
         } else {

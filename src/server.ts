@@ -88,13 +88,24 @@ export function createArchiveHandler(
       return json({ error: 'Unauthorized' }, 401);
     if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
     try {
-      // Enforce a limit for both fixed-length and streamed/chunked requests.
-      const reader = request.body?.getReader();
+      // Clients gzip uploads: smaller, and a proxy WAF (Render's Cloudflare) can't misread session text as an attack.
+      const encoding = request.headers.get('content-encoding')?.trim().toLowerCase() || 'identity';
+      if (encoding !== 'identity' && encoding !== 'gzip')
+        return json({ error: 'Unsupported content encoding' }, 415);
+      // Enforce a limit for both fixed-length and streamed/chunked requests, after decompression.
+      const reader = (
+        encoding === 'gzip'
+          ? request.body?.pipeThrough(new DecompressionStream('gzip'))
+          : request.body
+      )?.getReader();
       if (!reader) return json({ error: 'Body required' }, 400);
       const chunks: Uint8Array[] = [];
       let size = 0;
       while (true) {
-        const item = await reader.read();
+        const item = await reader.read().catch((error) => {
+          if (encoding === 'gzip') throw new SyntaxError('Invalid gzip body');
+          throw error;
+        });
         if (item.done) break;
         size += item.value.length;
         if (size > 65_000_000) {

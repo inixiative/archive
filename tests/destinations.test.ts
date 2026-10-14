@@ -180,7 +180,9 @@ test('a failed delivery backs off, doubling per failure, and clears once deliver
     port: 0,
     fetch: async (request) => {
       if (!accept) return Response.json({ error: 'Invalid archive request' }, { status: 400 });
-      const { snapshot: sent } = (await request.json()) as { snapshot: unknown };
+      const { snapshot: sent } = JSON.parse(
+        Buffer.from(Bun.gunzipSync(await request.arrayBuffer())).toString('utf8'),
+      ) as { snapshot: unknown };
       return Response.json({ data: await (await freshStore('remote')).capture(sent) });
     },
   });
