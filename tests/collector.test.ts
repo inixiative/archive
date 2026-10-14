@@ -345,7 +345,7 @@ test('the longest root wins; subdirectories, exclusions and the catch-all route 
   }
 });
 
-test('a Codex subagent rollout is its own session, with its parent as lineage', () => {
+test('a Codex subagent rollout is its own session, with its parent as lineage and without the copied parent history', () => {
   const child = '01a073a0-498b-7db2-99e3-4339c7d0058d';
   const parent = '01a0739f-c6d1-7160-a8ea-d2a555776324';
   const rows = [
@@ -373,7 +373,48 @@ test('a Codex subagent rollout is its own session, with its parent as lineage', 
       type: 'session_meta',
       payload: { id: parent, cwd: '/w', originator: 'Codex Desktop', source: 'vscode' },
     },
-    { type: 'turn_context', payload: { model: 'gpt-6-astra', effort: 'high' } },
+    // The parent's history, copied in at the spawn: its archive already holds it.
+    {
+      type: 'turn_context',
+      payload: { turn_id: '01a0739f-d000-7000-8000-000000000001', model: 'gpt-6-sol' },
+    },
+    {
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'Plan the parent work' }],
+      },
+    },
+    {
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'Parent reply' }],
+      },
+    },
+    {
+      type: 'response_item',
+      payload: { type: 'function_call', name: 'shell', arguments: '{}', call_id: 'parent-call' },
+    },
+    {
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'developer',
+        content: [{ type: 'input_text', text: '<multi_agent_role>You are an agent' }],
+      },
+    },
+    { type: 'event_msg', payload: { type: 'thread_settings_applied' } },
+    {
+      type: 'turn_context',
+      payload: {
+        turn_id: '01a073a0-49a0-7000-8000-000000000002',
+        model: 'gpt-6-astra',
+        effort: 'high',
+      },
+    },
     {
       type: 'response_item',
       payload: {
@@ -410,8 +451,27 @@ test('a Codex subagent rollout is its own session, with its parent as lineage', 
     evidence: 'transcript',
   });
   // The parent's meta does not make the subagent's prompt a typed one.
-  expect(snapshot.entries.map((e) => e.kind)).toEqual(['event', 'assistant']);
+  expect(snapshot.entries.map((e) => [e.kind, e.text])).toEqual([
+    ['event', 'Review this'],
+    ['assistant', 'Done'],
+  ]);
   expect(snapshot.entries[1]).toMatchObject({ model: 'gpt-6-astra', effort: 'high' });
+  expect(snapshot.coverage.omissions).toContain(
+    'History copied from the parent session is left to the parent archive',
+  );
+  // A rollout holding only the copied history has nothing of its own yet.
+  expect(() =>
+    importTranscript(
+      rows
+        .slice(0, 8)
+        .map((r) => JSON.stringify(r))
+        .join('\n'),
+      {
+        source: 'codex',
+        sourceId: crypto.randomUUID(),
+      },
+    ),
+  ).toThrow('contain supported records');
   // Two unrelated sessions in one file are still refused.
   const [, second] = rows;
   expect(() =>

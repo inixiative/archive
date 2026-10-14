@@ -109,6 +109,7 @@ export function importTranscriptLines(
   let scripted = false;
   let metaSeen = false;
   let lineage: ArchiveLineage | undefined;
+  let copiedHistory = false;
   let provider: string | undefined = options.source === 'claude-code' ? 'anthropic' : undefined;
   // Only a subscription's rate-limit windows prove the access path; an API key leaves no mark.
   let subscription = false;
@@ -159,6 +160,19 @@ export function importTranscriptLines(
         };
       const named = text(meta.model_provider)?.toLowerCase();
       provider = named && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(named) ? named : 'openai';
+      copiedHistory = Boolean(lineage);
+      continue;
+    }
+    // A forked or subagent rollout opens with a copy of its ancestors' history, which their own
+    // archives already hold. Ids are UUIDv7, so the copy ends at the first turn that started
+    // after this session did.
+    if (options.source === 'codex' && copiedHistory) {
+      const turnId = row.type === 'turn_context' ? text(row.payload?.turn_id) : undefined;
+      if (!turnId || !sessionId || turnId <= sessionId) {
+        omissions.add('History copied from the parent session is left to the parent archive');
+        continue;
+      }
+      copiedHistory = false;
     }
     if (
       options.source === 'codex' &&
