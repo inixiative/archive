@@ -4,11 +4,12 @@ import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { verifySignetProof } from '@inixiative/signet';
-import { pairWithKingdom } from '../src/kingdom';
+import { requestRegistrationSchema } from '@inixiative/signet/contracts';
+import { pairingRequest, pairWithKingdom } from '../src/kingdom';
 
 const fakeKingdom = () => {
   const nonces = new Set<string>();
-  const state = { polls: 0, collected: 0, actions: [] as string[] };
+  const state = { polls: 0, collected: 0, actions: [] as string[], requests: [] as unknown[] };
   let inquiryId = crypto.randomUUID();
   const signetId = crypto.randomUUID();
   const integrationId = crypto.randomUUID();
@@ -45,6 +46,7 @@ const fakeKingdom = () => {
       state.actions.push(action);
       if (action === 'registerInstallation') return data({ installationId: crypto.randomUUID() });
       if (action === 'requestRegistration') {
+        state.requests.push(requestRegistrationSchema.parse(await request.json()).terms);
         state.polls = 0;
         inquiryId = crypto.randomUUID();
         return data({
@@ -143,6 +145,7 @@ test('pair registers the Archive, waits for the claim, confirms the owner and co
       name: 'Laptop Archive',
       sourceId: crypto.randomUUID(),
       directory,
+      request: pairingRequest({ kingdom: kingdom.url, organization: 'acme', destinations: [] }),
       onReview: (review) => reviews.push(review.reviewCode),
       confirmOwner: async ({ ownerName }) => {
         owners.push(ownerName);
@@ -151,6 +154,10 @@ test('pair registers the Archive, waits for the claim, confirms the owner and co
       socketOptions: { pollMs: 10, retryBaseMs: 10_000 },
     });
     expect(reviews).toEqual(['ABCDEF123456']);
+    expect(kingdom.state.requests[0]).toMatchObject({
+      owner: { ownerModel: 'Organization', organization: 'acme' },
+      resources: [{ resourceKind: 'archiveLibrary', operations: ['sessions.write'], lens: {} }],
+    });
     expect(owners).toEqual(['Acme']);
     expect(paired.libraries).toEqual([
       { integrationId: kingdom.hostedId, resourceId: kingdom.resourceId, name: 'Acme Archive' },
@@ -167,6 +174,7 @@ test('pair registers the Archive, waits for the claim, confirms the owner and co
         name: 'Laptop Archive',
         sourceId: crypto.randomUUID(),
         directory,
+        request: { resources: [] },
         onReview: () => {},
         confirmOwner: async () => false,
         socketOptions: { pollMs: 10, retryBaseMs: 10_000 },
@@ -177,4 +185,44 @@ test('pair registers the Archive, waits for the claim, confirms the owner and co
     kingdom.server.stop(true);
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('pair asks for the named libraries, else the ones its Kingdom destinations name', () => {
+  const kingdom = 'https://api.kingdom.example.com';
+  const configured = crypto.randomUUID();
+  const named = crypto.randomUUID();
+  const destinations = [
+    {
+      kind: 'kingdom' as const,
+      projectId: 'kingdom',
+      url: `${kingdom}/`,
+      credentialFile: '/tmp/signet.json',
+      integrationId: crypto.randomUUID(),
+      resourceId: configured,
+    },
+    {
+      kind: 'kingdom' as const,
+      projectId: 'other',
+      url: 'https://api.elsewhere.example.com',
+      credentialFile: '/tmp/signet.json',
+      integrationId: crypto.randomUUID(),
+      resourceId: crypto.randomUUID(),
+    },
+  ];
+  const operations = ['sessions.write'];
+  expect(pairingRequest({ kingdom, destinations })).toEqual({
+    resources: [{ resourceId: configured, operations }],
+  });
+  expect(
+    pairingRequest({ kingdom, libraries: [named, 'inixiative Archive'], destinations }),
+  ).toEqual({
+    resources: [
+      { resourceId: named, operations },
+      { resourceKind: 'archiveLibrary', resourceName: 'inixiative Archive', operations },
+    ],
+  });
+  expect(pairingRequest({ kingdom, organization: 'inixiative', destinations: [] })).toEqual({
+    owner: { ownerModel: 'Organization', organization: 'inixiative' },
+    resources: [{ resourceKind: 'archiveLibrary', operations }],
+  });
 });

@@ -1,6 +1,8 @@
 import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { pairInstallation, SignetClient } from '@inixiative/signet';
+import { kingdomUrl, pairInstallation, SignetClient } from '@inixiative/signet';
+import type { RequestedOwner, RequestedResource } from '@inixiative/signet/contracts';
+import { z } from 'zod';
 import type { ArchiveDestination } from './config';
 
 type KingdomDestination = Extract<ArchiveDestination, { kind: 'kingdom' }>;
@@ -27,11 +29,51 @@ export async function writableLibraries(credentialFile: string) {
   );
 }
 
+/**
+ * What a pair asks Kingdom for: `sessions.write` on the libraries named (a UUID is a resource id,
+ * anything else a library name), else on the libraries this Archive's Kingdom destinations already
+ * name, else on the owner's Archive libraries; and the owner, when an organization is named.
+ */
+export function pairingRequest(input: {
+  kingdom: string;
+  organization?: string;
+  libraries?: string[];
+  destinations: ArchiveDestination[];
+}): { owner?: RequestedOwner; resources: RequestedResource[] } {
+  const operations = ['sessions.write'];
+  const named = (input.libraries ?? []).map((library) =>
+    z.uuid().safeParse(library).success
+      ? { resourceId: library, operations }
+      : { resourceKind: 'archiveLibrary', resourceName: library, operations },
+  );
+  const configured = [
+    ...new Set(
+      input.destinations.flatMap((destination) =>
+        destination.kind === 'kingdom' && kingdomUrl(destination.url) === kingdomUrl(input.kingdom)
+          ? [destination.resourceId]
+          : [],
+      ),
+    ),
+  ].map((resourceId) => ({ resourceId, operations }));
+  const resources = named.length
+    ? named
+    : configured.length
+      ? configured
+      : [{ resourceKind: 'archiveLibrary', operations }];
+  return {
+    ...(input.organization
+      ? { owner: { ownerModel: 'Organization' as const, organization: input.organization } }
+      : {}),
+    resources,
+  };
+}
+
 type Pairing = {
   kingdom: string;
   name: string;
   sourceId: string;
   directory: string;
+  request: { owner?: RequestedOwner; resources: RequestedResource[] };
   onReview: (review: { reviewCode: string; review: string; expiresAt: string }) => void;
   confirmOwner: (owner: { ownerName: string | null; owner: unknown }) => Promise<boolean>;
   onError?: (error: unknown) => void;
@@ -52,7 +94,7 @@ export async function pairWithKingdom(input: Pairing) {
     terms: {
       name: input.name,
       lifecycle: 'ongoing',
-      resources: [],
+      ...input.request,
       expiresAt: null,
       maxRequests: null,
       maxConcurrent: 4,

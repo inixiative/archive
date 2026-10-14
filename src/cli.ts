@@ -28,7 +28,7 @@ import {
 } from './config';
 import { stampedRun } from './exemption';
 import { importTranscriptFile } from './import-file';
-import { pairWithKingdom, verifyKingdomDestination } from './kingdom';
+import { pairingRequest, pairWithKingdom, verifyKingdomDestination } from './kingdom';
 import { previewImports } from './preview';
 import { ArchiveClient, DEFAULT_URL } from './remote';
 import { startArchiveServer } from './server';
@@ -57,6 +57,8 @@ export async function runCli(args = Bun.argv.slice(2)) {
       'resource-id': { type: 'string' },
       'credential-file': { type: 'string' },
       kingdom: { type: 'string' },
+      organization: { type: 'string' },
+      library: { type: 'string', multiple: true },
       'token-env': { type: 'string' },
       'token-file': { type: 'string' },
       file: { type: 'string' },
@@ -113,7 +115,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'export --id ID | tag --id ID [--tag TAG ...] [--untag TAG ...]\n' +
         'tags list | tags define --tag TAG [--description TEXT] | tags remove --tag TAG   (the category tags the archive offers)\n' +
         'suggest [--limit N] [--batch 8] [--concurrency 2] [--model claude-haiku-5-5] [--refresh]   (tag suggestions on the Claude subscription; test and Oracle runs are exempt)\n' +
-        'pair --kingdom KINGDOM_API_URL [--name NAME] [--yes]   (register this Archive with Kingdom; claim the review code there, then confirm the owner)\n' +
+        "pair --kingdom KINGDOM_API_URL [--name NAME] [--organization SLUG|ID] [--library ID|NAME ...] [--yes]   (register this Archive with Kingdom, asking for sessions.write on those libraries, by default the ones its Kingdom destinations name, else the owner's; claim the review code there, then confirm the owner)\n" +
         'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH)   (a remote Archive, for serve --sync)\n' +
         'connect --kind kingdom --url KINGDOM_API_URL --credential-file PATH --integration-id UUID --resource-id UUID --project-id ID   (a hosted Archive through Kingdom)\n' +
         'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
@@ -237,6 +239,12 @@ export async function runCli(args = Bun.argv.slice(2)) {
         name: v.name ?? `${hostname()} Archive`,
         sourceId: await local.sourceId(),
         directory: kingdomDirectory(home),
+        request: pairingRequest({
+          kingdom: v.kingdom,
+          organization: v.organization,
+          libraries: v.library,
+          destinations: readDestinations(config),
+        }),
         onReview: (review) => console.error(JSON.stringify(review)),
         onError: (error) =>
           console.error(`Still waiting: ${error instanceof Error ? error.message : String(error)}`),

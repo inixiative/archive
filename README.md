@@ -73,12 +73,15 @@ Kingdom is the permission hub. Your machine's Archive talks directly only to loc
 First, pair this Archive with Kingdom:
 
 ```sh
-bun run archive pair --kingdom https://api.your-kingdom.example --name "Work laptop"
+bun run archive pair --kingdom https://api.your-kingdom.example --name "Work laptop" --organization your-org
 ```
 
-`pair` registers this Archive with Kingdom as an **Installation**, named by a key kept in `<home>/config/kingdom/<kingdom host>/`. The same key is reused for every owner it registers with. It then asks to be registered as an integration and prints a review code with a link.
+`pair` registers this Archive with Kingdom as an **Installation**, named by a key kept in `<home>/config/kingdom/<kingdom host>/`. The same key is reused for every owner it registers with. It then asks to be registered as an integration, saying what it needs, and prints a review code with a link:
 
-Open the link, choose the owner and the hosted Archives this machine may write to, and approve. The command waits for approval, then shows which owner it was registered with and asks you to accept. Pass `--yes` to accept without the prompt; without a terminal, `--yes` is required. Only then does it collect the Signet (0600) and list the libraries it may write to. Confirming the owner protects you if someone else claimed your code into their own owner.
+- `--organization SLUG|ID`: the organization it belongs to;
+- `--library ID|NAME` (repeatable): `sessions.write` on those hosted libraries. Without it, the libraries this Archive's Kingdom destinations already name, or else every hosted Archive library of the owner.
+
+Open the link. The review opens with that owner and those libraries selected; change them if you need to, and approve. The command waits for approval, then shows which owner it was registered with and asks you to accept. Pass `--yes` to accept without the prompt; without a terminal, `--yes` is required. Only then does it collect the Signet (0600) and list the libraries it may write to. Confirming the owner protects you if someone else claimed your code into their own owner.
 
 Next, route a project to one of those libraries:
 
