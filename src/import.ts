@@ -109,6 +109,9 @@ export function importTranscriptLines(
   let scripted = false;
   let metaSeen = false;
   let lineage: ArchiveLineage | undefined;
+  let provider: string | undefined = options.source === 'claude-code' ? 'anthropic' : undefined;
+  // Only a subscription's rate-limit windows prove the access path; an API key leaves no mark.
+  let subscription = false;
   const text = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
   const optional = <K extends string>(key: K, value: string | undefined) =>
     (value ? { [key]: value } : {}) as Partial<Record<K, string>>;
@@ -154,7 +157,23 @@ export function importTranscriptLines(
           ...optional('agentName', text(spawn?.agent_nickname ?? meta.agent_nickname)),
           ...(Number.isInteger(spawn?.depth) ? { depth: spawn.depth } : {}),
         };
+      const named = text(meta.model_provider)?.toLowerCase();
+      provider = named && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(named) ? named : 'openai';
     }
+    if (
+      options.source === 'codex' &&
+      row.type === 'event_msg' &&
+      row.payload?.type === 'token_count' &&
+      text(row.payload.rate_limits?.plan_type)
+    )
+      subscription = true;
+    if (
+      options.source === 'claude-code' &&
+      row.quotaLimits &&
+      typeof row.quotaLimits === 'object' &&
+      text(row.quotaLimits.rateLimitType)
+    )
+      subscription = true;
     if (options.source === 'claude-code' && row.sessionId) {
       // Subagent transcripts reuse their parent's sessionId; each is its own archive.
       const id =
@@ -317,6 +336,12 @@ export function importTranscriptLines(
     sessionId,
     title,
     projectId: options.projectId,
+    runtime: {
+      provider: provider ?? 'openai',
+      accessPath: subscription ? 'subscription' : 'unknown',
+      ...(subscription ? { evidence: 'transcript' } : {}),
+    },
+    ...(lineage ? { lineage } : {}),
     tags: [],
     capturedAt: Date.now(),
     coverage: {
