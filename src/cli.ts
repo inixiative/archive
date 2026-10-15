@@ -106,12 +106,13 @@ export async function runCli(args = Bun.argv.slice(2)) {
   const command = positionals[0];
   if (v.help || !command) {
     process.stdout.write(
-      'Archive: init | up | down | serve | connect (setup) | preview | import | collect | list | export | tag | tags | suggest | routes | sync | search | agents\n' +
+      'Archive: init | up | down | serve | connect (setup) | preview | import | collect | repair | list | export | tag | tags | suggest | routes | sync | search | agents\n' +
         'up | down   (the local Archive: bundled compose.yaml with Postgres, data in --home)\n' +
         'serve [--port 4700 --hostname 127.0.0.1] [--sync]   (DATABASE_URL; token from ARCHIVE_SERVER_TOKEN or --token-file)\n' +
         'import --file PATH --source codex|claude-code|chatgpt --project-id ID [--tag TAG]\n' +
         'collect --directory HISTORY --source codex|claude-code (--project-root CWD [--project-root ...] --project-id ID [--worktrees] [--subdirectories] | --catch-all) [--exclude PATH ...] [--atlas] [--watch]\n' +
         'collect --agent NAME [--watch]   (one collector from agents.json, routed against the others, re-read each scan)\n' +
+        'repair [--agent NAME]   (every collector once, from the transcripts still on disk: re-captures each session as it routes now, taking over one another project holds, and reports every session re-imported or refused)\n' +
         'list | search --query TEXT [--remote]   [--project-id ID] [--source S] [--tag T] [--suggested T] [--exempt exclude|include|only] [--provider P] [--model M] [--effort E] [--access-path subscription|api|unknown]\n' +
         'export --id ID | tag --id ID [--tag TAG ...] [--untag TAG ...]\n' +
         'tags list | tags define --tag TAG [--description TEXT] | tags remove --tag TAG   (the category tags the archive offers)\n' +
@@ -551,6 +552,22 @@ export async function runCli(args = Bun.argv.slice(2)) {
     } while (v.watch && !stopped);
     process.removeListener('SIGINT', stop);
     process.removeListener('SIGTERM', stop);
+  } else if (command === 'repair') {
+    // Every collector once, as the collectors route today, taking over sessions held under another
+    // project (a row that holds a subagent's transcript under its parent's key, from before 0.2).
+    const config = readAgents(agentsFile);
+    if (!config) throw new Error('No agents.json; declare agents first');
+    const names = v.agent ? [v.agent] : config.collectors.map((c) => c.name);
+    const results = [];
+    for (const name of names) {
+      const { collector, peers, exclude, server } = collectorPlan(config, name);
+      const client = new ArchiveClient({ url: v.url ?? server?.url ?? DEFAULT_URL, token });
+      const started = Date.now();
+      const result = await collectSessions(client, collector, { peers, exclude, repair: true });
+      results.push({ collector: name, ...result, ms: Date.now() - started });
+      if (result.failed) process.exitCode = 1;
+    }
+    output(results);
   } else if (command === 'search')
     output(
       await archive.search({

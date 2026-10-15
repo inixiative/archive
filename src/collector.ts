@@ -11,7 +11,8 @@ import {
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { cwdRunTag, temporaryRoots } from './exemption';
-import { importTranscriptFile } from './import-file';
+import { claudeSessionId } from './import';
+import { importTranscriptFile, transcriptAgentId } from './import-file';
 import { archiveKey, archiveSnapshotSchema, snapshotDigest, UNROUTED } from './index';
 import type { ArchiveClient } from './remote';
 import { type AtlasFileConcepts, atlasTags, provenanceReferences } from './tags';
@@ -94,10 +95,7 @@ export function sessionMetadata(
     const meta = source === 'codex' ? (row.type === 'session_meta' ? row.payload : undefined) : row;
     if (typeof meta?.cwd !== 'string' || !isAbsolute(meta.cwd)) continue;
     const text = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
-    const claudeId =
-      text(row.sessionId) && row.isSidechain && text(row.agentId)
-        ? `${row.sessionId}/agent-${row.agentId}`
-        : text(row.sessionId);
+    const claudeId = claudeSessionId(row, transcriptAgentId(file));
     return source === 'codex'
       ? {
           cwd: resolve(meta.cwd),
@@ -256,7 +254,24 @@ export interface CollectOptions {
     directory: string,
   ) => 'subscription' | 'api' | undefined;
   now?: () => number;
+  /**
+   * Re-capture every session as it routes now, taking over one another project holds: a row
+   * captured before subagent transcripts had their own identity holds a subagent's content under
+   * its parent's key and the subagent's project, and the guard below would otherwise refuse the
+   * parent's own transcript forever. Each session re-imported, and each refusal with its reason,
+   * is reported.
+   */
+  repair?: boolean;
 }
+
+export type CollectResult = {
+  imported: number;
+  unchanged: number;
+  skipped: number;
+  failed: number;
+  repaired?: { file: string; sessionId: string; projectId: string; previousProjectId?: string }[];
+  refused?: { file: string; reason: string }[];
+};
 
 /** A rejection the same snapshot will get again: invalid input or a refused write, not an outage. */
 const deterministic = (error: unknown) => {
@@ -278,7 +293,18 @@ export async function collectSessions(
   const exclude = options.exclude ?? defaultExclusions();
   const cache: CollectorCache = options.cache ?? new Map();
   const routing = JSON.stringify([sourceId, config, peers, exclude]);
-  const result = { imported: 0, unchanged: 0, skipped: 0, failed: 0 };
+  const result: CollectResult = { imported: 0, unchanged: 0, skipped: 0, failed: 0 };
+  if (options.repair) {
+    result.repaired = [];
+    result.refused = [];
+  }
+  const refuse = (file: string, error: unknown) => {
+    result.failed++;
+    result.refused?.push({
+      file,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+  };
   // Per scan: checkouts change between scans.
   const rootSets = new Map<CollectionSource, Set<string>>();
   const roots = (collector: CollectionSource) => {
@@ -364,9 +390,9 @@ export async function collectSessions(
           sourceId,
           projectId: config.projectId,
         });
-      } catch {
+      } catch (error) {
         // The same bytes fail the same way; a partial file is retried once it changes.
-        result.failed++;
+        refuse(file, error);
         remember('failed', meta);
         continue;
       }
@@ -403,8 +429,9 @@ export async function collectSessions(
       const id = archiveKey(snapshot);
       const old = await archive.head(id);
       // A session belongs to one project; only one the catch-all held moves to its routed project.
-      if (old && old.projectId !== config.projectId && old.projectId !== UNROUTED) {
-        result.failed++;
+      const moved = old && old.projectId !== config.projectId && old.projectId !== UNROUTED;
+      if (moved && !options.repair) {
+        refuse(file, new Error(`Session is held by project ${old.projectId}`));
         remember('failed', meta);
         continue;
       }
@@ -413,9 +440,9 @@ export async function collectSessions(
       let digest: string;
       try {
         digest = snapshotDigest(archiveSnapshotSchema.parse(snapshot));
-      } catch {
+      } catch (error) {
         // Over the archive's limits: the same bytes are refused again.
-        result.failed++;
+        refuse(file, error);
         remember('failed', meta);
         continue;
       }
@@ -425,15 +452,22 @@ export async function collectSessions(
           const captured = await archive.capture(snapshot);
           digest = captured.digest;
           result[captured.changed ? 'imported' : 'unchanged']++;
+          if (captured.changed)
+            result.repaired?.push({
+              file,
+              sessionId: snapshot.sessionId,
+              projectId: config.projectId,
+              ...(moved ? { previousProjectId: old.projectId ?? undefined } : {}),
+            });
         } catch (error) {
-          result.failed++;
+          refuse(file, error);
           if (deterministic(error)) remember('failed', meta);
           continue;
         }
       }
       remember('unchanged', meta, { id, digest });
-    } catch {
-      result.failed++;
+    } catch (error) {
+      refuse(file, error);
     } // Partial/malformed files remain intact and retry on the next scan.
   }
   return result;
