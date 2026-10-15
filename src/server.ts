@@ -12,7 +12,13 @@ import {
 import { archiveReferenceSchema, archiveSnapshotSchema, selectChunks } from './index';
 import { KingdomGrantMissing, pairedDestination, pairedLibraries } from './kingdom';
 import { CLAIM_SOURCES } from './schemas';
-import { ArchiveConflict, ArchiveStore, archiveSettingsSchema, tagDefinitionSchema } from './store';
+import {
+  ArchiveConflict,
+  ArchiveStore,
+  archiveSettingsSchema,
+  ClaimHeld,
+  tagDefinitionSchema,
+} from './store';
 import type { SuggestionResult } from './suggest';
 
 const ingestSchema = z.strictObject({
@@ -71,8 +77,8 @@ const claimHoldSchema = z.strictObject({
     .max(24 * 60 * 60_000),
   sessions: z.array(claimSession).min(1).max(500),
 });
-const claimFulfilSchema = claimSession.extend({ archiveId });
-const claimStateSchema = claimSession;
+const claimFulfilSchema = claimSession.extend({ claimant: z.string().min(1).max(256), archiveId });
+const claimStateSchema = claimSession.extend({ modifiedAt: z.number().optional() });
 const tagRemoveSchema = tagDefinitionSchema.pick({ tag: true, actorId: true });
 const destinationListSchema = z.strictObject({ projectId: filterFields.projectId });
 const kingdomRouteSchema = kingdomDestinationSchema.pick({
@@ -212,7 +218,9 @@ export function createArchiveHandler(
       }
       if (path === '/api/v1/archive/claims/state') {
         const input = claimStateSchema.parse(body);
-        return json({ data: { state: await store.claimState(input.source, input.sessionId) } });
+        return json({
+          data: await store.claimState(input.source, input.sessionId, input.modifiedAt),
+        });
       }
       if (path === '/api/v1/archive/suggestions/queue') {
         const queue = await store.suggestionQueue(suggestionQueueSchema.parse(body));
@@ -298,7 +306,10 @@ export function createArchiveHandler(
       }
       return json({ error: 'Not found' }, 404);
     } catch (error) {
-      if (error instanceof ArchiveConflict) return json({ error: error.message }, 409);
+      if (error instanceof ArchiveConflict || error instanceof ClaimHeld)
+        return json({ error: error.message }, 409);
+      if (error instanceof Error && error.message === 'Archive unavailable')
+        return json({ error: error.message }, 404);
       if (error instanceof KingdomGrantMissing) return json({ error: error.message }, 403);
       if (error instanceof z.ZodError || error instanceof SyntaxError)
         return json({ error: 'Invalid archive request' }, 400);

@@ -139,12 +139,24 @@ export class ArchiveClient {
     return this.request<{ expiresAt: number }>('claims/hold', input);
   }
   /** This writer stored its own version (`archiveId`) of a session it claimed. */
-  fulfilClaim(input: { source: ClaimSource; sessionId: string; archiveId: string }) {
+  fulfilClaim(input: {
+    claimant: string;
+    source: ClaimSource;
+    sessionId: string;
+    archiveId: string;
+  }) {
     return this.request<{ fulfilledBy: string; superseded: string[] }>('claims/fulfil', input);
   }
-  /** Whether a native session is left to its claimant (`live`, `fulfilled`) or captured (`lapsed`, `none`). */
-  async claimState(source: ClaimSource, sessionId: string) {
-    return (await this.request<{ state: ClaimState }>('claims/state', { source, sessionId })).state;
+  /**
+   * Whether a native session (its transcript modified at `modifiedAt`) is left to its claimant
+   * (`live` until `until`, `fulfilled`) or captured (`lapsed`, `none`).
+   */
+  claimState(source: ClaimSource, sessionId: string, modifiedAt?: number) {
+    return this.request<{ state: ClaimState; until?: number }>('claims/state', {
+      source,
+      sessionId,
+      ...(modifiedAt !== undefined ? { modifiedAt } : {}),
+    });
   }
   read(id: string, revision?: number) {
     return this.request<{

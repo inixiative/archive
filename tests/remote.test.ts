@@ -143,7 +143,7 @@ test('a refusal carries the server’s reason, even from a proxy page', async ()
   ).rejects.toThrow('<title>Blocked</title>');
 });
 
-test('claims over HTTP: hold renews a lease, state reports it, fulfil needs a claim', async () => {
+test('claims over HTTP: hold renews a lease, state reports it, fulfil needs the claimant and an archive', async () => {
   await freshStore('serve');
   const server = await startArchiveServer({
     databaseUrl: testDatabaseUrl('serve'),
@@ -152,24 +152,64 @@ test('claims over HTTP: hold renews a lease, state reports it, fulfil needs a cl
   });
   try {
     const client = new ArchiveClient({ url: server.server.url.href, token });
-    expect(await client.claimState('codex', 'thread-1')).toBe('none');
+    expect(await client.claimState('codex', 'thread-1')).toEqual({ state: 'none' });
     const { expiresAt } = await client.holdClaims({
       claimant: 'foundry',
       ttlMs: 60_000,
       sessions: [{ source: 'codex', sessionId: 'thread-1' }],
     });
     expect(expiresAt).toBeGreaterThan(Date.now());
-    expect(await client.claimState('codex', 'thread-1')).toBe('live');
-    expect(
-      await client.fulfilClaim({
+    expect(await client.claimState('codex', 'thread-1')).toEqual({
+      state: 'live',
+      until: expiresAt,
+    });
+    await expect(
+      client.holdClaims({
+        claimant: 'someone-else',
+        ttlMs: 60_000,
+        sessions: [{ source: 'codex', sessionId: 'thread-1' }],
+      }),
+    ).rejects.toThrow('claimed by another writer');
+    await expect(
+      client.fulfilClaim({
+        claimant: 'foundry',
         source: 'codex',
         sessionId: 'thread-1',
         archiveId: 'a'.repeat(64),
       }),
-    ).toEqual({ fulfilledBy: 'a'.repeat(64), superseded: [] });
-    expect(await client.claimState('codex', 'thread-1')).toBe('fulfilled');
+    ).rejects.toThrow('Archive unavailable');
+    const stitched = await client.capture({
+      schemaVersion: 1,
+      sourceId: await client.sourceId(),
+      source: 'foundry',
+      sessionId: 'thread-1',
+      title: 'Stitched',
+      tags: [],
+      goalIds: [],
+      runIds: [],
+      capturedAt: Date.now(),
+      coverage: { reasoning: 'unavailable', completeness: 'partial', omissions: [] },
+      entries: [{ id: 'm1', kind: 'user', text: 'Hi', timestamp: 1, sourceRef: 'message:m1' }],
+    });
+    expect(
+      await client.fulfilClaim({
+        claimant: 'foundry',
+        source: 'codex',
+        sessionId: 'thread-1',
+        archiveId: stitched.id,
+      }),
+    ).toEqual({ fulfilledBy: stitched.id, superseded: [] });
+    expect(await client.claimState('codex', 'thread-1', Date.now() - 60_000)).toEqual({
+      state: 'live',
+      until: expiresAt,
+    });
     await expect(
-      client.fulfilClaim({ source: 'codex', sessionId: 'unclaimed', archiveId: 'a'.repeat(64) }),
+      client.fulfilClaim({
+        claimant: 'foundry',
+        source: 'codex',
+        sessionId: 'unclaimed',
+        archiveId: stitched.id,
+      }),
     ).rejects.toThrow('Claim unavailable');
     // Only native sources are claimable.
     await expect(

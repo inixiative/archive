@@ -143,7 +143,13 @@ bun run archive list --exempt only
 
 Tag edits apply to that archive without a new revision, survive re-capture, and do not sync. Offered tags are defined archive-wide or for one actor. Each session can name its **actor**: a `user`, a `service` such as an API-key run, or a `job` (its id is the job name), with the `integrationId` it ran under when there is one. An organization's archive mostly holds its members' work, filterable per person. Entries the model produced record its `model` and `effort` (from Claude Code assistant records and Codex turn context, per turn); listings summarize them per session as `models` and filter by `model` and `effort`. Each session also records its `runtime`: `provider` (`anthropic` for Claude Code, Codex's `model_provider`) and `accessPath` (`subscription`, `api` or `unknown`), with `evidence` `transcript` when the transcript proves it (a subscription's rate-limit window: Claude Code `quotaLimits`, Codex `rate_limits.plan_type`) or `harness` when the collector read the harness login instead (Claude Code's `oauthAccount` unless its settings supply an API key; Codex `auth.json`). A subagent run is its own session with `lineage`: `kind` (`subagent` or `fork`), `parentSessionId`, and what the harness recorded (`agentType`, `agentName`, `description`, `toolUseId`, `depth`; Claude Code's `agent-<id>.meta.json`, Codex's subagent `session_meta`). A tree of sessions written by its driver (Foundry: a thread, its subagents, theirs) also carries `rootSessionId` (the tree's root) and `parentEntryId` (the parent's entry that spawned it), with `parentSessionId` the direct parent. Example: `models: [{model: 'claude-opus-5-5', effort: 'medium'}]`, `runtime: {provider: 'anthropic', accessPath: 'subscription', evidence: 'harness'}`.
 
-A driver that records its own sessions (Foundry, for the native sessions it runs) **claims** them with a lease (`claims/hold`, renewed by holding again). The collector skips a claimed session while the lease is live, or once the claim is **fulfilled** (`claims/fulfil` names the archive that covers it; a Claude subagent transcript follows its session's claim). A claim that lapses unfulfilled (the driver died) is captured raw on the next scan, so every session is kept; fulfilling it later tags that raw capture `superseded-by:<archive id>`. `claims/state` reports `none`, `live`, `fulfilled` or `lapsed`.
+A driver that records its own sessions (Foundry, for the native sessions it runs) **claims** them with a lease:
+- **Holding.** `claims/hold` takes the lease, and holding again renews it. A re-hold also reopens a fulfilled claim. Another claimant's live lease is never taken over.
+- **What the collector skips.** It skips a claimed session while the lease is live, or once the claim is **fulfilled** and the transcript has not changed since. `claims/fulfil` names this store's archive that covers the session, and only the claimant can fulfil.
+- **What it falls back to.** Every session is kept. A lapsed, unfulfilled claim (the driver died), or a change made after fulfilment with no live lease, is captured raw on the next scan.
+- **Superseded captures.** A raw capture of a fulfilled session is marked `supersededBy` the driver's archive. It is kept, and never delivered onward.
+- **Subagents.** A Claude subagent transcript follows its session's claim. A Codex sub-agent thread is its own session, so the driver claims each one.
+- **Checking.** `claims/state` reports `none`, `live` (with `until`), `fulfilled` or `lapsed`. The collector asks before it parses a transcript, and asks again when a lease it saw runs out.
 
 The **retention** setting (`retentionDays`, off by default) deletes archives whose latest capture is older than that, at server start and hourly. It deletes only from the archive it is set on; deletions never sync.
 
@@ -161,9 +167,9 @@ All data endpoints are `POST /api/v1/archive/<action>` with a JSON body and `Aut
 | `delete` | `archiveId` | deleted |
 | `settings/read`, `settings/update` | `integrations?`, `retentionDays?` | settings |
 | `tags/list`, `tags/define`, `tags/remove` | `tag`, `actorId?`, `description?` | offered tags with usage counts |
-| `claims/hold` | `claimant`, `ttlMs`, `sessions: [{source, sessionId}]` | `expiresAt` (holding again renews) |
-| `claims/fulfil` | `source`, `sessionId`, `archiveId` | `fulfilledBy`, `superseded` (raw captures tagged); 404 when unclaimed |
-| `claims/state` | `source`, `sessionId` | `state`: `none`, `live`, `fulfilled` or `lapsed` |
+| `claims/hold` | `claimant`, `ttlMs`, `sessions: [{source, sessionId}]` | `expiresAt` (holding again renews and reopens); 409 while another claimant's lease is live |
+| `claims/fulfil` | `claimant`, `source`, `sessionId`, `archiveId` | `fulfilledBy`, `superseded` (raw captures marked); 404 when unclaimed or the archive is missing, 409 for another claimant |
+| `claims/state` | `source`, `sessionId`, `modifiedAt?` | `state`: `none`, `live` (+ `until`), `fulfilled` or `lapsed` |
 | `suggestions/queue` | `key`, `limit?`, `beforeId?`, `refresh?` | sessions due for suggestions, as digests; routed `projects` |
 | `suggestions/record` | `results` (`archiveId`, `digest`, `key`, `by`, `tags`) | recorded, stale (digest moved on), refused (exempt), dropped (tags not offered) |
 | `destinations/list`, `destinations/libraries`, `destinations/connect`, `destinations/remove`, `destinations/routes`, `destinations/sync` | see [Routing](#routing) | routes |

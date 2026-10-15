@@ -16,6 +16,7 @@ import {
   type ArchiveFilter,
   type ArchiveSettings,
   archiveSettingsSchema,
+  CLAIM_SOURCES,
   type ClaimSource,
   type ClaimState,
   defaultSettings,
@@ -181,7 +182,16 @@ export class ArchiveStore {
           throw new ArchiveConflict('Revision conflict');
         if (old && old.capturedAt > snapshot.capturedAt) throw new ArchiveConflict('Stale capture');
         const revision = (old?.revision ?? 0) + 1;
+        // A raw capture landing after its driver fulfilled the claim is superseded at once.
+        const claim = (CLAIM_SOURCES as readonly string[]).includes(snapshot.source)
+          ? await this.claimFor(tx, snapshot.source, snapshot.sessionId)
+          : null;
+        const supersededBy =
+          claim?.fulfilledBy && claim.fulfilledBy !== id
+            ? claim.fulfilledBy
+            : (old?.supersededBy ?? null);
         const fields = {
+          supersededBy,
           digest,
           revision,
           source: snapshot.source,
@@ -216,7 +226,7 @@ export class ArchiveStore {
   async head(id: string) {
     const row = await this.db.archive.findUnique({
       where: { id },
-      select: { id: true, digest: true, revision: true, projectId: true },
+      select: { id: true, digest: true, revision: true, projectId: true, supersededBy: true },
     });
     return row ?? undefined;
   }
@@ -362,65 +372,130 @@ export class ArchiveStore {
     });
   }
   /**
-   * Claim native sessions for a writer that records them itself, for `ttlMs` from now: the lease is
-   * renewed by claiming again. A claim keeps a session it already covers fulfilled.
+   * Claim native sessions for a writer that records them itself, for `ttlMs` from now; holding
+   * again renews the lease and reopens a fulfilled claim (the session is the writer's again until
+   * it fulfils). Another claimant's live lease is not taken over.
    */
   async claim(input: {
     claimant: string;
     ttlMs: number;
     sessions: Array<{ source: ClaimSource; sessionId: string }>;
   }) {
-    const expiresAt = new Date(Date.now() + input.ttlMs);
-    await this.db.$transaction(
-      input.sessions.map(({ source, sessionId }) =>
-        this.db.claim.upsert({
+    const now = Date.now();
+    const expiresAt = new Date(now + input.ttlMs);
+    await this.db.$transaction(async (tx) => {
+      for (const { source, sessionId } of input.sessions) {
+        const held = await tx.claim.findUnique({
           where: { source_sessionId: { source, sessionId } },
-          create: { source, sessionId, claimant: input.claimant, expiresAt },
-          update: { claimant: input.claimant, expiresAt },
-        }),
-      ),
-    );
+        });
+        if (
+          held &&
+          held.claimant !== input.claimant &&
+          held.expiresAt.getTime() > now &&
+          !held.fulfilledBy
+        )
+          throw new ClaimHeld(`${source} session ${sessionId} is claimed by another writer`);
+        const fields = {
+          claimant: input.claimant,
+          expiresAt,
+          fulfilledBy: null,
+          fulfilledAt: null,
+        };
+        await tx.claim.upsert({
+          where: { source_sessionId: { source, sessionId } },
+          create: { source, sessionId, ...fields },
+          update: fields,
+        });
+      }
+    });
     return { expiresAt: expiresAt.getTime() };
   }
   /**
-   * The claimant stored its own version of a claimed session (`archiveId`): the claim is fulfilled,
-   * and a raw capture the collector made while the claim had lapsed is tagged `superseded-by:<id>`
-   * (kept; retention may prune it).
+   * The claimant stored its own version (`archiveId`, an archive in this store) of a claimed
+   * session: the claim is fulfilled as of now, and a raw capture of the session (or its Claude
+   * subagent transcripts) made while the claim had lapsed is marked superseded: kept, never
+   * delivered onward. Null when the session is unclaimed.
    */
-  async fulfil(input: { source: ClaimSource; sessionId: string; archiveId: string }) {
-    const updated = await this.db.claim.updateMany({
-      where: { source: input.source, sessionId: input.sessionId },
-      data: { fulfilledBy: input.archiveId },
+  async fulfil(input: {
+    claimant: string;
+    source: ClaimSource;
+    sessionId: string;
+    archiveId: string;
+  }) {
+    const sourceId = await this.sourceId();
+    return this.db.$transaction(async (tx) => {
+      const claim = await tx.claim.findUnique({
+        where: { source_sessionId: { source: input.source, sessionId: input.sessionId } },
+      });
+      if (!claim) return null;
+      if (claim.claimant !== input.claimant)
+        throw new ClaimHeld(
+          `${input.source} session ${input.sessionId} is claimed by another writer`,
+        );
+      if (!(await tx.archive.findUnique({ where: { id: input.archiveId }, select: { id: true } })))
+        throw new Error('Archive unavailable');
+      await tx.claim.update({
+        where: { source_sessionId: { source: input.source, sessionId: input.sessionId } },
+        data: { fulfilledBy: input.archiveId, fulfilledAt: new Date() },
+      });
+      const raw = await tx.archive.findMany({
+        where: {
+          source: input.source,
+          id: { not: input.archiveId },
+          AND: [
+            { summary: { path: ['sourceId'], equals: sourceId } },
+            {
+              OR: [
+                { summary: { path: ['sessionId'], equals: input.sessionId } },
+                { summary: { path: ['sessionId'], string_starts_with: `${input.sessionId}/` } },
+              ],
+            },
+          ],
+        },
+        select: { id: true },
+      });
+      await tx.archive.updateMany({
+        where: { id: { in: raw.map((a) => a.id) } },
+        data: { supersededBy: input.archiveId },
+      });
+      return { fulfilledBy: input.archiveId, superseded: raw.map((a) => a.id) };
     });
-    if (!updated.count) return null;
-    const fallbacks = await this.db.archive.findMany({
-      where: {
-        source: input.source,
-        OR: [
-          { summary: { path: ['sessionId'], equals: input.sessionId } },
-          { summary: { path: ['sessionId'], string_starts_with: `${input.sessionId}/` } },
-        ],
-      },
-      select: { id: true },
-    });
-    for (const { id } of fallbacks)
-      await this.tag(id, { add: [`superseded-by:${input.archiveId}`] });
-    return { fulfilledBy: input.archiveId, superseded: fallbacks.map((a) => a.id) };
   }
   /**
-   * Whether the collector should leave a native session to its claimant: `live` (lease running),
-   * `fulfilled` (stored by the claimant), `lapsed` (capture it raw) or `none`. A Claude subagent
-   * transcript (`<session>/agent-<id>`) follows its session's claim.
+   * Whether the collector should leave a native session (modified at `modifiedAt`) to its
+   * claimant:
+   * - `live`: its lease is running, until `until`;
+   * - `fulfilled`: the claimant stored it, and the transcript has not changed since;
+   * - `lapsed`: the lease ran out, or the transcript changed after the claim was fulfilled, so it is
+   *   captured raw;
+   * - `none`: nobody claimed it.
+   *
+   * A Claude subagent transcript (`<session>/agent-<id>`) follows its session's claim unless it has
+   * its own. Codex sub-agent threads are their own sessions: their driver claims each one.
    */
-  async claimState(source: string, sessionId: string): Promise<ClaimState> {
+  async claimState(
+    source: string,
+    sessionId: string,
+    modifiedAt?: number,
+  ): Promise<{ state: ClaimState; until?: number }> {
+    const claim = await this.claimFor(this.db, source, sessionId);
+    if (!claim) return { state: 'none' };
+    const until = claim.expiresAt.getTime();
+    if (until > Date.now()) return { state: 'live', until };
+    if (
+      claim.fulfilledBy &&
+      claim.fulfilledAt &&
+      (modifiedAt === undefined || modifiedAt <= claim.fulfilledAt.getTime() + 1_000)
+    )
+      return { state: 'fulfilled' };
+    return { state: 'lapsed' };
+  }
+  private claimFor(db: Prisma.TransactionClient | PrismaClient, source: string, sessionId: string) {
     const root = sessionId.split('/')[0]!;
-    const claim = await this.db.claim.findFirst({
+    return db.claim.findFirst({
       where: { source, sessionId: { in: [...new Set([sessionId, root])] } },
       orderBy: { sessionId: 'desc' },
     });
-    if (!claim) return 'none';
-    if (claim.fulfilledBy) return 'fulfilled';
-    return claim.expiresAt.getTime() > Date.now() ? 'live' : 'lapsed';
   }
   async delete(id: string) {
     return (await this.db.archive.deleteMany({ where: { id } })).count > 0;
@@ -541,7 +616,7 @@ export class ArchiveStore {
   /** A project's archives at one destination: delivered at their latest digest, or pending. */
   async delivery(projectId: string, destination: string) {
     const archives = await this.db.archive.findMany({
-      where: { projectId },
+      where: { projectId, supersededBy: null },
       select: { digest: true, receipts: { where: { destination }, select: { digest: true } } },
     });
     const delivered = archives.filter((a) => a.receipts[0]?.digest === a.digest).length;
@@ -689,3 +764,5 @@ export class ArchiveStore {
 
 /** A capture that lost a race or arrived out of order; the server answers 409. */
 export class ArchiveConflict extends Error {}
+/** A claim another writer holds, or a fulfil by a writer that does not hold the claim. */
+export class ClaimHeld extends Error {}

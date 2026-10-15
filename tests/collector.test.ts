@@ -218,7 +218,8 @@ test('an unchanged session is not sent again, and an untouched file is not read 
       calls.capture++;
       return store.capture(snapshot);
     },
-    claimState: (source: ClaimSource, sessionId: string) => store.claimState(source, sessionId),
+    claimState: (source: ClaimSource, sessionId: string, modifiedAt?: number) =>
+      store.claimState(source, sessionId, modifiedAt),
   };
   const session = (id: string, text: string) =>
     writeFileSync(
@@ -600,7 +601,8 @@ test('a refused session is not retried until it changes; the catch-all hands ses
       return store.head(id);
     },
     capture: (snapshot: unknown) => store.capture(snapshot),
-    claimState: (source: ClaimSource, sessionId: string) => store.claimState(source, sessionId),
+    claimState: (source: ClaimSource, sessionId: string, modifiedAt?: number) =>
+      store.claimState(source, sessionId, modifiedAt),
   };
   const session = (id: string, cwd: string) =>
     writeFileSync(
@@ -662,24 +664,32 @@ test('a refused session is not retried until it changes; the catch-all hands ses
   }
 });
 
-test('a session its driver claims is skipped while the lease is live; a lapsed claim is captured raw, then marked superseded once fulfilled', async () => {
+test('a driver-claimed session: skipped while the lease is live, captured raw once it lapses, superseded when fulfilled, captured again if it changes after', async () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'archive-claims-')));
   const store = await freshStore();
+  let clock = Date.now();
   const writer = {
     sourceId: () => store.sourceId(),
     head: (id: string) => store.head(id),
     capture: (snapshot: unknown) => store.capture(snapshot),
-    claimState: (source: ClaimSource, sessionId: string) => store.claimState(source, sessionId),
+    claimState: (source: ClaimSource, sessionId: string, modifiedAt?: number) =>
+      store.claimState(source, sessionId, modifiedAt),
   };
-  writeFileSync(
-    join(dir, 'driven.jsonl'),
+  const row = (uuid: string, text: string, extra: Record<string, unknown> = {}) =>
     JSON.stringify({
       sessionId: 'driven',
       cwd: dir,
       type: 'user',
-      uuid: 'driven-1',
-      message: { content: 'Run by Foundry' },
-    }),
+      uuid,
+      message: { content: text },
+      ...extra,
+    });
+  writeFileSync(join(dir, 'driven.jsonl'), row('driven-1', 'Run by Foundry'));
+  // Its subagent's transcript, which follows the session's claim.
+  mkdirSync(join(dir, 'driven', 'subagents'), { recursive: true });
+  writeFileSync(
+    join(dir, 'driven', 'subagents', 'agent-a1.jsonl'),
+    row('child-1', 'A Warden', { isSidechain: true, agentId: 'a1' }),
   );
   const config = {
     directory: dir,
@@ -688,51 +698,96 @@ test('a session its driver claims is skipped while the lease is live; a lapsed c
     projectRoots: [dir],
   };
   const harness = () => 'subscription' as const;
-  try {
-    // Foundry drives the session and holds a live lease: the raw transcript is not captured.
-    await store.claim({
-      claimant: 'foundry',
+  // One collector across scans: what it remembers must not hide a lapse.
+  const cache: CollectorCache = new Map();
+  const scan = () => collectSessions(writer, config, { harness, cache, now: () => clock });
+  const all = () => store.list({ exempt: 'include' });
+  const lease = (claimant = 'foundry') =>
+    store.claim({
+      claimant,
       ttlMs: 60_000,
       sessions: [{ source: 'claude-code', sessionId: 'driven' }],
     });
-    expect(await store.claimState('claude-code', 'driven')).toBe('live');
-    // A Claude subagent transcript of the session follows its session's claim.
-    expect(await store.claimState('claude-code', 'driven/agent-a1')).toBe('live');
-    expect(await collectSessions(writer, config, { harness })).toMatchObject({
-      imported: 0,
-      skipped: 1,
-    });
-    expect(await store.list({ exempt: 'include' })).toHaveLength(0);
-    // Foundry crashed: the lease lapses with the transcript unchanged, and the next scan keeps it raw.
-    await store.db.claim.update({
+  const lapse = () =>
+    store.db.claim.update({
       where: { source_sessionId: { source: 'claude-code', sessionId: 'driven' } },
       data: { expiresAt: new Date(Date.now() - 1) },
     });
-    expect(await store.claimState('claude-code', 'driven')).toBe('lapsed');
-    expect(await collectSessions(writer, config, { harness })).toMatchObject({ imported: 1 });
-    const [raw] = await store.list({ exempt: 'include' });
-    // Foundry comes back, stores its stitched version and fulfils the claim: the raw capture is kept,
-    // marked superseded, and the collector leaves the session alone from then on.
-    const stitched = 'f'.repeat(64);
-    expect(
-      await store.fulfil({ source: 'claude-code', sessionId: 'driven', archiveId: stitched }),
-    ).toEqual({ fulfilledBy: stitched, superseded: [raw!.id] });
-    expect((await store.list({ exempt: 'include' }))[0]!.tags).toContain(
-      `superseded-by:${stitched}`,
-    );
-    expect(await store.claimState('claude-code', 'driven')).toBe('fulfilled');
+  try {
+    await lease();
+    expect(await scan()).toMatchObject({ imported: 0, skipped: 2 });
+    expect(await all()).toHaveLength(0);
+    // Another writer cannot take a live lease over.
+    await expect(lease('other-foundry')).rejects.toThrow('claimed by another writer');
+    // Foundry crashes: the lease lapses with the transcripts unchanged, and the next scan (past the
+    // lease the collector remembered) keeps both raw.
+    await lapse();
+    clock += 61_000;
+    expect(await scan()).toMatchObject({ imported: 2 });
+    const raw = (await all()).map((a) => a.id).sort();
+    // Foundry comes back, stores its stitched version and fulfils: the raw captures are kept,
+    // superseded (never delivered onward), and the collector leaves the session alone.
+    const stitched = await store.capture({
+      schemaVersion: 1,
+      sourceId: await store.sourceId(),
+      source: 'foundry',
+      sessionId: 'thread-1',
+      title: 'Stitched',
+      tags: [],
+      goalIds: [],
+      runIds: [],
+      capturedAt: Date.now(),
+      coverage: { reasoning: 'unavailable', completeness: 'partial', omissions: [] },
+      entries: [
+        { id: 'm1', kind: 'user', text: 'Run by Foundry', timestamp: 1, sourceRef: 'message:m1' },
+      ],
+    });
+    await expect(
+      store.fulfil({
+        claimant: 'other-foundry',
+        source: 'claude-code',
+        sessionId: 'driven',
+        archiveId: stitched.id,
+      }),
+    ).rejects.toThrow('claimed by another writer');
+    const fulfilled = await store.fulfil({
+      claimant: 'foundry',
+      source: 'claude-code',
+      sessionId: 'driven',
+      archiveId: stitched.id,
+    });
+    expect(fulfilled!.superseded.sort()).toEqual(raw);
+    for (const id of raw) expect((await store.head(id))!.supersededBy).toBe(stitched.id);
+    expect((await store.head(stitched.id))!.supersededBy).toBeNull();
+    expect(await scan()).toMatchObject({ imported: 0 });
+    // The session is resumed outside Foundry: the transcript changes after fulfilment and, with no
+    // live lease, the change is captured raw (still superseded: its driver's version exists).
+    await Bun.sleep(1_100);
     writeFileSync(
       join(dir, 'driven.jsonl'),
-      `${JSON.stringify({ sessionId: 'driven', cwd: dir, type: 'user', uuid: 'driven-1', message: { content: 'Run by Foundry' } })}\n${JSON.stringify({ sessionId: 'driven', cwd: dir, type: 'user', uuid: 'driven-2', message: { content: 'More' } })}`,
+      `${row('driven-1', 'Run by Foundry')}\n${row('driven-2', 'Resumed by hand')}`,
     );
-    expect(await collectSessions(writer, config, { harness })).toMatchObject({
-      imported: 0,
-      skipped: 1,
-    });
-    // Fulfilling a session nobody claimed is refused.
+    expect(await scan()).toMatchObject({ imported: 1 });
+    // Holding again reopens the claim: the session is the driver's until it fulfils again.
+    await lease();
+    expect(await store.claimState('claude-code', 'driven')).toMatchObject({ state: 'live' });
+    // Fulfilling a session nobody claimed, or with an archive this store lacks, is refused.
     expect(
-      await store.fulfil({ source: 'claude-code', sessionId: 'other', archiveId: stitched }),
+      await store.fulfil({
+        claimant: 'foundry',
+        source: 'claude-code',
+        sessionId: 'other',
+        archiveId: stitched.id,
+      }),
     ).toBeNull();
+    await expect(
+      store.fulfil({
+        claimant: 'foundry',
+        source: 'claude-code',
+        sessionId: 'driven',
+        archiveId: 'f'.repeat(64),
+      }),
+    ).rejects.toThrow('Archive unavailable');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
