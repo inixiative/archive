@@ -40,10 +40,16 @@ export const archiveRuntimeSchema = z.strictObject({
   accessPath: z.enum(['subscription', 'api', 'unknown']),
   evidence: z.enum(['transcript', 'harness']).optional(),
 });
-/** The session that started this one: a subagent's parent, or the thread a fork copied. */
+/**
+ * The session that started this one: a subagent's parent, or the thread a fork copied. A tree of
+ * sessions (a thread, its subagents, theirs) shares `rootSessionId`; `parentSessionId` is the direct
+ * parent, and `parentEntryId` the parent's entry that spawned it (its tool call).
+ */
 export const archiveLineageSchema = z.strictObject({
   kind: z.enum(['subagent', 'fork']),
   parentSessionId: identifier,
+  rootSessionId: identifier.optional(),
+  parentEntryId: identifier.optional(),
   agentType: z.string().min(1).max(200).optional(),
   agentName: z.string().min(1).max(200).optional(),
   description: z.string().min(1).max(500).optional(),

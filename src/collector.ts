@@ -62,7 +62,13 @@ export function transcriptFiles(directory: string): string[] {
   return result;
 }
 
-export type SessionMetadata = { cwd: string; branch?: string; repository?: string };
+export type SessionMetadata = {
+  cwd: string;
+  branch?: string;
+  repository?: string;
+  /** The session id the import gives it (a Claude subagent: `<session>/agent-<id>`), for claims. */
+  sessionId?: string;
+};
 
 /** Provider metadata, never text/tags/model suggestions; `routeSession` decides where it goes. */
 export function sessionMetadata(
@@ -88,13 +94,22 @@ export function sessionMetadata(
     const meta = source === 'codex' ? (row.type === 'session_meta' ? row.payload : undefined) : row;
     if (typeof meta?.cwd !== 'string' || !isAbsolute(meta.cwd)) continue;
     const text = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
+    const claudeId =
+      text(row.sessionId) && row.isSidechain && text(row.agentId)
+        ? `${row.sessionId}/agent-${row.agentId}`
+        : text(row.sessionId);
     return source === 'codex'
       ? {
           cwd: resolve(meta.cwd),
           branch: text(meta.git?.branch),
           repository: text(meta.git?.repository_url),
+          ...(text(meta.id) ? { sessionId: text(meta.id) } : {}),
         }
-      : { cwd: resolve(meta.cwd), branch: text(meta.gitBranch) };
+      : {
+          cwd: resolve(meta.cwd),
+          branch: text(meta.gitBranch),
+          ...(claudeId ? { sessionId: claudeId } : {}),
+        };
   }
 }
 
@@ -176,7 +191,7 @@ export function routeSession(
 }
 
 /** Where collected sessions go: an Archive server, or a store in-process. */
-export type ArchiveWriter = Pick<ArchiveClient, 'sourceId' | 'head' | 'capture'>;
+export type ArchiveWriter = Pick<ArchiveClient, 'sourceId' | 'head' | 'capture' | 'claimState'>;
 
 /**
  * The access path the harness's login implies when a transcript is silent, read from the harness
@@ -224,6 +239,8 @@ export type CollectorCache = Map<
     outcome: 'unchanged' | 'skipped' | 'failed';
     meta?: SessionMetadata;
     stored?: { id: string; digest: string; checkedAt: number };
+    /** Left to its claimant: asked again once the lease runs out (or the file changes). */
+    claimedUntil?: number;
   }
 >;
 const REVALIDATE_MS = 10 * 60_000;
@@ -282,11 +299,17 @@ export async function collectSessions(
         known.routing === routing
       ) {
         const stored = known.stored;
-        if (!stored || now() - stored.checkedAt < REVALIDATE_MS) {
+        const claimed = known.claimedUntil;
+        if (claimed !== undefined) {
+          // Left to a live lease; once it runs out (the transcript unchanged), ask again below.
+          if (now() < claimed) {
+            result.skipped++;
+            continue;
+          }
+        } else if (!stored || now() - stored.checkedAt < REVALIDATE_MS) {
           result[known.outcome]++;
           continue;
-        }
-        if ((await archive.head(stored.id))?.digest === stored.digest) {
+        } else if ((await archive.head(stored.id))?.digest === stored.digest) {
           stored.checkedAt = now();
           result.unchanged++;
           continue;
@@ -296,6 +319,7 @@ export async function collectSessions(
         outcome: 'unchanged' | 'skipped' | 'failed',
         meta?: SessionMetadata,
         stored?: { id: string; digest: string },
+        claimedUntil?: number,
       ) =>
         cache.set(file, {
           size: before.size,
@@ -304,7 +328,20 @@ export async function collectSessions(
           outcome,
           meta,
           ...(stored ? { stored: { ...stored, checkedAt: now() } } : {}),
+          ...(claimedUntil !== undefined ? { claimedUntil } : {}),
         });
+      // A session its driver records itself (Foundry) is its driver's while the lease is live, or
+      // once fulfilled with the transcript unchanged since; otherwise (the driver died) it is
+      // captured raw. Asked before the transcript is parsed.
+      const claimed = async (sessionId: string, meta?: SessionMetadata) => {
+        if (config.source !== 'claude-code' && config.source !== 'codex') return false;
+        const claim = await archive.claimState(config.source, sessionId, before.mtimeMs);
+        if (claim.state === 'live') remember('skipped', meta, undefined, claim.until ?? now());
+        else if (claim.state === 'fulfilled') remember('skipped', meta);
+        else return false;
+        result.skipped++;
+        return true;
+      };
       // A transcript's first cwd never changes, so it is read once per file.
       const meta = known?.meta ?? sessionMetadata(file, config.source);
       if (!meta) {
@@ -319,6 +356,7 @@ export async function collectSessions(
         remember('skipped', meta);
         continue;
       }
+      if (meta.sessionId && (await claimed(meta.sessionId, meta))) continue;
       let snapshot: ReturnType<typeof importTranscriptFile>;
       try {
         snapshot = importTranscriptFile(file, {
@@ -337,6 +375,8 @@ export async function collectSessions(
         result.skipped++;
         continue;
       }
+      if (snapshot.sessionId !== meta.sessionId && (await claimed(snapshot.sessionId, meta)))
+        continue;
       const { cwd } = meta;
       if (!repositories.has(cwd)) repositories.set(cwd, git(cwd, 'remote', 'get-url', 'origin'));
       if (config.atlas && !graphs.has(cwd)) graphs.set(cwd, atlasGraph(cwd));

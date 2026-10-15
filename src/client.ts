@@ -90,6 +90,8 @@ export async function publishArchive(
   const archive = await store.head(id);
   if (!archive || archive.projectId !== destination.projectId)
     throw new Error('Archive is outside destination project');
+  // A raw capture its driver later stored itself stays local: the driver's version is the one that travels.
+  if (archive.supersededBy) return { unchanged: true };
   const receiptKey = destinationIdentity(destination);
   let sent = false;
   for (let attempt = 0; attempt < 8; attempt++) {

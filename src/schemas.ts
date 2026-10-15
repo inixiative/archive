@@ -47,3 +47,9 @@ export interface ArchiveFilter {
   /** Archives with this tag among their suggestions. */
   suggestedTag?: string;
 }
+
+/** Native sources a writer can claim: sessions it drives and records itself (Foundry). */
+export const CLAIM_SOURCES = ['claude-code', 'codex'] as const;
+export type ClaimSource = (typeof CLAIM_SOURCES)[number];
+/** `live` and `fulfilled` leave a session to its claimant; `lapsed` and `none` are captured. */
+export type ClaimState = 'none' | 'live' | 'fulfilled' | 'lapsed';

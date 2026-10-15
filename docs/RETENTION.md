@@ -102,7 +102,7 @@ For each harness file it reports one of `captured` (latest digest held), `pendin
 
 ### 3.3 What a capture carries for retention
 
-- **Lineage.** Read `agent-<id>.meta.json` and record it on the snapshot: `lineage: { kind: 'subagent' | 'handoff' | 'fork', parentKey, toolUseId?, agentType?, depth? }`. Foundry's own child threads (SUBAGENTS.md option (a)) fill the same field from `ThreadMeta.parentThreadId`. Retention treats a lineage tree as one unit (§4).
+- **Lineage.** One shape, as shipped (0.20.0): `lineage: { kind: 'subagent' | 'fork', parentSessionId, rootSessionId?, parentEntryId?, toolUseId?, agentType?, agentName?, description?, depth? }`. `parentSessionId` is the direct parent's session id; a parent's archive key is `archiveKey({sourceId, source, sessionId: parentSessionId})`. The collector fills it from `agent-<id>.meta.json` and Codex `session_meta`. Foundry writes the trees it drives (Foundry `docs/THREAD-TREE.md` spec A), with `rootSessionId` and `parentEntryId`, and claims those native sessions so the collector does not capture them twice. A Foundry child thread is `subagent`; there is no separate `handoff` kind. Retention treats a lineage tree as one unit (§4).
 - **Corrections.** At capture, run foundry-core's deterministic `extractCorrections(sessionId, turns)` (`pc/feedback/correction.ts`, MIT, data and pure functions, no model call) over the session's typed prompts (`typedPrompt`, `ar/import.ts`). Store the candidates' ids and signals in the listing summary. The model classification (`CORRECTION_CLASSIFY_PROMPT`) stays with Foundry and Oracle, which report back through citations (§5).
 
 ## 4. What must remain
@@ -266,7 +266,7 @@ Against a real Postgres, as the existing tests do (`tests/db.ts`):
 2. A session under an excluded temp directory is reported `excluded` by `coverage` and never captured.
 3. `coverage` flags a file older than `cleanupPeriodDays − 7` that is `pending`.
 4. Capturing revision 3 of a session deletes revisions 1–2 and their chunks; a revision named by an `outbox` row survives until delivered.
-5. A subagent file with `meta.json` gets `lineage.parentKey` equal to its parent's key; pinning the parent keeps the child.
+5. A subagent file with `meta.json` gets `lineage.parentSessionId` naming its parent (whose key is computed from it); pinning the parent keeps the child.
 6. A session with a "once and for all" correction gets a `correction` citation at capture and stays in keep at any age.
 7. A never-read session at 31 days moves to summarized in the plan; with `mode: 'off'` nothing changes.
 8. Ten reads spread over 60 days keep a session's usefulness above `keepScore`.
