@@ -38,7 +38,7 @@
   },
   "dependencies": {
     "@inixiative/agent-session": "^0.6.6",
-    "@inixiative/signet": "^0.4.1",
+    "@inixiative/signet": "^0.4.2",
     "@prisma/client": "^6.6.0",
     "js-tiktoken": "1.0.21",
     "prisma": "^6.6.0",
