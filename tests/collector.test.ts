@@ -11,6 +11,7 @@ import {
 } from '../src/collector';
 import { importTranscript } from '../src/import';
 import { importTranscriptFile } from '../src/import-file';
+import type { ClaimSource } from '../src/schemas';
 import { freshStore } from './db';
 
 test('collector matches exact provider cwd, retries partial files and keeps manual tags', async () => {
@@ -217,6 +218,7 @@ test('an unchanged session is not sent again, and an untouched file is not read 
       calls.capture++;
       return store.capture(snapshot);
     },
+    claimState: (source: ClaimSource, sessionId: string) => store.claimState(source, sessionId),
   };
   const session = (id: string, text: string) =>
     writeFileSync(
@@ -598,6 +600,7 @@ test('a refused session is not retried until it changes; the catch-all hands ses
       return store.head(id);
     },
     capture: (snapshot: unknown) => store.capture(snapshot),
+    claimState: (source: ClaimSource, sessionId: string) => store.claimState(source, sessionId),
   };
   const session = (id: string, cwd: string) =>
     writeFileSync(
@@ -654,6 +657,82 @@ test('a refused session is not retried until it changes; the catch-all hands ses
       await collectSessions(writer, a, { peers: [a], harness, cache: own, now }),
     ).toMatchObject({ imported: 1 });
     expect((await store.list()).length).toBe(1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a session its driver claims is skipped while the lease is live; a lapsed claim is captured raw, then marked superseded once fulfilled', async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'archive-claims-')));
+  const store = await freshStore();
+  const writer = {
+    sourceId: () => store.sourceId(),
+    head: (id: string) => store.head(id),
+    capture: (snapshot: unknown) => store.capture(snapshot),
+    claimState: (source: ClaimSource, sessionId: string) => store.claimState(source, sessionId),
+  };
+  writeFileSync(
+    join(dir, 'driven.jsonl'),
+    JSON.stringify({
+      sessionId: 'driven',
+      cwd: dir,
+      type: 'user',
+      uuid: 'driven-1',
+      message: { content: 'Run by Foundry' },
+    }),
+  );
+  const config = {
+    directory: dir,
+    source: 'claude-code' as const,
+    projectId: 'a',
+    projectRoots: [dir],
+  };
+  const harness = () => 'subscription' as const;
+  try {
+    // Foundry drives the session and holds a live lease: the raw transcript is not captured.
+    await store.claim({
+      claimant: 'foundry',
+      ttlMs: 60_000,
+      sessions: [{ source: 'claude-code', sessionId: 'driven' }],
+    });
+    expect(await store.claimState('claude-code', 'driven')).toBe('live');
+    // A Claude subagent transcript of the session follows its session's claim.
+    expect(await store.claimState('claude-code', 'driven/agent-a1')).toBe('live');
+    expect(await collectSessions(writer, config, { harness })).toMatchObject({
+      imported: 0,
+      skipped: 1,
+    });
+    expect(await store.list({ exempt: 'include' })).toHaveLength(0);
+    // Foundry crashed: the lease lapses with the transcript unchanged, and the next scan keeps it raw.
+    await store.db.claim.update({
+      where: { source_sessionId: { source: 'claude-code', sessionId: 'driven' } },
+      data: { expiresAt: new Date(Date.now() - 1) },
+    });
+    expect(await store.claimState('claude-code', 'driven')).toBe('lapsed');
+    expect(await collectSessions(writer, config, { harness })).toMatchObject({ imported: 1 });
+    const [raw] = await store.list({ exempt: 'include' });
+    // Foundry comes back, stores its stitched version and fulfils the claim: the raw capture is kept,
+    // marked superseded, and the collector leaves the session alone from then on.
+    const stitched = 'f'.repeat(64);
+    expect(
+      await store.fulfil({ source: 'claude-code', sessionId: 'driven', archiveId: stitched }),
+    ).toEqual({ fulfilledBy: stitched, superseded: [raw!.id] });
+    expect((await store.list({ exempt: 'include' }))[0]!.tags).toContain(
+      `superseded-by:${stitched}`,
+    );
+    expect(await store.claimState('claude-code', 'driven')).toBe('fulfilled');
+    writeFileSync(
+      join(dir, 'driven.jsonl'),
+      `${JSON.stringify({ sessionId: 'driven', cwd: dir, type: 'user', uuid: 'driven-1', message: { content: 'Run by Foundry' } })}\n${JSON.stringify({ sessionId: 'driven', cwd: dir, type: 'user', uuid: 'driven-2', message: { content: 'More' } })}`,
+    );
+    expect(await collectSessions(writer, config, { harness })).toMatchObject({
+      imported: 0,
+      skipped: 1,
+    });
+    // Fulfilling a session nobody claimed is refused.
+    expect(
+      await store.fulfil({ source: 'claude-code', sessionId: 'other', archiveId: stitched }),
+    ).toBeNull();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -61,7 +61,7 @@ export async function freshStore(name: TestDatabase = 'main') {
   const store = new ArchiveStore(testDatabaseUrl(name));
   open.set(name, store);
   await store.db.$executeRawUnsafe(
-    'TRUNCATE "archives", "settings", "tag_definitions" RESTART IDENTITY CASCADE',
+    'TRUNCATE "archives", "settings", "tag_definitions", "claims" RESTART IDENTITY CASCADE',
   );
   return store;
 }

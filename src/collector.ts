@@ -176,7 +176,7 @@ export function routeSession(
 }
 
 /** Where collected sessions go: an Archive server, or a store in-process. */
-export type ArchiveWriter = Pick<ArchiveClient, 'sourceId' | 'head' | 'capture'>;
+export type ArchiveWriter = Pick<ArchiveClient, 'sourceId' | 'head' | 'capture' | 'claimState'>;
 
 /**
  * The access path the harness's login implies when a transcript is silent, read from the harness
@@ -336,6 +336,16 @@ export async function collectSessions(
       if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
         result.skipped++;
         continue;
+      }
+      // A session its driver records itself (Foundry) is its driver's while the claim is live or
+      // fulfilled; a lapsed claim (the driver died) is captured raw. Asked on every scan, never
+      // remembered: a lease can lapse without the transcript changing.
+      if (config.source === 'claude-code' || config.source === 'codex') {
+        const claim = await archive.claimState(config.source, snapshot.sessionId);
+        if (claim === 'live' || claim === 'fulfilled') {
+          result.skipped++;
+          continue;
+        }
       }
       const { cwd } = meta;
       if (!repositories.has(cwd)) repositories.set(cwd, git(cwd, 'remote', 'get-url', 'origin'));

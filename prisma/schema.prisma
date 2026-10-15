@@ -148,3 +148,20 @@ model Outbox {
   @@id([archiveId, destination])
   @@map("outbox")
 }
+
+/// A writer that records native sessions itself (Foundry, for the threads it drives) claims them
+/// with a lease. The collector skips a claimed session while the lease is live, or once the claim
+/// is fulfilled (the writer stored its own version of it, `fulfilledBy`). A lapsed, unfulfilled
+/// claim (the writer died) falls back to capturing the raw session: every session is kept.
+model Claim {
+  source      String
+  sessionId   String
+  claimant    String
+  expiresAt   DateTime
+  /// The archive that covers this session, once the claimant stored it.
+  fulfilledBy String?
+  updatedAt   DateTime @updatedAt
+
+  @@id([source, sessionId])
+  @@map("claims")
+}

@@ -142,3 +142,44 @@ test('a refusal carries the server’s reason, even from a proxy page', async ()
     refusing(new Response('<html><title>Blocked</title></html>', { status: 403 })),
   ).rejects.toThrow('<title>Blocked</title>');
 });
+
+test('claims over HTTP: hold renews a lease, state reports it, fulfil needs a claim', async () => {
+  await freshStore('serve');
+  const server = await startArchiveServer({
+    databaseUrl: testDatabaseUrl('serve'),
+    token,
+    port: 0,
+  });
+  try {
+    const client = new ArchiveClient({ url: server.server.url.href, token });
+    expect(await client.claimState('codex', 'thread-1')).toBe('none');
+    const { expiresAt } = await client.holdClaims({
+      claimant: 'foundry',
+      ttlMs: 60_000,
+      sessions: [{ source: 'codex', sessionId: 'thread-1' }],
+    });
+    expect(expiresAt).toBeGreaterThan(Date.now());
+    expect(await client.claimState('codex', 'thread-1')).toBe('live');
+    expect(
+      await client.fulfilClaim({
+        source: 'codex',
+        sessionId: 'thread-1',
+        archiveId: 'a'.repeat(64),
+      }),
+    ).toEqual({ fulfilledBy: 'a'.repeat(64), superseded: [] });
+    expect(await client.claimState('codex', 'thread-1')).toBe('fulfilled');
+    await expect(
+      client.fulfilClaim({ source: 'codex', sessionId: 'unclaimed', archiveId: 'a'.repeat(64) }),
+    ).rejects.toThrow('Claim unavailable');
+    // Only native sources are claimable.
+    await expect(
+      client.holdClaims({
+        claimant: 'foundry',
+        ttlMs: 60_000,
+        sessions: [{ source: 'foundry' as never, sessionId: 'x' }],
+      }),
+    ).rejects.toThrow();
+  } finally {
+    await server.close();
+  }
+});

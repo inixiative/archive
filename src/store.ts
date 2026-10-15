@@ -16,6 +16,8 @@ import {
   type ArchiveFilter,
   type ArchiveSettings,
   archiveSettingsSchema,
+  type ClaimSource,
+  type ClaimState,
   defaultSettings,
   type TagDefinition,
   tagDefinitionSchema,
@@ -358,6 +360,67 @@ export class ArchiveStore {
       z.array(tagSchema).max(100, 'An archive holds at most 100 tags').parse(tags);
       return { id, tags };
     });
+  }
+  /**
+   * Claim native sessions for a writer that records them itself, for `ttlMs` from now: the lease is
+   * renewed by claiming again. A claim keeps a session it already covers fulfilled.
+   */
+  async claim(input: {
+    claimant: string;
+    ttlMs: number;
+    sessions: Array<{ source: ClaimSource; sessionId: string }>;
+  }) {
+    const expiresAt = new Date(Date.now() + input.ttlMs);
+    await this.db.$transaction(
+      input.sessions.map(({ source, sessionId }) =>
+        this.db.claim.upsert({
+          where: { source_sessionId: { source, sessionId } },
+          create: { source, sessionId, claimant: input.claimant, expiresAt },
+          update: { claimant: input.claimant, expiresAt },
+        }),
+      ),
+    );
+    return { expiresAt: expiresAt.getTime() };
+  }
+  /**
+   * The claimant stored its own version of a claimed session (`archiveId`): the claim is fulfilled,
+   * and a raw capture the collector made while the claim had lapsed is tagged `superseded-by:<id>`
+   * (kept; retention may prune it).
+   */
+  async fulfil(input: { source: ClaimSource; sessionId: string; archiveId: string }) {
+    const updated = await this.db.claim.updateMany({
+      where: { source: input.source, sessionId: input.sessionId },
+      data: { fulfilledBy: input.archiveId },
+    });
+    if (!updated.count) return null;
+    const fallbacks = await this.db.archive.findMany({
+      where: {
+        source: input.source,
+        OR: [
+          { summary: { path: ['sessionId'], equals: input.sessionId } },
+          { summary: { path: ['sessionId'], string_starts_with: `${input.sessionId}/` } },
+        ],
+      },
+      select: { id: true },
+    });
+    for (const { id } of fallbacks)
+      await this.tag(id, { add: [`superseded-by:${input.archiveId}`] });
+    return { fulfilledBy: input.archiveId, superseded: fallbacks.map((a) => a.id) };
+  }
+  /**
+   * Whether the collector should leave a native session to its claimant: `live` (lease running),
+   * `fulfilled` (stored by the claimant), `lapsed` (capture it raw) or `none`. A Claude subagent
+   * transcript (`<session>/agent-<id>`) follows its session's claim.
+   */
+  async claimState(source: string, sessionId: string): Promise<ClaimState> {
+    const root = sessionId.split('/')[0]!;
+    const claim = await this.db.claim.findFirst({
+      where: { source, sessionId: { in: [...new Set([sessionId, root])] } },
+      orderBy: { sessionId: 'desc' },
+    });
+    if (!claim) return 'none';
+    if (claim.fulfilledBy) return 'fulfilled';
+    return claim.expiresAt.getTime() > Date.now() ? 'live' : 'lapsed';
   }
   async delete(id: string) {
     return (await this.db.archive.deleteMany({ where: { id } })).count > 0;
