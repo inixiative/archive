@@ -1,6 +1,11 @@
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
+import { basename } from 'node:path';
 import { type ImportOptions, importTranscriptLines } from './import';
-import { archiveLineageSchema } from './index';
+import { type ArchiveLineage, archiveLineageSchema } from './index';
+
+/** The agent id in a Claude subagent transcript's name (`agent-<id>.jsonl`), else undefined. */
+export const transcriptAgentId = (file: string) =>
+  /^agent-([A-Za-z0-9_-]+)\.jsonl$/.exec(basename(file))?.[1];
 
 /** Bound raw record memory while skipping unsupported payloads from long native histories. */
 export function importTranscriptFile(file: string, options: ImportOptions) {
@@ -42,16 +47,21 @@ export function importTranscriptFile(file: string, options: ImportOptions) {
       closeSync(descriptor);
     }
   }
-  const snapshot = importTranscriptLines(lines(), options);
+  const agentId = options.source === 'claude-code' ? transcriptAgentId(file) : undefined;
+  const snapshot = importTranscriptLines(lines(), agentId ? { ...options, agentId } : options);
   if (options.source === 'claude-code' && snapshot.lineage) {
-    const meta = subagentMeta(file);
+    const meta = subagentMeta(file, snapshot.lineage);
     if (meta) snapshot.lineage = archiveLineageSchema.parse({ ...snapshot.lineage, ...meta });
   }
   return snapshot;
 }
 
-/** Claude Code writes `agent-<id>.meta.json` beside a subagent transcript: its type, task and depth. */
-function subagentMeta(file: string) {
+/**
+ * Claude Code writes `agent-<id>.meta.json` beside a subagent transcript: its type, task and depth,
+ * whether it is a fork, and for a nested subagent the agent that spawned it (`parentAgentId`),
+ * whose session is `<root>/agent-<parentAgentId>`.
+ */
+function subagentMeta(file: string, lineage: ArchiveLineage) {
   const path = file.replace(/\.jsonl$/, '.meta.json');
   if (path === file || !existsSync(path)) return undefined;
   let meta: Record<string, unknown>;
@@ -62,8 +72,13 @@ function subagentMeta(file: string) {
   }
   const text = (value: unknown, max: number) =>
     typeof value === 'string' && value ? value.slice(0, max) : undefined;
+  const root = lineage.rootSessionId ?? lineage.parentSessionId;
+  const parentAgentId = text(meta.parentAgentId, 256);
   const fields = {
+    kind: meta.isFork === true ? 'fork' : undefined,
+    parentSessionId: parentAgentId ? `${root}/agent-${parentAgentId}` : undefined,
     agentType: text(meta.agentType, 200),
+    agentName: text(meta.name, 200),
     description: text(meta.description, 500),
     toolUseId: text(meta.toolUseId, 256),
     depth: Number.isInteger(meta.spawnDepth) ? (meta.spawnDepth as number) : undefined,

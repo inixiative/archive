@@ -11,6 +11,24 @@ export interface ImportOptions {
   sessionId?: string;
   title?: string;
   projectId?: string;
+  /** The agent id a Claude subagent transcript's file name carries, for records that lack one. */
+  agentId?: string;
+}
+
+/**
+ * The session a Claude Code record belongs to. A subagent's records carry their parent's
+ * `sessionId`; its session is `<parent>/agent-<id>`, never the parent's, so the two never share an
+ * archive. The id comes from the record, else from the transcript's file name.
+ */
+export function claudeSessionId(
+  row: { sessionId?: unknown; isSidechain?: unknown; agentId?: unknown },
+  fileAgentId?: string,
+) {
+  const text = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
+  const sessionId = text(row.sessionId);
+  if (!sessionId) return undefined;
+  const agentId = text(row.agentId) ?? fileAgentId;
+  return agentId && (row.isSidechain || fileAgentId) ? `${sessionId}/agent-${agentId}` : sessionId;
 }
 /** Content the harness wraps in or adds to a user message; the person never typed it. */
 const injectedTags = [
@@ -188,16 +206,17 @@ export function importTranscriptLines(
       text(row.quotaLimits.rateLimitType)
     )
       subscription = true;
-    if (options.source === 'claude-code' && row.sessionId) {
-      // Subagent transcripts reuse their parent's sessionId; each is its own archive.
-      const id =
-        row.isSidechain && typeof row.agentId === 'string'
-          ? `${row.sessionId}/agent-${row.agentId}`
-          : row.sessionId;
+    const id = options.source === 'claude-code' ? claudeSessionId(row, options.agentId) : undefined;
+    if (id) {
       if (sessionId && sessionId !== id) throw new Error('Mixed transcript sessions');
       sessionId = id;
-      if (row.isSidechain && typeof row.agentId === 'string')
-        lineage ??= { kind: 'subagent', parentSessionId: row.sessionId };
+      // The parent is the tree's root; meta.json names a nested subagent's direct parent.
+      if (id !== row.sessionId)
+        lineage ??= {
+          kind: 'subagent',
+          parentSessionId: row.sessionId,
+          rootSessionId: row.sessionId,
+        };
     }
     if (options.source === 'codex' && row.type === 'turn_context')
       turn = { model: text(row.payload?.model), effort: text(row.payload?.effort) };

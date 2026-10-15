@@ -558,6 +558,7 @@ test('Claude subagent runs carry lineage from meta.json; runtime is tagged and f
     expect(run.lineage).toEqual({
       kind: 'subagent',
       parentSessionId: parent,
+      rootSessionId: parent,
       agentType: 'general-purpose',
       description: 'Adversarial review',
       toolUseId: 'toolu_1',
@@ -585,6 +586,131 @@ test('Claude subagent runs carry lineage from meta.json; runtime is tagged and f
       (await store.list({ model: 'claude-sonnet-5', effort: 'high' })).map((a) => a.id),
     ).toEqual([run.id]);
     expect(await store.list({ model: 'claude-sonnet-5', effort: 'medium' })).toEqual([]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a subagent transcript never takes its parent’s key; a parent row holding a subagent’s content is repaired from disk; nested subagents carry root and parent', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'archive-collision-'));
+  const store = await freshStore();
+  const parent = 'c8c7f7a9-7f4e-4ac7-9d6a-6a4c2a2a0c01';
+  const row = (extra: object) =>
+    JSON.stringify({ sessionId: parent, cwd: '/work/a', uuid: crypto.randomUUID(), ...extra });
+  const subagents = join(dir, parent, 'subagents');
+  // Records of an older Claude Code: sidechain, but no agentId; only the file name says which agent.
+  const older = [
+    row({ type: 'user', isSidechain: true, message: { content: 'Review it' } }),
+    row({
+      type: 'assistant',
+      isSidechain: true,
+      message: { model: 'claude-sonnet-5', content: [{ type: 'text', text: 'Reviewed' }] },
+    }),
+  ].join('\n');
+  try {
+    mkdirSync(subagents, { recursive: true });
+    writeFileSync(
+      join(dir, `${parent}.jsonl`),
+      [
+        row({ type: 'user', message: { content: 'Plan it' } }),
+        row({
+          type: 'assistant',
+          message: { model: 'claude-opus-5-5', content: [{ type: 'text', text: 'Ok' }] },
+        }),
+      ].join('\n'),
+    );
+    writeFileSync(join(subagents, 'agent-a1.jsonl'), older);
+    writeFileSync(
+      join(subagents, 'agent-a1.meta.json'),
+      JSON.stringify({ agentType: 'general-purpose', description: 'Review', spawnDepth: 1 }),
+    );
+    writeFileSync(
+      join(subagents, 'agent-a2.jsonl'),
+      row({ type: 'user', isSidechain: true, agentId: 'a2', message: { content: 'Dig in' } }),
+    );
+    writeFileSync(
+      join(subagents, 'agent-a2.meta.json'),
+      JSON.stringify({
+        agentType: 'fork',
+        isFork: true,
+        name: 'Digger',
+        description: 'Dig',
+        toolUseId: 'toolu_2',
+        parentAgentId: 'a1',
+        spawnDepth: 2,
+      }),
+    );
+    // Without the file name, the older records would be the parent's own session.
+    const sourceId = await store.sourceId();
+    const stale = importTranscript(older, { source: 'claude-code', sourceId, projectId: 'b' });
+    expect(stale.sessionId).toBe(parent);
+    expect(stale.lineage).toBeUndefined();
+    expect(
+      importTranscriptFile(join(subagents, 'agent-a1.jsonl'), {
+        source: 'claude-code',
+        sourceId,
+        projectId: 'b',
+      }).sessionId,
+    ).toBe(`${parent}/agent-a1`);
+    // The historic collision: the subagent's capture landed on the parent's key, in its own project.
+    await store.capture(stale);
+    const config = {
+      directory: dir,
+      source: 'claude-code' as const,
+      projectId: 'a',
+      projectRoots: ['/work/a'],
+    };
+    const harness = () => 'subscription' as const;
+    // A scan keeps the parent's transcript out: another project holds its key.
+    const scan = await collectSessions(store, config, { harness });
+    expect(scan).toEqual({ imported: 2, unchanged: 0, skipped: 0, failed: 1 });
+    expect(scan.refused).toBeUndefined();
+    const held = (await store.list()).find((a) => a.sessionId === parent)!;
+    expect([held.projectId, held.title]).toEqual(['b', 'Review it']);
+    // The repair takes it over with its own content, and says so.
+    const repair = await collectSessions(store, config, { harness, repair: true });
+    expect(repair).toMatchObject({ imported: 1, unchanged: 2, failed: 0, refused: [] });
+    expect(repair.repaired).toEqual([
+      {
+        file: join(dir, `${parent}.jsonl`),
+        sessionId: parent,
+        projectId: 'a',
+        previousProjectId: 'b',
+      },
+    ]);
+    const listed = await store.list();
+    const main = listed.find((a) => a.sessionId === parent)!;
+    expect([main.projectId, main.title, main.entries, main.lineage]).toEqual([
+      'a',
+      'Plan it',
+      2,
+      undefined,
+    ]);
+    expect(listed.find((a) => a.sessionId === `${parent}/agent-a1`)!.lineage).toEqual({
+      kind: 'subagent',
+      parentSessionId: parent,
+      rootSessionId: parent,
+      agentType: 'general-purpose',
+      description: 'Review',
+      depth: 1,
+    });
+    expect(listed.find((a) => a.sessionId === `${parent}/agent-a2`)!.lineage).toEqual({
+      kind: 'fork',
+      parentSessionId: `${parent}/agent-a1`,
+      rootSessionId: parent,
+      agentType: 'fork',
+      agentName: 'Digger',
+      description: 'Dig',
+      toolUseId: 'toolu_2',
+      depth: 2,
+    });
+    // A repair reports what it refuses, with the reason.
+    writeFileSync(join(dir, 'broken.jsonl'), `${row({ type: 'user', message: {} })}\n{`);
+    const refused = await collectSessions(store, config, { harness, repair: true });
+    expect(refused).toMatchObject({ failed: 1, repaired: [] });
+    expect(refused.refused).toEqual([
+      { file: join(dir, 'broken.jsonl'), reason: expect.stringContaining('Invalid transcript') },
+    ]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
