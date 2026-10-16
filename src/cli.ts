@@ -112,7 +112,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'import --file PATH --source codex|claude-code|chatgpt --project-id ID [--tag TAG]\n' +
         'collect --directory HISTORY --source codex|claude-code (--project-root CWD [--project-root ...] --project-id ID [--worktrees] [--subdirectories] | --catch-all) [--exclude PATH ...] [--atlas] [--watch]\n' +
         'collect --agent NAME [--watch]   (one collector from agents.json, routed against the others, re-read each scan)\n' +
-        'repair [--agent NAME]   (every collector once, from the transcripts still on disk: re-captures each session as it routes now, taking over one another project holds, and reports every session re-imported or refused)\n' +
+        'repair [--agent NAME]   (every collector once, from the transcripts still on disk: re-captures each session as it routes now, taking over one another project holds only when that row holds another transcript, and reports every session re-imported or refused)\n' +
         'list | search --query TEXT [--remote]   [--project-id ID] [--source S] [--tag T] [--suggested T] [--exempt exclude|include|only] [--provider P] [--model M] [--effort E] [--access-path subscription|api|unknown]\n' +
         'export --id ID | tag --id ID [--tag TAG ...] [--untag TAG ...]\n' +
         'tags list | tags define --tag TAG [--description TEXT] | tags remove --tag TAG   (the category tags the archive offers)\n' +
@@ -553,8 +553,8 @@ export async function runCli(args = Bun.argv.slice(2)) {
     process.removeListener('SIGINT', stop);
     process.removeListener('SIGTERM', stop);
   } else if (command === 'repair') {
-    // Every collector once, as the collectors route today, taking over sessions held under another
-    // project (a row that holds a subagent's transcript under its parent's key, from before 0.2).
+    // Every collector once, as the collectors route today, taking over a session another project
+    // holds only when its row holds another transcript (a subagent's, under its parent's key).
     const config = readAgents(agentsFile);
     if (!config) throw new Error('No agents.json; declare agents first');
     const names = v.agent ? [v.agent] : config.collectors.map((c) => c.name);

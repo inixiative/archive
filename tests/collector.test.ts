@@ -704,13 +704,31 @@ test('a subagent transcript never takes its parent’s key; a parent row holding
       toolUseId: 'toolu_2',
       depth: 2,
     });
+    // A session another project holds with its own content (routed there by a worktree since
+    // removed) is not a collision: the repair leaves it there.
+    const routed = join(dir, 'routed.jsonl');
+    writeFileSync(
+      routed,
+      JSON.stringify({
+        sessionId: 'routed',
+        cwd: '/work/a',
+        uuid: 'routed-1',
+        type: 'user',
+        message: { content: 'Worktree work' },
+      }),
+    );
+    await store.capture(
+      importTranscriptFile(routed, { source: 'claude-code', sourceId, projectId: 'b' }),
+    );
     // A repair reports what it refuses, with the reason.
     writeFileSync(join(dir, 'broken.jsonl'), `${row({ type: 'user', message: {} })}\n{`);
     const refused = await collectSessions(store, config, { harness, repair: true });
-    expect(refused).toMatchObject({ failed: 1, repaired: [] });
+    expect(refused).toMatchObject({ failed: 2, repaired: [] });
     expect(refused.refused).toEqual([
       { file: join(dir, 'broken.jsonl'), reason: expect.stringContaining('Invalid transcript') },
+      { file: routed, reason: 'Session is held by project b' },
     ]);
+    expect((await store.list()).find((a) => a.sessionId === 'routed')!.projectId).toBe('b');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
