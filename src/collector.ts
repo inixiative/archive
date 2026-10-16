@@ -13,7 +13,13 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { cwdRunTag, temporaryRoots } from './exemption';
 import { claudeSessionId } from './import';
 import { importTranscriptFile, transcriptAgentId } from './import-file';
-import { archiveKey, archiveSnapshotSchema, snapshotDigest, UNROUTED } from './index';
+import {
+  type ArchiveSnapshot,
+  archiveKey,
+  archiveSnapshotSchema,
+  snapshotDigest,
+  UNROUTED,
+} from './index';
 import type { ArchiveClient } from './remote';
 import { type AtlasFileConcepts, atlasTags, provenanceReferences } from './tags';
 
@@ -189,7 +195,18 @@ export function routeSession(
 }
 
 /** Where collected sessions go: an Archive server, or a store in-process. */
-export type ArchiveWriter = Pick<ArchiveClient, 'sourceId' | 'head' | 'capture' | 'claimState'>;
+export type ArchiveWriter = Pick<ArchiveClient, 'sourceId' | 'head' | 'capture' | 'claimState'> & {
+  /** Needed only by a repair, to tell a collided row from one routed elsewhere. */
+  read?: (id: string) => Promise<{ snapshot: Pick<ArchiveSnapshot, 'entries'> } | undefined>;
+};
+
+/** The stored row shares no entry with this transcript: it holds another session's content. */
+async function collided(archive: ArchiveWriter, id: string, snapshot: ArchiveSnapshot) {
+  const stored = await archive.read?.(id);
+  if (!stored) return false;
+  const own = new Set(snapshot.entries.map((entry) => entry.id));
+  return !stored.snapshot.entries.some((entry) => own.has(entry.id));
+}
 
 /**
  * The access path the harness's login implies when a transcript is silent, read from the harness
@@ -255,11 +272,11 @@ export interface CollectOptions {
   ) => 'subscription' | 'api' | undefined;
   now?: () => number;
   /**
-   * Re-capture every session as it routes now, taking over one another project holds: a row
+   * Take over a session another project holds only when its row holds another transcript: one
    * captured before subagent transcripts had their own identity holds a subagent's content under
-   * its parent's key and the subagent's project, and the guard below would otherwise refuse the
-   * parent's own transcript forever. Each session re-imported, and each refusal with its reason,
-   * is reported.
+   * its parent's key and the subagent's project, and the project guard would otherwise refuse the
+   * parent's own transcript forever. A row holding this transcript keeps its project. Each
+   * session re-imported, and each refusal with its reason, is reported.
    */
   repair?: boolean;
 }
@@ -430,7 +447,7 @@ export async function collectSessions(
       const old = await archive.head(id);
       // A session belongs to one project; only one the catch-all held moves to its routed project.
       const moved = old && old.projectId !== config.projectId && old.projectId !== UNROUTED;
-      if (moved && !options.repair) {
+      if (moved && !(options.repair && (await collided(archive, id, snapshot)))) {
         refuse(file, new Error(`Session is held by project ${old.projectId}`));
         remember('failed', meta);
         continue;
