@@ -52,6 +52,7 @@ const fakeKingdom = () => {
         return data({
           reviewCode: 'ABCDEF123456',
           expiresAt: new Date(Date.now() + 600000).toISOString(),
+          reviewUrl: 'https://kingdom.example/dashboard?reviewSignet=ABCDEF123456',
         });
       }
       if (action === 'installationInquiries') {
@@ -146,14 +147,17 @@ test('pair registers the Archive, waits for the claim, confirms the owner and co
       sourceId: crypto.randomUUID(),
       directory,
       request: pairingRequest({ kingdom: kingdom.url, organization: 'acme', destinations: [] }),
-      onReview: (review) => reviews.push(review.reviewCode),
+      onReview: (review) => reviews.push(review.reviewCode, review.review),
       confirmOwner: async ({ ownerName }) => {
         owners.push(ownerName);
         return true;
       },
       socketOptions: { pollMs: 10, retryBaseMs: 10_000 },
     });
-    expect(reviews).toEqual(['ABCDEF123456']);
+    expect(reviews).toEqual([
+      'ABCDEF123456',
+      'https://kingdom.example/dashboard?reviewSignet=ABCDEF123456',
+    ]);
     expect(kingdom.state.requests[0]).toMatchObject({
       owner: { ownerModel: 'Organization', organization: 'acme' },
       resources: [{ resourceKind: 'archiveLibrary', operations: ['sessions.write'], lens: {} }],
