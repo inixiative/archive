@@ -293,3 +293,94 @@ test('a collector tags an org-level session, and its subagent, with the projects
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('touched means accessed: file tool paths, shell arguments, cd and git -C; never content, prompts or prose', () => {
+  const home = homedir();
+  const org = join(home, 'code/inixiative');
+  const zealot = join(home, 'code/zealot');
+  const projects = [
+    { projectId: 'inixiative', roots: [org] },
+    { projectId: 'template', roots: [join(org, 'template'), join(org, 'template/.worktrees/a')] },
+    { projectId: 'userevidence', roots: [zealot, join(zealot, '.worktrees/pr')] },
+  ];
+  const claude = (name: string, input: object) => ({
+    kind: 'tool-call' as const,
+    text: JSON.stringify({ name, input }),
+  });
+  const codex = (name: string, args: unknown) => ({
+    kind: 'tool-call' as const,
+    text: JSON.stringify({
+      name,
+      arguments: typeof args === 'string' ? args : JSON.stringify(args),
+    }),
+  });
+  const tags = (entries: Pick<ArchiveEntry, 'kind' | 'text'>[], cwd = org) =>
+    projectTags(snapshot(entries), projects, cwd).sort();
+
+  // O4: an orchestrator session that only names ~/code/zealot in prompts, reports, written
+  // content, a heredoc or a commit message is not tagged userevidence.
+  expect(
+    tags([
+      { kind: 'user', text: 'Look at ~/code/zealot/apps/api' },
+      { kind: 'assistant', text: 'I read /Users/x/code/zealot/README.md' },
+      claude('Agent', { prompt: `Review ${zealot}/apps/api for me`, description: 'review' }),
+      claude('SendMessage', { to: 'main', message: `Done in ${zealot}/apps` }),
+      claude('Write', { file_path: join(org, 'notes.md'), content: `See ${zealot}/apps/api` }),
+      claude('Edit', { file_path: join(org, 'a.md'), old_string: 'x', new_string: `${zealot}/x` }),
+      claude('Bash', {
+        command: `cat > /tmp/r.md <<'EOF'\nZealot work lives in ${zealot}/apps\nEOF\ngit commit -m "touch ${zealot}/apps"`,
+        description: `mentions ${zealot}`,
+      }),
+      claude('Bash', { command: `echo "the repo is ${zealot}/apps"` }),
+    ]),
+  ).toEqual(['project:inixiative']);
+
+  // Access counts: file tools, shell arguments, cd and git -C, Codex commands and patches.
+  expect(tags([claude('Read', { file_path: `${zealot}/apps/api/index.ts` })])).toEqual([
+    'project:userevidence',
+  ]);
+  expect(tags([claude('Grep', { pattern: 'x', path: '~/code/zealot/apps' })])).toEqual([
+    'project:userevidence',
+  ]);
+  expect(tags([claude('Bash', { command: 'cd template/apps && ls ../package.json' })])).toEqual([
+    'project:template',
+  ]);
+  expect(tags([codex('exec_command', { cmd: 'git status', workdir: zealot })])).toEqual([
+    'project:userevidence',
+  ]);
+  expect(tags([codex('shell', { command: ['ls', `${zealot}/apps`] })])).toEqual([
+    'project:userevidence',
+  ]);
+  expect(
+    tags([
+      codex(
+        'apply_patch',
+        `*** Begin Patch\n*** Update File: ${org}/template/a.ts\n@@\n-x\n+y\n*** End Patch`,
+      ),
+    ]),
+  ).toEqual(['project:template']);
+  expect(
+    tags([
+      codex('exec', `const r = await tools.exec_command({cmd:"cat ${zealot}/package.json"});`),
+    ]),
+  ).toEqual(['project:userevidence']);
+  // Codex messages and plans name paths without accessing them.
+  expect(tags([codex('send_message', { target: 'x', message: `${zealot}/apps` })])).toEqual([]);
+
+  // O2: a project's own root counts, even one that holds its own worktrees.
+  expect(tags([claude('Bash', { command: 'git -C ~/code/zealot log -1' })])).toEqual([
+    'project:userevidence',
+  ]);
+  expect(tags([claude('Bash', { command: `git -C ${org}/template status` })])).toEqual([
+    'project:template',
+  ]);
+  // O1: the pure container tags nothing, with or without a trailing slash.
+  for (const command of [
+    'ls ~/code/inixiative/',
+    'ls ~/code/inixiative',
+    `find ${org}/ -maxdepth 1`,
+  ])
+    expect(tags([claude('Bash', { command })], '/tmp')).toEqual([]);
+  // The working directory counts as accessed.
+  expect(tags([], join(org, 'template/apps'))).toEqual(['project:template']);
+});

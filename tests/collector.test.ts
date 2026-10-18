@@ -58,8 +58,10 @@ test('collector matches exact provider cwd, retries partial files and keeps manu
     writeFileSync(join(dir, 'wanted.jsonl'), rows('wanted', root, 'More work'));
     const next = await collectSessions(store, config);
     expect(next.imported).toBe(2);
+    // Its working directory is the project's root: accessed, so tagged with its own project.
     expect((await await store.list()).find((a) => a.id === id)?.tags).toEqual([
       'coding',
+      'project:inixiative',
       'manually-reviewed',
     ]);
     expect(await await store.list()).toHaveLength(2);
@@ -98,7 +100,7 @@ test('Claude cwd metadata is collected without treating a destination name in te
     expect(result.imported).toBe(1);
     expect((await store.list())[0].projectId).toBe('userevidence');
     // A branch without a GitHub repository references no integration.
-    expect((await store.list())[0].tags).toEqual([]);
+    expect((await store.list())[0].tags).toEqual(['project:userevidence']);
     expect((await store.list())[0].references).toEqual([]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -258,7 +260,7 @@ test('an unchanged session is not sent again, and an untouched file is not read 
     expect(await collectSessions(writer, config, { harness })).toMatchObject({ imported: 2 });
     // The checkout is in a temp directory, so its sessions are inferred test runs: exempt, kept.
     const [listed] = await store.list({ exempt: 'only' });
-    expect(listed!.tags).toEqual(['run:test', 'run:inferred']);
+    expect(listed!.tags).toEqual(['run:test', 'run:inferred', 'project:a']);
     expect(listed!.references).toEqual([expect.objectContaining({ integration: 'github' })]);
     expect(calls.capture).toBe(2);
     // A restarted collector compares digests: nothing is sent.

@@ -212,6 +212,7 @@ test('a collector tags sessions from a test working directory it was told to col
     expect((await store.list({ exempt: 'include' }))[0]!.tags).toEqual([
       RUN_TAGS.test,
       RUN_INFERRED,
+      'project:foundry',
     ]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
