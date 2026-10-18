@@ -23,7 +23,11 @@ model Archive {
   id         String  @id
   /// Insertion order: listings are newest first.
   seq        BigInt  @unique @default(autoincrement())
+  /// The snapshot as its writer sent it: head, ingest and previousDigest speak this digest.
   digest     String
+  /// The current revision as stored here and published onward. Differs from `digest` only when
+  /// ingest filtered the snapshot (captureToolCallsAndResults off).
+  storedDigest String
   revision   Int
   source     String
   projectId  String?
@@ -49,10 +53,12 @@ model Archive {
   @@map("archives")
 }
 
-/// An immutable revision of a session.
+/// An immutable revision of a session. Only the current one is kept, plus one an outbox row
+/// still names until it is delivered (compaction).
 model Revision {
   archiveId String
   revision  Int
+  /// The digest of this revision's snapshot as stored.
   digest    String
   snapshot  Json
 

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { importTranscript, typedPrompt } from '../src/import';
 import { archiveSnapshotSchema, chunkArchive, selectChunks, snapshotDigest } from '../src/index';
-import { ArchiveStore } from '../src/store';
+import { ArchiveStore, RevisionCompacted } from '../src/store';
 import { freshStore, testDatabaseUrl } from './db';
 
 const snapshot = () =>
@@ -40,14 +40,15 @@ describe('session archives', () => {
     for (const chunk of small.chunks)
       expect(s.entries[0].text.slice(chunk.start, chunk.end)).toBe(chunk.text);
   });
-  test('capture is idempotent, retains prior versions and rejects older replacements', async () => {
+  test('capture is idempotent, compacts the revision it replaces and rejects older replacements', async () => {
     const store = await freshStore();
     const s = snapshot(),
       first = await store.capture(s);
     expect((await store.capture({ ...s, capturedAt: 2 })).changed).toBe(false);
     const edited = { ...s, title: 'Changed', capturedAt: 3 };
     expect((await store.capture(edited)).revision).toBe(2);
-    expect((await store.read(first.id, 1))?.snapshot.title).toBe(s.title);
+    expect(store.read(first.id, 1)).rejects.toThrow(RevisionCompacted);
+    expect((await store.read(first.id))?.snapshot.title).toBe('Changed');
     expect(store.capture({ ...s, capturedAt: 2 })).rejects.toThrow('Stale capture');
     expect(await store.receipt(first.id, 'destination')).toBeNull();
     await store.delivered(first.id, 'destination', snapshotDigest(edited));

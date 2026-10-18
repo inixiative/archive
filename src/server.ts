@@ -17,6 +17,8 @@ import {
   ArchiveStore,
   archiveSettingsSchema,
   ClaimHeld,
+  MaintenancePending,
+  RevisionCompacted,
   tagDefinitionSchema,
 } from './store';
 import type { SuggestionResult } from './suggest';
@@ -246,6 +248,14 @@ export function createArchiveHandler(
         return json({
           data: await store.updateSettings(archiveSettingsSchema.partial().parse(body)),
         });
+      if (path === '/api/v1/archive/maintenance/status') {
+        z.strictObject({}).parse(body);
+        return json({ data: await store.maintenanceStatus() });
+      }
+      if (path === '/api/v1/archive/maintenance/reclaim') {
+        z.strictObject({}).parse(body);
+        return json({ data: await store.reclaim() });
+      }
       if (path === '/api/v1/archive/tags/list')
         return json({
           data: { tags: await store.tagDefinitions(tagListSchema.parse(body).actorId) },
@@ -306,8 +316,13 @@ export function createArchiveHandler(
       }
       return json({ error: 'Not found' }, 404);
     } catch (error) {
-      if (error instanceof ArchiveConflict || error instanceof ClaimHeld)
+      if (
+        error instanceof ArchiveConflict ||
+        error instanceof ClaimHeld ||
+        error instanceof MaintenancePending
+      )
         return json({ error: error.message }, 409);
+      if (error instanceof RevisionCompacted) return json({ error: error.message }, 410);
       if (error instanceof Error && error.message === 'Archive unavailable')
         return json({ error: error.message }, 404);
       if (error instanceof KingdomGrantMissing) return json({ error: error.message }, 403);
@@ -327,9 +342,21 @@ export async function startArchiveServer(options: {
 }) {
   const store = new ArchiveStore(options.databaseUrl);
   try {
-    // Retention runs at start and hourly; it only ever deletes from this archive.
-    await store.prune();
-    const retention = setInterval(() => void store.prune().catch(() => {}), 3_600_000);
+    // Maintenance (retention, compaction, tool-activity removal) runs in the background at start,
+    // where it also compacts what earlier versions kept, and hourly. It only changes this archive.
+    const maintain = () =>
+      store.maintain().catch((error) =>
+        console.error(
+          JSON.stringify({
+            maintenance: 'failed',
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        ),
+      );
+    let maintenance = maintain();
+    const retention = setInterval(() => {
+      maintenance = maintain();
+    }, 3_600_000);
     retention.unref();
     const server = Bun.serve({
       port: options.port ?? 4700,
@@ -345,6 +372,7 @@ export async function startArchiveServer(options: {
       async close() {
         clearInterval(retention);
         await server.stop(true);
+        await maintenance;
         await store.close();
       },
     };

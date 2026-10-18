@@ -13,11 +13,18 @@ export const archiveSettingsSchema = z.strictObject({
     ),
   /** Archives whose latest capture is older than this are deleted here. Deletions never sync. */
   retentionDays: z.number().int().positive().max(36_500).nullable(),
+  /**
+   * Whether this Archive keeps tool calls and tool results. Off: ingest drops them from every
+   * snapshot, whoever writes it (collectors, Foundry, a syncing Archive), and maintenance removes
+   * those already held.
+   */
+  captureToolCallsAndResults: z.boolean(),
 });
 export type ArchiveSettings = z.infer<typeof archiveSettingsSchema>;
 export const defaultSettings: ArchiveSettings = {
   integrations: defaultIntegrations,
   retentionDays: null,
+  captureToolCallsAndResults: true,
 };
 
 export const tagSchema = z.string().min(1).max(120);

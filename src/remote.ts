@@ -39,6 +39,24 @@ export type RoutingPreview = (Pick<
   destinations: RoutedDestination[];
 })[];
 export type SyncResult = { id: string; destination: string; status: string };
+export type MaintenanceStatus = {
+  databaseBytes: number;
+  supersededRevisions: number;
+  revisionsAwaitingDelivery: number;
+  toolActivitySweepPending: boolean;
+  reclaim: {
+    state: 'running' | 'idle';
+    startedAt?: number;
+    last?: {
+      startedAt: number;
+      finishedAt: number;
+      beforeBytes: number;
+      afterBytes?: number;
+      error?: string;
+    };
+  };
+  tables: { table: string; totalBytes: number; liveRows: number; deadRows: number }[];
+};
 /** A project routed to a hosted Archive library through Kingdom. */
 export type KingdomRoute = { projectId: string; integrationId: string; resourceId: string };
 
@@ -234,6 +252,14 @@ export class ArchiveClient {
       'tags/list',
       actorId ? { actorId } : {},
     );
+  }
+  /** Compaction and tool-activity removal still to do, table sizes, and the last reclaim. */
+  maintenanceStatus() {
+    return this.request<MaintenanceStatus>('maintenance/status');
+  }
+  /** Starts returning freed space to the operating system; `maintenanceStatus` reports the outcome. */
+  reclaim() {
+    return this.request<{ started: boolean; beforeBytes: number }>('maintenance/reclaim');
   }
   destinations(filter: { projectId?: string } = {}) {
     return this.request<{ destinations: DestinationStatus[] }>('destinations/list', filter);

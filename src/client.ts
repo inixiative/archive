@@ -7,7 +7,7 @@ import {
   destinationUrl,
 } from './config';
 import { ArchiveRequestError, type RoutingPreview, refusalDetail, type SyncResult } from './remote';
-import type { ArchiveStore } from './store';
+import { type ArchiveStore, RevisionCompacted } from './store';
 
 export { type ArchiveDestination, archiveDestinationSchema } from './config';
 
@@ -99,11 +99,17 @@ export async function publishArchive(
     const previousDigest = await store.receipt(id, receiptKey);
     let pending = await store.pending(id, receiptKey);
     if (!pending) {
-      if (previousDigest === latest.digest) return { unchanged: !sent };
+      if (previousDigest === latest.storedDigest) return { unchanged: !sent };
       await store.enqueue(id, receiptKey, { revision: latest.revision });
       pending = (await store.pending(id, receiptKey))!;
     }
-    const queued = await store.read(id, pending.revision);
+    const queued = await store.read(id, pending.revision).catch(async (error) => {
+      // Compacted between queueing and reading, so never sent: queue the current revision instead.
+      if (!(error instanceof RevisionCompacted)) throw error;
+      await store.dropPending(id, receiptKey, pending.revision);
+      return null;
+    });
+    if (queued === null) continue;
     if (!queued || queued.snapshot.projectId !== destination.projectId)
       throw new Error('Pending archive is outside destination project');
     const acknowledged = await ingest(

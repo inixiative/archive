@@ -58,7 +58,7 @@ const request = (action: string, body: unknown, auth = token) =>
     body: JSON.stringify(body),
   });
 
-test('hosted auth, immutable revisions, concurrent-write conflicts and bounded search', async () => {
+test('hosted auth, compacted revisions, concurrent-write conflicts and bounded search', async () => {
   const store = await freshStore();
   const handler = createArchiveHandler(store, token);
   try {
@@ -95,11 +95,15 @@ test('hosted auth, immutable revisions, concurrent-write conflicts and bounded s
         )
       ).status,
     ).toBe(200);
+    // Only the current revision is kept: an earlier one is gone, not unknown.
+    expect((await handler(request('read', { archiveId: first.data.id, revision: 1 }))).status).toBe(
+      410,
+    );
     expect(
       readResponse.parse(
-        await (await handler(request('read', { archiveId: first.data.id, revision: 1 }))).json(),
+        await (await handler(request('read', { archiveId: first.data.id, revision: 2 }))).json(),
       ).data.snapshot.title,
-    ).toBe(s.title);
+    ).toBe('Edit');
     await handler(
       request('ingest', { snapshot: snapshot('inixiative', 'two'), previousDigest: null }),
     );
@@ -194,8 +198,11 @@ test('lost acknowledgement replays old revision before new content after client 
     await publishArchive(local, first.id, destination, ((url: any, options: any) =>
       handler(new Request(url, options))) as typeof fetch);
     expect((await remote.read(first.id))?.revision).toBe(2);
-    expect((await remote.read(first.id, 1))?.snapshot.title).toBe('Routing test');
+    // The replayed first revision reached the remote before the second, which compacted it.
+    expect(remote.read(first.id, 1)).rejects.toThrow('was compacted');
     expect((await remote.read(first.id))?.snapshot.title).toBe('Second');
+    // Delivered, the local revision the outbox held back is compacted too.
+    expect(local.read(first.id, 1)).rejects.toThrow('was compacted');
   } finally {
     await local.close();
     await remote.close();

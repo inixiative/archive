@@ -41,10 +41,18 @@ export async function prepareTestDatabases() {
       const database = new URL(url).pathname.slice(1);
       const [exists] = await admin`SELECT 1 FROM pg_database WHERE datname = ${database}`;
       if (!exists) await admin.unsafe(`CREATE DATABASE "${database}"`);
-      const push = Bun.spawnSync(
-        [process.execPath, 'x', 'prisma', 'db', 'push', '--skip-generate'],
-        { env: { ...process.env, DATABASE_URL: url }, stdout: 'ignore', stderr: 'pipe' },
-      );
+      const pushSchema = (...flags: string[]) =>
+        Bun.spawnSync(
+          [process.execPath, 'x', 'prisma', 'db', 'push', '--skip-generate', ...flags],
+          {
+            env: { ...process.env, DATABASE_URL: url },
+            stdout: 'ignore',
+            stderr: 'pipe',
+          },
+        );
+      let push = pushSchema();
+      // Test data is disposable: a schema change push cannot apply to leftover rows resets it.
+      if (!push.success) push = pushSchema('--force-reset');
       if (!push.success) throw new Error(`Test database ${name}: ${push.stderr.toString()}`);
     }
   } finally {
