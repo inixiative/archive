@@ -5,14 +5,7 @@ import { type ArchiveIntegration, archiveReferences, defaultIntegrations } from 
 export const TOOL_ACTIVITY_KINDS = ['tool-call', 'tool-result'] as const;
 export const TOOL_ACTIVITY_OMISSION =
   "Tool calls and tool results are not kept: this Archive's captureToolCallsAndResults setting is off.";
-
-/** Tools that start a subagent: their calls are what a child's `lineage.toolUseId` points at. */
-const SPAWN_TOOLS = new Set(['Agent', 'Task', 'spawn_agent']);
-/** Codex's tool for asking the person questions; its output holds their answers. */
-const CODEX_QUESTION_TOOLS = new Set(['request_user_input']);
-const REJECTION = /^The user doesn't want to proceed with this tool use\.[\s\S]*?the user said:\s*/;
-/** What Claude Code writes when the person chose to clarify a question instead of answering it. */
-const CLARIFY = /^The user wants to clarify these questions\./;
+const MAX_REFERENCES = 100;
 
 const parse = (text: string): unknown => {
   try {
@@ -25,72 +18,167 @@ const record = (value: unknown) =>
   value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
-/** A tool call's name and input, as the importers and Foundry write them. */
-const toolCall = (entry: ArchiveEntry | undefined) => {
+const string = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
+type ToolCall = { name: string; input?: Record<string, unknown> };
+/** A tool call's name and input, as the importers (`name`) and Foundry (`tool`) write them. */
+const toolCall = (entry: ArchiveEntry | undefined): ToolCall | undefined => {
   const call = record(entry && parse(entry.text));
-  const name = typeof call?.name === 'string' ? call.name : call?.tool;
-  if (typeof name !== 'string') return undefined;
+  const name = string(call?.name) ?? string(call?.tool);
+  if (!name) return undefined;
   const raw = call?.input ?? call?.arguments;
   return { name, input: record(typeof raw === 'string' ? parse(raw) : raw) };
 };
 
+const REJECTED = /^The user doesn't want to proceed with this tool use\./;
+const SAID = /the user said:\s*/;
+
 /**
- * The person's side of a tool result:
- * - `user`, what they typed: Claude Code's AskUserQuestion answers (`The user answered:
- *   "question"="answer"`), a rejected tool use or plan with their feedback (`… the user said: …`),
- *   and Codex `request_user_input` answers, rendered with their questions;
- * - `event`, a choice they made without typing (asking to clarify a question), which keeps the
- *   questions it names.
+ * The person's side of a tool result, one recogniser per shape Claude Code and Codex write. Each
+ * gives the entry the result becomes: `user` for what the person typed, `event` for a choice they
+ * made without typing. Results that match none are tool activity.
  */
-export function typedToolResult(
-  result: ArchiveEntry,
-  call?: ArchiveEntry,
-): { kind: 'user' | 'event'; text: string } | undefined {
+const RESULT_SHAPES: {
+  shape: string;
+  read: (result: string, call?: ToolCall) => { kind: 'user' | 'event'; text: string } | undefined;
+}[] = [
+  {
+    // AskUserQuestion: `The user answered: "question"="answer"` (older Claude Code wrote
+    // `Your questions have been answered: …`). The questions are in the text.
+    shape: 'answered',
+    read: (result) =>
+      /^(?:The user answered|Your questions have been answered): /.test(result)
+        ? { kind: 'user', text: result }
+        : undefined,
+  },
+  {
+    // A rejected tool use or plan with the person's typed feedback. Asking to clarify a question
+    // instead of answering it is a choice, and keeps the questions it names.
+    shape: 'rejected with feedback',
+    read: (result) => {
+      const said = REJECTED.test(result) ? SAID.exec(result) : null;
+      if (!said) return undefined;
+      const feedback = result.slice(said.index + said[0].length).trim();
+      if (!feedback) return undefined;
+      return {
+        kind: /^The user wants to clarify these questions\./.test(feedback) ? 'event' : 'user',
+        text: result,
+      };
+    },
+  },
+  {
+    // A rejection without feedback: the refusal of that call is the signal.
+    shape: 'rejected',
+    read: (result, call) => {
+      if (!REJECTED.test(result) || SAID.test(result)) return undefined;
+      const command = string(call?.input?.command);
+      return {
+        kind: 'event',
+        text: JSON.stringify({
+          rejected: call?.name ?? 'tool use',
+          ...(command && command.length <= 500 ? { command } : {}),
+        }),
+      };
+    },
+  },
+  {
+    // ExitPlanMode approval; the approved plan is in the text.
+    shape: 'plan approved',
+    read: (result) =>
+      /^User has approved your plan\./.test(result) ? { kind: 'event', text: result } : undefined,
+  },
+  {
+    // Codex request_user_input: answers by question id, written here with their questions.
+    shape: 'codex answered',
+    read: (result, call) => {
+      if (call?.name !== 'request_user_input') return undefined;
+      const answers = record(record(parse(result))?.answers);
+      if (!answers) return undefined;
+      const questions = Array.isArray(call.input?.questions) ? call.input.questions : [];
+      const parts = Object.entries(answers).flatMap(([id, value]) => {
+        const given = record(value)?.answers;
+        const list = Array.isArray(given) ? given.filter((a) => string(a)) : [];
+        if (!list.length) return [];
+        const question = questions.map(record).find((q) => q?.id === id);
+        return [`"${string(question?.question) ?? id}"="${list.join(', ')}"`];
+      });
+      return parts.length
+        ? { kind: 'user', text: `The user answered: ${parts.join(', ')}` }
+        : undefined;
+    },
+  },
+];
+
+/** The shape a tool result matches and the entry it becomes, or undefined for tool activity. */
+export function personToolResult(result: ArchiveEntry, call?: ArchiveEntry) {
   if (result.kind !== 'tool-result') return undefined;
-  if (result.text.startsWith('The user answered: ')) return { kind: 'user', text: result.text };
-  const rejection = REJECTION.exec(result.text);
-  if (rejection) {
-    const said = result.text.slice(rejection[0].length);
-    if (!said.trim()) return undefined;
-    return { kind: CLARIFY.test(said) ? 'event' : 'user', text: result.text };
-  }
   const asked = toolCall(call);
-  if (!asked || !CODEX_QUESTION_TOOLS.has(asked.name)) return undefined;
-  const answers = record(record(parse(result.text))?.answers);
-  if (!answers) return undefined;
-  const questions = Array.isArray(asked.input?.questions) ? asked.input.questions : [];
-  const parts = Object.entries(answers).flatMap(([id, value]) => {
-    const given = record(value)?.answers;
-    const list = Array.isArray(given) ? given.filter((a) => typeof a === 'string' && a) : [];
-    if (!list.length) return [];
-    const question = questions.map(record).find((q) => q?.id === id);
-    const text = typeof question?.question === 'string' ? question.question : id;
-    return [`"${text}"="${list.join(', ')}"`];
-  });
-  return parts.length
-    ? { kind: 'user', text: `The user answered: ${parts.join(', ')}` }
-    : undefined;
+  for (const { shape, read } of RESULT_SHAPES) {
+    const entry = read(result.text, asked);
+    if (entry) return { shape, ...entry };
+  }
+  return undefined;
 }
 
-/** Tool results that carry the person's answers become user (or event) entries, the question in their text. */
-export function typedToolResultsAsUser(entries: ArchiveEntry[]) {
+/** Tool results that carry the person's answers or choices become user or event entries. */
+export function personToolResults(entries: ArchiveEntry[]) {
   const calls = new Map(
     entries.flatMap((entry) =>
       entry.kind === 'tool-call' && entry.callId ? [[entry.callId, entry] as const] : [],
     ),
   );
   return entries.map((entry) => {
-    const typed = typedToolResult(entry, entry.callId ? calls.get(entry.callId) : undefined);
-    return typed ? { ...entry, ...typed } : entry;
+    const person = personToolResult(entry, entry.callId ? calls.get(entry.callId) : undefined);
+    return person ? { ...entry, kind: person.kind, text: person.text } : entry;
   });
 }
 
 /**
+ * Tool calls the strip keeps as a small event with the call's id and callId, one recogniser per
+ * shape: subagent spawns, which a child's `lineage.toolUseId` points at, and a Codex
+ * `request_user_input_async` question whose answer message does not repeat it.
+ */
+const CALL_SHAPES: {
+  shape: string;
+  keep: (call: ToolCall, entry: ArchiveEntry, entries: ArchiveEntry[]) => object | undefined;
+}[] = [
+  {
+    shape: 'spawn',
+    keep: (call) => {
+      if (!['Agent', 'Task', 'spawn_agent'].includes(call.name)) return undefined;
+      const detail =
+        string(call.input?.description) ??
+        string(call.input?.agent_type) ??
+        string(call.input?.subagent_type);
+      return { spawned: call.name, ...(detail ? { description: detail.slice(0, 500) } : {}) };
+    },
+  },
+  {
+    shape: 'codex question',
+    keep: (call, entry, entries) => {
+      if (call.name !== 'request_user_input_async' || !entry.callId) return undefined;
+      const callId = entry.callId;
+      // The answer arrives later as a message naming the call, with the question in it.
+      const answered = entries.some(
+        (other) =>
+          other.kind !== 'tool-call' &&
+          other.text.includes('send_user_message_question_reply') &&
+          other.text.includes(callId),
+      );
+      if (answered) return undefined;
+      const questions = (Array.isArray(call.input?.questions) ? call.input.questions : [])
+        .map(record)
+        .flatMap((q) => string(q?.question) ?? string(q?.title) ?? []);
+      return questions.length ? { asked: questions } : undefined;
+    },
+  },
+];
+
+/**
  * The snapshot without tool calls and tool results, its coverage saying so. What survives:
- * - what the person typed into a tool (answers, rejection feedback) as user entries;
- * - references linked only from tool activity, recorded in `references`;
- * - each subagent spawn as an event with the call's id and callId, so a child's lineage still
- *   resolves.
+ * - the person's answers, feedback and choices made through a tool (`RESULT_SHAPES`);
+ * - references linked only from tool activity, recorded in `references` (at most 100; a coverage
+ *   omission counts any beyond);
+ * - the calls `CALL_SHAPES` keep, as events with their id and callId.
  *
  * `changed` counts the entries dropped or rewritten; a snapshot with none is returned as it was.
  */
@@ -99,54 +187,62 @@ export function withoutToolActivity(
   integrations: ArchiveIntegration[] = defaultIntegrations,
 ) {
   const kinds: readonly string[] = TOOL_ACTIVITY_KINDS;
-  const typed = typedToolResultsAsUser(snapshot.entries);
+  const personal = personToolResults(snapshot.entries);
   const dropped: ArchiveEntry[] = [];
-  const entries = typed.flatMap((entry): ArchiveEntry[] => {
+  const entries = personal.flatMap((entry): ArchiveEntry[] => {
     if (!kinds.includes(entry.kind)) return [entry];
     dropped.push(entry);
-    const spawn = entry.kind === 'tool-call' ? toolCall(entry) : undefined;
-    if (!spawn || !SPAWN_TOOLS.has(spawn.name)) return [];
-    const detail =
-      spawn.input?.description ?? spawn.input?.agent_type ?? spawn.input?.subagent_type;
+    const call = entry.kind === 'tool-call' ? toolCall(entry) : undefined;
+    const kept = call
+      ? CALL_SHAPES.map(({ keep }) => keep(call, entry, personal)).find(Boolean)
+      : undefined;
+    if (!kept) return [];
     return [
       {
         id: entry.id,
         ...(entry.turnId ? { turnId: entry.turnId } : {}),
         ...(entry.callId ? { callId: entry.callId } : {}),
         kind: 'event',
-        text: JSON.stringify({
-          spawned: spawn.name,
-          ...(typeof detail === 'string' ? { description: detail.slice(0, 500) } : {}),
-        }),
+        text: JSON.stringify(kept),
         timestamp: entry.timestamp,
         sourceRef: entry.sourceRef,
       },
     ];
   });
-  const changed = dropped.length + typed.filter((entry, i) => entry !== snapshot.entries[i]).length;
+  const changed =
+    dropped.length + personal.filter((entry, i) => entry !== snapshot.entries[i]).length;
   if (!changed) return { snapshot, changed };
   // Links the kept text still carries are found there; only those in dropped entries are recorded.
+  const key = (r: { integration: string; ref: string }) => JSON.stringify([r.integration, r.ref]);
   const kept = new Set(
-    archiveReferences({ ...snapshot, entries }, integrations, 1_000).map((r) =>
-      JSON.stringify([r.integration, r.ref]),
-    ),
+    archiveReferences({ ...snapshot, entries }, integrations, Number.MAX_SAFE_INTEGER).map(key),
   );
   const linked = archiveReferences(
     { ...snapshot, references: [], entries: dropped },
     integrations,
-    100,
+    Number.MAX_SAFE_INTEGER,
   )
     .map(({ integration, ref }) => ({ integration, ref }))
-    .filter((r) => !kept.has(JSON.stringify([r.integration, r.ref])));
-  const references = [...(snapshot.references ?? []), ...linked].slice(0, 100);
-  const omissions = snapshot.coverage.omissions.includes(TOOL_ACTIVITY_OMISSION)
-    ? snapshot.coverage.omissions
-    : [...snapshot.coverage.omissions, TOOL_ACTIVITY_OMISSION].slice(-100);
+    .filter((r) => !kept.has(key(r)));
+  const all = [...(snapshot.references ?? []), ...linked];
+  const references = all.slice(0, MAX_REFERENCES);
+  const cut = all.length - references.length;
+  const omissions = [
+    ...snapshot.coverage.omissions,
+    TOOL_ACTIVITY_OMISSION,
+    ...(cut
+      ? [`${cut} references linked from tool activity beyond ${MAX_REFERENCES} were not recorded`]
+      : []),
+  ];
   return {
     snapshot: archiveSnapshotSchema.parse({
       ...snapshot,
       ...(references.length ? { references } : {}),
-      coverage: { ...snapshot.coverage, completeness: 'partial', omissions },
+      coverage: {
+        ...snapshot.coverage,
+        completeness: 'partial',
+        omissions: [...new Set(omissions)].slice(-100),
+      },
       entries,
     }),
     changed,

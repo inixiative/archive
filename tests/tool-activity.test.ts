@@ -252,8 +252,133 @@ test('outbox rows no route will deliver are released, and their revisions compac
     data: { supersededBy: first.id },
   });
   expect((await store.maintenanceStatus()).revisionsAwaitingDelivery).toBe(2);
+  // An empty list reads like a destinations file that failed to load: nothing is released.
   await syncArchives(store, []);
+  expect(await store.db.outbox.count()).toBe(2);
+  await syncArchives(store, [
+    { kind: 'archive', projectId: 'other', url: 'http://localhost:4499/', tokenEnv: 'UNUSED' },
+  ]);
   await store.maintain();
   expect(await store.db.outbox.count()).toBe(0);
   expect(await store.db.revision.count()).toBe(2);
+});
+
+// More live shapes (2026-10-18), shortened.
+const yourQuestions =
+  'Your questions have been answered: "Publishing json-rules 2.26.0 can\'t affect Zealot (it\'s locked at 2.24.0). Should I publish now?"="Publish now (Recommended)". You can now continue with these answers in mind.';
+const rejectedSilently =
+  "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.\n\nNote: The user's next message may contain a correction or preference.";
+const planApproved =
+  "User has approved your plan. You can now start coding. Start with updating your todo list if applicable\n\n## Approved Plan:\n# Reset Kingdom's local test database (kingdom_test)";
+
+test('each recognised shape becomes the person’s entry; the rest stays tool activity', () => {
+  const imported = importTranscript(
+    lines([
+      claudeRow('u1', 'user', [{ type: 'text', text: 'Release json-rules' }]),
+      claudeRow('a1', 'assistant', [
+        { type: 'tool_use', id: 'toolu_q', name: 'AskUserQuestion', input: { questions: [] } },
+        {
+          type: 'tool_use',
+          id: 'toolu_rm',
+          name: 'Bash',
+          input: { command: 'rm -rf .worktrees/old' },
+        },
+        { type: 'tool_use', id: 'toolu_plan', name: 'ExitPlanMode', input: { plan: '# Reset' } },
+      ]),
+      claudeRow('u2', 'user', [
+        { type: 'tool_result', tool_use_id: 'toolu_q', content: yourQuestions },
+        { type: 'tool_result', tool_use_id: 'toolu_rm', content: rejectedSilently },
+        { type: 'tool_result', tool_use_id: 'toolu_plan', content: planApproved },
+      ]),
+    ]),
+    { source: 'claude-code', sourceId },
+  );
+  const byCall = (id: string) =>
+    imported.entries.find((e) => e.callId === id && e.kind !== 'tool-call');
+  expect(byCall('toolu_q')).toMatchObject({ kind: 'user', text: yourQuestions });
+  expect(byCall('toolu_rm')?.kind).toBe('event');
+  expect(JSON.parse(byCall('toolu_rm')!.text)).toEqual({
+    rejected: 'Bash',
+    command: 'rm -rf .worktrees/old',
+  });
+  expect(byCall('toolu_plan')).toMatchObject({ kind: 'event', text: planApproved });
+});
+
+test('a Codex async question survives the strip unless its answer message carries it', () => {
+  const asked = (callId: string, title: string) => ({
+    type: 'response_item',
+    payload: {
+      type: 'function_call',
+      name: 'request_user_input_async',
+      call_id: callId,
+      arguments: JSON.stringify({ questions: [{ title }] }),
+    },
+  });
+  const accepted = (callId: string) => ({
+    type: 'response_item',
+    payload: { type: 'function_call_output', call_id: callId, output: '{"accepted":true}' },
+  });
+  const snapshot = importTranscript(
+    lines([
+      { type: 'session_meta', payload: { id: 'codex-async', originator: 'codex_cli_rs' } },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'Fix Segments' }],
+        },
+      },
+      asked('call_answered', 'Where are you seeing the issues?'),
+      accepted('call_answered'),
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'input_text',
+              text: `<send_user_message_question_reply> [{"questionItemId":"[\\"request_user_input_async\\",\\"call_answered\\",0]","question":"Where are you seeing the issues?","answer":"Segments navigation"}] </send_user_message_question_reply>`,
+            },
+          ],
+        },
+      },
+      asked('call_open', 'Which app shows the Segments issue?'),
+      accepted('call_open'),
+    ]),
+    { source: 'codex', sourceId },
+  );
+  const stripped = withoutToolActivity(snapshot).snapshot.entries;
+  expect(stripped.find((e) => e.callId === 'call_answered')).toBeUndefined();
+  expect(stripped.some((e) => e.text.includes('Segments navigation'))).toBe(true);
+  const open = stripped.find((e) => e.callId === 'call_open');
+  expect(open?.kind).toBe('event');
+  expect(JSON.parse(open!.text)).toEqual({ asked: ['Which app shows the Segments issue?'] });
+});
+
+test('references cut by the 100 cap are counted in coverage', () => {
+  const issues = Array.from(
+    { length: 130 },
+    (_, i) => `https://linear.app/acme/issue/ZLT-${i + 1}`,
+  );
+  const snapshot = archiveSnapshotSchema.parse({
+    ...capturedBefore(),
+    entries: [
+      ...capturedBefore().entries,
+      {
+        id: 'dump',
+        kind: 'tool-result',
+        text: issues.join('\n'),
+        timestamp: 1,
+        sourceRef: 'line:99',
+        callId: 'toolu_list',
+      },
+    ],
+  });
+  const stripped = withoutToolActivity(snapshot).snapshot;
+  expect(stripped.references).toHaveLength(100);
+  expect(stripped.coverage.omissions).toContain(
+    '31 references linked from tool activity beyond 100 were not recorded',
+  );
 });

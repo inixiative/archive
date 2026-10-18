@@ -335,27 +335,6 @@ test('the search index is rebuilt once compaction is done, and reclaim rewrites 
 test('maintenance and reclaim never overlap, and a search index build in progress is left alone', async () => {
   const store = await freshStore();
   await store.capture(session(turns));
-  // A maintenance run in progress refuses a reclaim.
-  const running = store.maintain();
-  expect(store.reclaim()).rejects.toThrow('Maintenance or a reclaim is running');
-  await running;
-  // A reclaim in progress makes maintenance a no-op.
-  await store.reclaim();
-  expect(store.reclaiming.state).toBe('running');
-  const held = await store.capture({ ...session(turns.slice(0, 1)), sessionId: 'held' });
-  await store.enqueue(held.id, 'destination', { revision: 1 });
-  await store.capture({ ...session(turns.slice(0, 2), 2), sessionId: 'held' });
-  await store.db.outbox.deleteMany({});
-  await store.maintain();
-  expect((await store.maintenanceStatus()).supersededRevisions).toBe(1);
-  for (let i = 0; store.reclaiming.state === 'running' && i < 600; i++) await Bun.sleep(50);
-  await store.maintain();
-  expect((await store.maintenanceStatus()).supersededRevisions).toBe(0);
-  expect(store.reclaiming.last?.error).toBeUndefined();
-  expect(await searchIndexValid(store)).toBe(true);
-
-  // A concurrent build waits on an old snapshot, leaving an invalid index while it is in progress.
-  await store.db.$executeRawUnsafe('DROP INDEX IF EXISTS "chunks_text_idx"');
   const url = new URL(
     process.env.ARCHIVE_TEST_DATABASE_URL ??
       'postgresql://archive:archive@127.0.0.1:6132/archive_test',
@@ -365,6 +344,38 @@ test('maintenance and reclaim never overlap, and a search index build in progres
   const builder = new Bun.SQL(url.href, { max: 1 });
   const reserved = await holder.reserve();
   try {
+    // A maintenance run in progress refuses a reclaim.
+    const running = store.maintain();
+    expect(store.reclaim()).rejects.toThrow('Maintenance or a reclaim is running');
+    await running;
+
+    // A reclaim in progress makes maintenance a no-op. An open transaction that has read chunks
+    // holds the reclaim at its first step (dropping the index concurrently waits for it), while
+    // captures go on.
+    await reserved`BEGIN`;
+    await reserved`SELECT count(*) FROM "chunks"`;
+    await store.reclaim();
+    expect(store.reclaiming.state).toBe('running');
+    // A second reclaim is refused at once, before anything is awaited.
+    expect(store.reclaim()).rejects.toThrow('Maintenance or a reclaim is running');
+    const held = await store.capture({ ...session(turns.slice(0, 1)), sessionId: 'held' });
+    await store.enqueue(held.id, 'destination', { revision: 1 });
+    await store.capture({ ...session(turns.slice(0, 2), 2), sessionId: 'held' });
+    await store.db.outbox.deleteMany({});
+    await store.maintain();
+    // Still held, however fast VACUUM FULL would be on this small database.
+    await Bun.sleep(500);
+    expect(store.reclaiming.state).toBe('running');
+    expect((await store.maintenanceStatus()).supersededRevisions).toBe(1);
+    await reserved`COMMIT`;
+    for (let i = 0; store.reclaiming.state === 'running' && i < 600; i++) await Bun.sleep(50);
+    expect(store.reclaiming.last?.error).toBeUndefined();
+    await store.maintain();
+    expect((await store.maintenanceStatus()).supersededRevisions).toBe(0);
+    expect(await searchIndexValid(store)).toBe(true);
+
+    // A concurrent build waits on an old snapshot, leaving an invalid index while it is in progress.
+    await store.db.$executeRawUnsafe('DROP INDEX IF EXISTS "chunks_text_idx"');
     await reserved`BEGIN ISOLATION LEVEL REPEATABLE READ`;
     await reserved`SELECT count(*) FROM "chunks"`;
     // Bun's queries run when awaited: start the build now, without waiting for it.

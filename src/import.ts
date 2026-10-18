@@ -4,7 +4,7 @@ import {
   type ArchiveSnapshot,
   archiveSnapshotSchema,
 } from './index';
-import { typedToolResultsAsUser } from './tool-activity';
+import { personToolResults } from './tool-activity';
 
 export interface ImportOptions {
   source: 'codex' | 'claude-code';
@@ -387,6 +387,6 @@ export function importTranscriptLines(
       ],
     },
     // What the person typed into a tool (an answer, a rejection's feedback) is theirs, not tool activity.
-    entries: typedToolResultsAsUser(entries),
+    entries: personToolResults(entries),
   });
 }

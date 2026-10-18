@@ -601,6 +601,8 @@ export class ArchiveStore {
    * revisions they hold can be compacted. `destinations` are the configured identities.
    */
   async releaseOutbox(destinations: string[]) {
+    // An empty list is more likely a destinations file that failed to read than no routes at all.
+    if (!destinations.length) return 0;
     return (await this.db.outbox.deleteMany({ where: { destination: { notIn: destinations } } }))
       .count;
   }
@@ -830,13 +832,20 @@ export class ArchiveStore {
   async reclaim() {
     if (this.maintaining || this.reclaiming.state === 'running')
       throw new MaintenancePending('Maintenance or a reclaim is running; try again when it ends');
-    const before = await this.maintenanceStatus();
-    if (before.supersededRevisions || before.toolActivitySweepPending)
+    // Claimed before the first await, so a maintenance run starting meanwhile sees it.
+    const idle = this.reclaiming;
+    const startedAt = Date.now();
+    this.reclaiming = { state: 'running', startedAt };
+    const before = await this.maintenanceStatus().catch((error) => {
+      this.reclaiming = idle;
+      throw error;
+    });
+    if (before.supersededRevisions || before.toolActivitySweepPending) {
+      this.reclaiming = idle;
       throw new MaintenancePending(
         'Compaction or tool-activity removal is still running; reclaim once maintenance finishes',
       );
-    const startedAt = Date.now();
-    this.reclaiming = { state: 'running', startedAt };
+    }
     const finish = (outcome: { afterBytes?: number; error?: string }) => {
       this.reclaiming = {
         state: 'idle',
@@ -881,48 +890,47 @@ export class ArchiveStore {
    * them. Turning `captureToolCallsAndResults` off queues removal of the tool activity already held.
    */
   async updateSettings(change: Partial<ArchiveSettings>) {
-    return this.db.$transaction(
-      async (tx) => {
-        // Waits for captures in flight (they hold it shared), so none lands after the sweep passed it.
-        await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(${SETTINGS_LOCK})`;
-        const previous = await this.settings(tx);
-        const next = archiveSettingsSchema.parse({ ...previous, ...change });
+    const { previous, next } = await this.db.$transaction(async (tx) => {
+      // Waits for captures in flight (they hold it shared), so none lands after the sweep passed it.
+      await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(${SETTINGS_LOCK})`;
+      const previous = await this.settings(tx);
+      const next = archiveSettingsSchema.parse({ ...previous, ...change });
+      await tx.setting.upsert({
+        where: { key: 'archive' },
+        create: { key: 'archive', value: next },
+        update: { value: next },
+      });
+      if (previous.captureToolCallsAndResults && !next.captureToolCallsAndResults)
         await tx.setting.upsert({
-          where: { key: 'archive' },
-          create: { key: 'archive', value: next },
-          update: { value: next },
+          where: { key: TOOL_ACTIVITY_SWEEP },
+          create: { key: TOOL_ACTIVITY_SWEEP, value: { afterSeq: '0' } },
+          update: { value: { afterSeq: '0' } },
         });
-        if (previous.captureToolCallsAndResults && !next.captureToolCallsAndResults)
-          await tx.setting.upsert({
-            where: { key: TOOL_ACTIVITY_SWEEP },
-            create: { key: TOOL_ACTIVITY_SWEEP, value: { afterSeq: '0' } },
-            update: { value: { afterSeq: '0' } },
-          });
-        if (next.captureToolCallsAndResults)
-          await tx.setting.deleteMany({ where: { key: TOOL_ACTIVITY_SWEEP } });
-        if (JSON.stringify(previous.integrations) === JSON.stringify(next.integrations))
-          return next;
-        const archives = await tx.archive.findMany({ select: { id: true, revision: true } });
-        for (const archive of archives) {
-          const row = await tx.revision.findUnique({
-            where: { archiveId_revision: { archiveId: archive.id, revision: archive.revision } },
-            select: { snapshot: true },
-          });
-          if (!row) continue;
-          await tx.archive.update({
-            where: { id: archive.id },
-            data: {
-              summary: summarize(
-                archiveSnapshotSchema.parse(row.snapshot),
-                next,
-              ) as Prisma.InputJsonValue,
-            },
-          });
-        }
-        return next;
-      },
-      { timeout: 600_000, maxWait: 30_000 },
-    );
+      if (next.captureToolCallsAndResults)
+        await tx.setting.deleteMany({ where: { key: TOOL_ACTIVITY_SWEEP } });
+      return { previous, next };
+    });
+    if (JSON.stringify(previous.integrations) === JSON.stringify(next.integrations)) return next;
+    // After the lock is released, so captures go on. Captures from here on summarize with the new
+    // integrations themselves; a row a capture moved on meanwhile is left to that capture.
+    const archives = await this.db.archive.findMany({ select: { id: true, revision: true } });
+    for (const archive of archives) {
+      const row = await this.db.revision.findUnique({
+        where: { archiveId_revision: { archiveId: archive.id, revision: archive.revision } },
+        select: { snapshot: true },
+      });
+      if (!row) continue;
+      await this.db.archive.updateMany({
+        where: { id: archive.id, revision: archive.revision },
+        data: {
+          summary: summarize(
+            archiveSnapshotSchema.parse(row.snapshot),
+            next,
+          ) as Prisma.InputJsonValue,
+        },
+      });
+    }
+    return next;
   }
   /** Offered tags with how many archives carry each; an actor sees archive-wide and their own. */
   async tagDefinitions(actorId?: string) {
