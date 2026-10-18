@@ -6,8 +6,12 @@ import {
   describeDestination,
   destinationIdentity,
   kingdomDestinationSchema,
-  readDestinations,
+  organizationSchema,
+  readRouting,
   removeDestination,
+  removeOrganization,
+  sessionOrganizations,
+  setOrganization,
 } from './config';
 import { archiveReferenceSchema, archiveSnapshotSchema, selectChunks } from './index';
 import { KingdomGrantMissing, pairedDestination, pairedLibraries } from './kingdom';
@@ -82,9 +86,11 @@ const claimHoldSchema = z.strictObject({
 const claimFulfilSchema = claimSession.extend({ claimant: z.string().min(1).max(256), archiveId });
 const claimStateSchema = claimSession.extend({ modifiedAt: z.number().optional() });
 const tagRemoveSchema = tagDefinitionSchema.pick({ tag: true, actorId: true });
-const destinationListSchema = z.strictObject({ projectId: filterFields.projectId });
+const destinationListSchema = z.strictObject({
+  organizationId: organizationSchema.shape.id.optional(),
+});
 const kingdomRouteSchema = kingdomDestinationSchema.pick({
-  projectId: true,
+  organizationId: true,
   integrationId: true,
   resourceId: true,
 });
@@ -265,25 +271,48 @@ export function createArchiveHandler(
       if (path === '/api/v1/archive/tags/remove')
         return json({ data: { removed: await store.undefineTag(tagRemoveSchema.parse(body)) } });
       if (config && path === '/api/v1/archive/destinations/list') {
-        const { projectId } = destinationListSchema.parse(body);
+        const { organizationId } = destinationListSchema.parse(body);
+        const routing = readRouting(config.destinationsFile);
+        const archives = await store.list({ exempt: 'include' });
         const destinations = [];
-        for (const destination of readDestinations(config.destinationsFile))
-          if (!projectId || destination.projectId === projectId)
+        for (const destination of routing.destinations)
+          if (!organizationId || destination.organizationId === organizationId) {
+            const routed = archives.filter((a) =>
+              sessionOrganizations(routing, a).includes(destination.organizationId),
+            );
             destinations.push({
               ...describeDestination(destination),
-              ...(await store.delivery(destination.projectId, destinationIdentity(destination))),
+              ...(await store.delivery(
+                routed.map((a) => a.id),
+                destinationIdentity(destination),
+              )),
             });
+          }
         return json({ data: { destinations } });
+      }
+      if (config && path === '/api/v1/archive/organizations/list') {
+        z.strictObject({}).parse(body);
+        return json({
+          data: { organizations: readRouting(config.destinationsFile).organizations },
+        });
+      }
+      if (config && path === '/api/v1/archive/organizations/set')
+        return json({
+          data: {
+            organizations: setOrganization(config.destinationsFile, organizationSchema.parse(body)),
+          },
+        });
+      if (config && path === '/api/v1/archive/organizations/remove') {
+        const { id } = organizationSchema.pick({ id: true }).parse(body);
+        return json({ data: { removed: removeOrganization(config.destinationsFile, id) } });
       }
       if (config && path === '/api/v1/archive/destinations/routes') {
         z.strictObject({}).parse(body);
-        return json({
-          data: await routingPreview(store, readDestinations(config.destinationsFile)),
-        });
+        return json({ data: await routingPreview(store, readRouting(config.destinationsFile)) });
       }
       if (config && path === '/api/v1/archive/destinations/sync') {
         z.strictObject({}).parse(body);
-        return json({ data: await syncArchives(store, readDestinations(config.destinationsFile)) });
+        return json({ data: await syncArchives(store, readRouting(config.destinationsFile)) });
       }
       if (config && path === '/api/v1/archive/destinations/libraries') {
         z.strictObject({}).parse(body);
@@ -296,10 +325,10 @@ export function createArchiveHandler(
       }
       if (config && path === '/api/v1/archive/destinations/remove') {
         const route = kingdomRouteSchema.parse(body);
-        const configured = readDestinations(config.destinationsFile).find(
+        const configured = readRouting(config.destinationsFile).destinations.find(
           (d) =>
             d.kind === 'kingdom' &&
-            d.projectId === route.projectId &&
+            d.organizationId === route.organizationId &&
             d.integrationId === route.integrationId &&
             d.resourceId === route.resourceId,
         );
@@ -307,7 +336,7 @@ export function createArchiveHandler(
           data: {
             removed: configured
               ? removeDestination(config.destinationsFile, {
-                  projectId: route.projectId,
+                  organizationId: route.organizationId,
                   identity: destinationIdentity(configured),
                 })
               : false,

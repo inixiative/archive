@@ -11,6 +11,7 @@ import { createArchiveHandler } from '../src/server';
 import type { ArchiveStore } from '../src/store';
 import { TOOL_ACTIVITY_OMISSION } from '../src/tool-activity';
 import { freshStore } from './db';
+import { routing } from './routing';
 
 const token = 'synthetic-archive-test-token-0000000000';
 const entry = (id: string, kind: ArchiveSnapshot['entries'][number]['kind'], text: string) => ({
@@ -121,7 +122,7 @@ test('a publish whose queued revision was compacted before sending queues the cu
     const first = await store.capture(session(turns.slice(0, 1)));
     const destination: ArchiveDestination = {
       kind: 'archive',
-      projectId: 'inixiative',
+      organizationId: 'inixiative',
       url: 'http://localhost:4412/',
       tokenEnv: 'ARCHIVE_COMPACTION_TEST_TOKEN',
     };
@@ -131,8 +132,10 @@ test('a publish whose queued revision was compacted before sending queues the cu
       data: { archiveId: first.id, destination: destinationIdentity(destination), revision: 1 },
     });
     const handler = createArchiveHandler(remote, token);
-    await publishArchive(store, first.id, destination, ((url: string, options: RequestInit) =>
-      handler(new Request(url, options))) as unknown as typeof fetch);
+    await publishArchive(store, first.id, destination, routing([destination]), ((
+      url: string,
+      options: RequestInit,
+    ) => handler(new Request(url, options))) as unknown as typeof fetch);
     expect((await remote.read(first.id))?.snapshot.entries).toHaveLength(2);
     expect(await store.pending(first.id, destinationIdentity(destination))).toBeNull();
   } finally {
@@ -188,7 +191,7 @@ test('archives with different tool settings publish to each other and then stay 
   process.env.ARCHIVE_COMPACTION_TEST_TOKEN = token;
   const destination: ArchiveDestination = {
     kind: 'archive',
-    projectId: 'inixiative',
+    organizationId: 'inixiative',
     url: 'http://localhost:4413/',
     tokenEnv: 'ARCHIVE_COMPACTION_TEST_TOKEN',
   };
@@ -201,21 +204,30 @@ test('archives with different tool settings publish to each other and then stay 
     // Local keeps tool activity, the destination does not.
     await remote.updateSettings({ captureToolCallsAndResults: false });
     const first = await local.capture(session(turns));
-    expect(await publishArchive(local, first.id, destination, transport(remote))).toEqual({
+    expect(
+      await publishArchive(local, first.id, destination, routing([destination]), transport(remote)),
+    ).toEqual({
       unchanged: false,
     });
     expect(await chunkKinds(remote, first.id)).toEqual(['assistant', 'user']);
-    expect(await publishArchive(local, first.id, destination, transport(remote))).toEqual({
+    expect(
+      await publishArchive(local, first.id, destination, routing([destination]), transport(remote)),
+    ).toEqual({
       unchanged: true,
     });
     await local.capture(session([...turns, entry('a2', 'assistant', 'Done')], 2));
-    await publishArchive(local, first.id, destination, transport(remote));
+    await publishArchive(local, first.id, destination, routing([destination]), transport(remote));
     expect((await remote.read(first.id))?.snapshot.entries.map((e) => e.id)).toEqual([
       'u1',
       'a1',
       'a2',
     ]);
-    expect(await local.delivery('inixiative', destinationIdentity(destination))).toEqual({
+    expect(
+      await local.delivery(
+        (await local.list({ exempt: 'include' })).map((a) => a.id),
+        destinationIdentity(destination),
+      ),
+    ).toEqual({
       delivered: 1,
       pending: 0,
     });
@@ -224,12 +236,25 @@ test('archives with different tool settings publish to each other and then stay 
     await local.updateSettings({ captureToolCallsAndResults: false });
     await remote.updateSettings({ captureToolCallsAndResults: true });
     const second = await local.capture({ ...session(turns, 3), sessionId: 'second' });
-    await publishArchive(local, second.id, destination, transport(remote));
+    await publishArchive(local, second.id, destination, routing([destination]), transport(remote));
     expect(await chunkKinds(remote, second.id)).toEqual(['assistant', 'user']);
-    expect(await publishArchive(local, second.id, destination, transport(remote))).toEqual({
+    expect(
+      await publishArchive(
+        local,
+        second.id,
+        destination,
+        routing([destination]),
+        transport(remote),
+      ),
+    ).toEqual({
       unchanged: true,
     });
-    expect(await local.delivery('inixiative', destinationIdentity(destination))).toEqual({
+    expect(
+      await local.delivery(
+        (await local.list({ exempt: 'include' })).map((a) => a.id),
+        destinationIdentity(destination),
+      ),
+    ).toEqual({
       delivered: 2,
       pending: 0,
     });

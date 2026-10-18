@@ -6,6 +6,7 @@ import { connectDestination, destinationsFile, kingdomDirectory } from '../src/c
 import { archiveSnapshotSchema } from '../src/index';
 import { startArchiveServer } from '../src/server';
 import { freshStore, MIGRATED_DATABASE, testDatabaseUrl } from './db';
+import { routing } from './routing';
 
 const token = 'synthetic-archive-test-token-0000000000';
 const hostedToken = 'synthetic-hosted-archive-token-000000000';
@@ -33,14 +34,17 @@ test('serve --sync publishes what it receives to its destinations from the same 
     mkdirSync(dirname(destinationsFile(home)), { recursive: true });
     writeFileSync(
       destinationsFile(home),
-      JSON.stringify([
-        {
-          kind: 'archive',
-          projectId: 'inixiative',
-          url: hosted.server.url.href,
-          tokenEnv: 'HOSTED_TOKEN',
-        },
-      ]),
+      JSON.stringify({
+        organizations: [{ id: 'inixiative', projects: ['inixiative'] }],
+        destinations: [
+          {
+            kind: 'archive',
+            organizationId: 'inixiative',
+            url: hosted.server.url.href,
+            tokenEnv: 'HOSTED_TOKEN',
+          },
+        ],
+      }),
     );
     const reader = local.stdout.getReader();
     let printed = '';
@@ -100,7 +104,7 @@ test('routes and sync run against the Archive server of the home, without DATABA
   const { DATABASE_URL: _databaseUrl, ARCHIVE_TOKEN: _archiveToken, ...env } = process.env;
   const cli = async (command: string) => {
     const run = Bun.spawn(
-      ['bun', 'src/cli.ts', command, '--home', home, '--url', local.server.url.href],
+      ['bun', 'src/cli.ts', ...command.split(' '), '--home', home, '--url', local.server.url.href],
       { env: { ...env, ARCHIVE_DEBUG: '1' }, stdout: 'pipe', stderr: 'pipe' },
     );
     const [stdout, stderr, exitCode] = await Promise.all([
@@ -114,10 +118,13 @@ test('routes and sync run against the Archive server of the home, without DATABA
   try {
     connectDestination(destinationsFile(home), {
       kind: 'archive',
-      projectId: 'inixiative',
+      organizationId: 'inixiative',
       url: hosted.server.url.href,
       tokenFile: join(home, 'hosted.token'),
     });
+    expect(await cli('organizations set --id inixiative --project inixiative')).toEqual([
+      { id: 'inixiative', projects: ['inixiative'] },
+    ]);
     const captured = await local.store.capture(
       archiveSnapshotSchema.parse({
         schemaVersion: 1,
@@ -136,7 +143,10 @@ test('routes and sync run against the Archive server of the home, without DATABA
       {
         id: captured.id,
         projectId: 'inixiative',
-        destinations: [{ kind: 'archive', url: hosted.server.url.href }],
+        organizations: ['inixiative'],
+        destinations: [
+          { kind: 'archive', organizationId: 'inixiative', url: hosted.server.url.href },
+        ],
       },
     ]);
     expect(await cli('sync')).toEqual([

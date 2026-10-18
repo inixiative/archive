@@ -5,10 +5,12 @@ import {
   destinationIdentity,
   destinationToken,
   destinationUrl,
+  type Routing,
+  sessionDestinations,
+  sessionOrganizations,
 } from './config';
 import { ArchiveRequestError, type RoutingPreview, refusalDetail, type SyncResult } from './remote';
 import { type ArchiveStore, RevisionCompacted } from './store';
-import { PROJECT_TAG_PREFIX } from './tags';
 
 export { type ArchiveDestination, archiveDestinationSchema } from './config';
 
@@ -81,16 +83,27 @@ const ingest = async (
     ? (await archiveRequest(destination, 'ingest', body, transport)).data
     : await kingdomArchiveOperation(destination, 'sessions.write', body)) as Ingested | undefined;
 
+/**
+ * Publishes one archive to one destination of an organization it belongs to (its own project's,
+ * or a touched project's; `sessionOrganizations`).
+ */
 export async function publishArchive(
   store: ArchiveStore,
   id: string,
   input: ArchiveDestination,
+  routing: Routing,
   transport: typeof fetch = fetch,
 ) {
   const destination = archiveDestinationSchema.parse(input);
   const archive = await store.head(id);
-  if (!archive || 'deleted' in archive || archive.projectId !== destination.projectId)
-    throw new Error('Archive is outside destination project');
+  const listed = await store.listing(id);
+  if (
+    !archive ||
+    'deleted' in archive ||
+    !listed ||
+    !sessionOrganizations(routing, listed).includes(destination.organizationId)
+  )
+    throw new Error('Archive is outside the destination organization');
   // A raw capture its driver later stored itself stays local: the driver's version is the one that travels.
   if (archive.supersededBy) return { unchanged: true };
   const receiptKey = destinationIdentity(destination);
@@ -111,8 +124,7 @@ export async function publishArchive(
       return null;
     });
     if (queued === null) continue;
-    if (!queued || queued.snapshot.projectId !== destination.projectId)
-      throw new Error('Pending archive is outside destination project');
+    if (!queued) throw new Error('Pending archive is unavailable');
     const acknowledged = await ingest(
       destination,
       { previousDigest, snapshot: queued.snapshot },
@@ -125,47 +137,22 @@ export async function publishArchive(
   throw new Error('Archive changed repeatedly during publication; retry sync');
 }
 
-/**
- * The projects in another ownership boundary a session touched, for one destination. Boundaries
- * are the destinations each project routes to (`destinations.json`): a `project:` tag naming a
- * project routed elsewhere, and never to this destination, crosses one. Such a session stays
- * local for that destination, so neither its content nor the other boundary's project ids leave
- * through it. Projects with no destination claim no boundary.
- */
-export function boundaryCrossings(
-  tags: readonly string[],
-  destination: ArchiveDestination,
-  destinations: ArchiveDestination[],
-): string[] {
-  const identity = destinationIdentity(destination);
-  return tags.flatMap((tag) => {
-    if (!tag.startsWith(PROJECT_TAG_PREFIX)) return [];
-    const projectId = tag.slice(PROJECT_TAG_PREFIX.length);
-    const routes = destinations.filter((d) => d.projectId === projectId).map(destinationIdentity);
-    return routes.length && !routes.includes(identity) ? [projectId] : [];
-  });
-}
-
 export async function routingPreview(
   store: ArchiveStore,
-  destinations: ArchiveDestination[],
+  routing: Routing,
 ): Promise<RoutingPreview> {
   return (await store.list({ exempt: 'include' })).map((archive) => ({
     id: archive.id,
     projectId: archive.projectId,
     tags: archive.tags,
     suggestedTags: archive.suggestedTags,
-    destinations: destinations
-      .filter((d) => d.projectId === archive.projectId)
-      .map((d) => {
-        const withheld = boundaryCrossings(archive.tags, d, destinations);
-        return {
-          kind: d.kind,
-          url: d.url,
-          ...(d.kind === 'kingdom' ? { integrationId: d.integrationId } : {}),
-          ...(withheld.length ? { withheld } : {}),
-        };
-      }),
+    organizations: sessionOrganizations(routing, archive),
+    destinations: sessionDestinations(routing, archive).map((d) => ({
+      kind: d.kind,
+      organizationId: d.organizationId,
+      url: d.url,
+      ...(d.kind === 'kingdom' ? { integrationId: d.integrationId } : {}),
+    })),
   }));
 }
 
@@ -185,7 +172,7 @@ const outage = (error: unknown) => {
 
 export async function syncArchives(
   store: ArchiveStore,
-  destinations: ArchiveDestination[],
+  routing: Routing,
   options: { backoff?: SyncBackoff; now?: () => number } = {},
 ): Promise<SyncResult[]> {
   const now = options.now ?? Date.now;
@@ -195,10 +182,10 @@ export async function syncArchives(
   const delay = (failures: number) =>
     Math.min(BACKOFF_BASE_MS * 2 ** (failures - 1), BACKOFF_MAX_MS);
   // A route that was removed never delivers: release the revisions its outbox rows hold.
-  await store.releaseOutbox(destinations.map(destinationIdentity));
+  await store.releaseOutbox(routing.destinations.map(destinationIdentity));
   const archives = await store.list({ exempt: 'include' });
   for (const archive of archives)
-    for (const destination of destinations.filter((d) => d.projectId === archive.projectId)) {
+    for (const destination of sessionDestinations(routing, archive)) {
       const identity = destinationIdentity(destination);
       const key = JSON.stringify([archive.id, identity]);
       const down = JSON.stringify(['destination', identity]);
@@ -214,22 +201,13 @@ export async function syncArchives(
         deferred(circuit.until);
         continue;
       }
-      const crossed = boundaryCrossings(archive.tags, destination, destinations);
-      if (crossed.length) {
-        results.push({
-          id: archive.id,
-          destination: destination.url,
-          status: `withheld: touched ${crossed.join(', ')}, in another ownership boundary`,
-        });
-        continue;
-      }
       const waiting = backoff?.get(key);
       if (waiting && now() < waiting.until && waiting.digest === archive.digest) {
         deferred(waiting.until);
         continue;
       }
       try {
-        const result = await publishArchive(store, archive.id, destination);
+        const result = await publishArchive(store, archive.id, destination, routing);
         backoff?.delete(key);
         backoff?.delete(down);
         results.push({
@@ -268,27 +246,17 @@ export async function searchRemotes(
       try {
         const data =
           destination.kind === 'archive'
-            ? (
-                await archiveRequest(destination, 'search', {
-                  query,
-                  budget,
-                  projectId: destination.projectId,
-                })
-              ).data
-            : await kingdomArchiveOperation(destination, 'documents.search', {
-                query,
-                budget,
-                projectId: destination.projectId,
-              });
+            ? (await archiveRequest(destination, 'search', { query, budget })).data
+            : await kingdomArchiveOperation(destination, 'documents.search', { query, budget });
         return {
           destination: destination.url,
-          projectId: destination.projectId,
+          organizationId: destination.organizationId,
           data,
         };
       } catch {
         return {
           destination: destination.url,
-          projectId: destination.projectId,
+          organizationId: destination.organizationId,
           error: 'Remote unavailable',
         };
       }

@@ -9,6 +9,7 @@ import { RUN_INFERRED, RUN_TAGS, stampedRun, stampRunDirectory } from '../src/ex
 import { archiveSnapshotSchema } from '../src/index';
 import { createArchiveHandler } from '../src/server';
 import { freshStore } from './db';
+import { routing } from './routing';
 
 const token = 'synthetic-archive-test-token-0000000000';
 const session = (sessionId: string, tags: string[] = [], projectId = 'inixiative') =>
@@ -156,19 +157,23 @@ test('a destination that does not keep run sessions acknowledges them, so they a
     const { id } = await store.capture(session('synced-run', [RUN_TAGS.test]));
     const destination: ArchiveDestination = {
       kind: 'archive',
-      projectId: 'inixiative',
+      organizationId: 'inixiative',
       url: 'http://localhost:4413/',
       tokenEnv: 'ARCHIVE_RUN_SESSIONS_TEST_TOKEN',
     };
     const handler = createArchiveHandler(remote, token);
     const transport = ((url: string, options: RequestInit) =>
       handler(new Request(url, options))) as unknown as typeof fetch;
-    expect(await publishArchive(store, id, destination, transport)).toEqual({ unchanged: false });
+    expect(await publishArchive(store, id, destination, routing([destination]), transport)).toEqual(
+      { unchanged: false },
+    );
     expect(await remote.list({ exempt: 'include' })).toEqual([]);
     expect(await store.receipt(id, destinationIdentity(destination))).toBe(
       (await store.head(id))!.storedDigest,
     );
-    expect(await publishArchive(store, id, destination, transport)).toEqual({ unchanged: true });
+    expect(await publishArchive(store, id, destination, routing([destination]), transport)).toEqual(
+      { unchanged: true },
+    );
   } finally {
     delete process.env.ARCHIVE_RUN_SESSIONS_TEST_TOKEN;
   }
@@ -288,16 +293,20 @@ test('a session a person rescued from a run tag is stored without it, so an "off
     expect((await store.list()).map((a) => a.sessionId)).toEqual(['rescued']);
     const destination: ArchiveDestination = {
       kind: 'archive',
-      projectId: 'inixiative',
+      organizationId: 'inixiative',
       url: 'http://localhost:4414/',
       tokenEnv: 'ARCHIVE_RUN_SESSIONS_TEST_TOKEN',
     };
     const handler = createArchiveHandler(remote, token);
     const transport = ((url: string, options: RequestInit) =>
       handler(new Request(url, options))) as unknown as typeof fetch;
-    expect(await publishArchive(store, id, destination, transport)).toEqual({ unchanged: false });
+    expect(await publishArchive(store, id, destination, routing([destination]), transport)).toEqual(
+      { unchanged: false },
+    );
     expect((await remote.list()).map((a) => a.sessionId)).toEqual(['rescued']);
-    expect(await publishArchive(store, id, destination, transport)).toEqual({ unchanged: true });
+    expect(await publishArchive(store, id, destination, routing([destination]), transport)).toEqual(
+      { unchanged: true },
+    );
   } finally {
     delete process.env.ARCHIVE_RUN_SESSIONS_TEST_TOKEN;
   }

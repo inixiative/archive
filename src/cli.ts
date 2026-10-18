@@ -32,7 +32,9 @@ import {
   connectDestination,
   destinationsFile,
   kingdomDirectory,
-  readDestinations,
+  readRouting,
+  removeOrganization,
+  setOrganization,
 } from './config';
 import { stampedRun } from './exemption';
 import { importTranscriptFile } from './import-file';
@@ -61,6 +63,8 @@ export async function runCli(args = Bun.argv.slice(2)) {
       url: { type: 'string' },
       kind: { type: 'string', default: 'archive' },
       'project-id': { type: 'string' },
+      'organization-id': { type: 'string' },
+      project: { type: 'string', multiple: true },
       'integration-id': { type: 'string' },
       'resource-id': { type: 'string' },
       'credential-file': { type: 'string' },
@@ -118,7 +122,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
   const command = positionals[0];
   if (v.help || !command) {
     process.stdout.write(
-      'Archive: init | up | down | serve | connect (setup) | preview | import | collect | repair | list | export | tag | tags | suggest | routes | sync | search | settings | maintenance | agents\n' +
+      'Archive: init | up | down | serve | connect (setup) | preview | import | collect | repair | list | export | tag | tags | suggest | routes | sync | search | settings | maintenance | organizations | agents\n' +
         'up | down   (the local Archive: bundled compose.yaml with Postgres, data in --home)\n' +
         'serve [--port 4700 --hostname 127.0.0.1] [--sync]   (DATABASE_URL; token from ARCHIVE_SERVER_TOKEN or --token-file)\n' +
         'import --file PATH --source codex|claude-code|chatgpt --project-id ID [--tag TAG]\n' +
@@ -130,8 +134,9 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'tags list | tags define --tag TAG [--description TEXT] | tags remove --tag TAG   (the category tags the archive offers)\n' +
         'suggest [--limit N] [--batch 8] [--concurrency 2] [--model claude-haiku-5-5] [--refresh]   (tag suggestions on the Claude subscription; test and Oracle runs are exempt)\n' +
         "pair --kingdom KINGDOM_API_URL [--name NAME] [--organization SLUG|ID] [--library ID|NAME ...] [--yes]   (register this Archive with Kingdom, asking for sessions.write on those libraries, by default the ones its Kingdom destinations name, else the owner's; claim the review code there, then confirm the owner)\n" +
-        'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH)   (a remote Archive, for serve --sync)\n' +
-        'connect --kind kingdom --url KINGDOM_API_URL --credential-file PATH --integration-id UUID --resource-id UUID --project-id ID   (a hosted Archive through Kingdom)\n' +
+        'connect --url HTTPS_URL --organization-id ID (--token-env ENV | --token-file PATH)   (a remote Archive an organization publishes to, for serve --sync)\n' +
+        'connect --kind kingdom --url KINGDOM_API_URL --credential-file PATH --integration-id UUID --resource-id UUID --organization-id ID   (a hosted Archive through Kingdom)\n' +
+        'organizations list | organizations set --id ID [--project ID ...] | organizations remove --id ID   (the projects each organization owns; a session publishes to every organization its project or a project it touched belongs to)\n' +
         'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
         "settings [--capture-tool-calls-and-results true|false] [--capture-run-sessions true|false] [--retention-days N|off]   (read, or change, this Archive's settings)\n" +
         'maintenance status | maintenance reclaim   (compaction left to do and table sizes; return freed space to the OS once compaction is done)\n' +
@@ -224,7 +229,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
     const sync = (async () => {
       while (v.sync && !stopped) {
         try {
-          const results = await syncArchives(instance.store, readDestinations(config), { backoff });
+          const results = await syncArchives(instance.store, readRouting(config), { backoff });
           const failed = results.filter((r) => r.status.startsWith('failed'));
           if (failed.length) console.error(JSON.stringify({ sync: 'failed', archives: failed }));
         } catch {
@@ -259,7 +264,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
           kingdom: v.kingdom,
           organization: v.organization,
           libraries: v.library,
-          destinations: readDestinations(config),
+          destinations: readRouting(config).destinations,
         }),
         onReview: (review) => console.error(JSON.stringify(review)),
         onError: (error) =>
@@ -280,7 +285,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       v.kind === 'kingdom'
         ? {
             kind: 'kingdom',
-            projectId: v['project-id'],
+            organizationId: v['organization-id'],
             url: v.url,
             credentialFile: v['credential-file'] && resolve(v['credential-file']),
             integrationId: v['integration-id'],
@@ -288,7 +293,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
           }
         : {
             kind: 'archive',
-            projectId: v['project-id'],
+            organizationId: v['organization-id'],
             url: v.url,
             tokenEnv: v['token-env'] ?? (v['token-file'] ? undefined : 'ARCHIVE_TOKEN'),
             tokenFile: v['token-file'] && resolve(v['token-file']),
@@ -301,12 +306,23 @@ export async function runCli(args = Bun.argv.slice(2)) {
         query: '',
         budget: 16,
         limit: 1,
-        projectId: destination.projectId,
       });
       if (!Array.isArray(probe.data?.archives))
         throw new Error('Destination is not an Archive-compatible endpoint');
     }
     output(connectDestination(config, destination));
+    return;
+  }
+  if (command === 'organizations') {
+    const action = positionals[1] ?? 'list';
+    if (action === 'list') output(readRouting(config).organizations);
+    else if (action === 'set') {
+      if (!v.id) throw new Error('organizations set requires --id');
+      output(setOrganization(config, { id: v.id, projects: v.project ?? [] }));
+    } else if (action === 'remove') {
+      if (!v.id) throw new Error('organizations remove requires --id');
+      output({ removed: removeOrganization(config, v.id) });
+    } else throw new Error('Unknown organizations command; use --help');
     return;
   }
   if (command === 'agents') {
@@ -381,7 +397,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
     return;
   }
   if (command === 'search' && v.remote) {
-    const results = await searchRemotes(readDestinations(config), v.query!);
+    const results = await searchRemotes(readRouting(config).destinations, v.query!);
     output(results);
     if (results.some((r) => 'error' in r)) process.exitCode = 1;
     return;

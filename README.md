@@ -44,7 +44,8 @@ Every deployment runs the published image `ghcr.io/inixiative/archive` (tags: ve
 The local Archive publishes onward to destinations. Place the destination's token in a private file under the server's config directory (`chmod 600`, owned by you) or an environment variable, then run:
 
 ```sh
-archive connect --url https://your-archive.example --project-id inixiative --token-file ~/.local/share/archive/config/credentials/inixiative.token
+archive organizations set --id inixiative --project inixiative --project template --project kingdom
+archive connect --url https://your-archive.example --organization-id inixiative --token-file ~/.local/share/archive/config/credentials/inixiative.token
 archive search --remote --query 'migration'
 ```
 
@@ -83,10 +84,10 @@ bun run archive pair --kingdom https://api.your-kingdom.example --name "Work lap
 
 Open the link. The review opens with that owner and those libraries selected; change them if you need to, and approve. The command waits for approval, then shows which owner it was registered with and asks you to accept. Pass `--yes` to accept without the prompt; without a terminal, `--yes` is required. Only then does it collect the Signet (0600) and list the libraries it may write to. Confirming the owner protects you if someone else claimed your code into their own owner.
 
-Next, route a project to one of those libraries:
+Next, publish an organization to one of those libraries:
 
 ```sh
-bun run archive connect --kind kingdom --url https://api.your-kingdom.example --credential-file ~/.local/share/archive/config/kingdom/KINGDOM_HOST/signet-SIGNET.json --integration-id HOSTED_ARCHIVE_INTEGRATION --resource-id LIBRARY --project-id inixiative
+bun run archive connect --kind kingdom --url https://api.your-kingdom.example --credential-file ~/.local/share/archive/config/kingdom/KINGDOM_HOST/signet-SIGNET.json --integration-id HOSTED_ARCHIVE_INTEGRATION --resource-id LIBRARY --organization-id inixiative
 ```
 
 `connect` checks that the Signet grants `sessions.write` on that library before it saves anything. `serve --sync` then sends each changed session through `POST /api/v1/access/execute`. Every call carries the Signet's access token and a fresh DPoP proof (`@inixiative/signet` renews the token).
@@ -105,17 +106,20 @@ Foundry writes its captures to the local Archive server through `@inixiative/arc
 
 ## Routing
 
-Only explicit `projectId` matches authorize publication. An archive with no matching destination stays local. Multiple matches create deliberate separate copies. `routes` previews these destinations before upload. Tags, references and actors never change ownership or routing, with one conservative exception that only withholds: a session whose `project:` tags name a project in another ownership boundary stays local for a destination. A project's boundary is the destinations it routes to; a session that touched a project routed elsewhere, and never to this destination (orchestrator work on `userevidence` from `~/code/inixiative`, a Zealot session that touched an inixiative project), is not sent there, so neither its content nor the other boundary's project ids leave through it. `routes` lists such a destination with `withheld` (the projects), and `sync` reports it `withheld`. A project with no destination claims no boundary.
+One archive per organization, not per project: projects are tags. `destinations.json` declares `organizations` (each an `id` and the `projects` it owns; a project belongs to at most one) and `destinations` (each naming its `organizationId`). A session publishes to the destinations of every organization its own project, or a project it touched (its `project:` tags, captured or added by a person), belongs to. A session that worked on two organizations' projects goes to both, tagged with both, and each copy keeps its own `projectId`. A project in no organization (and `unrouted`) stays local. `routes` previews each archive's `organizations` and destinations before upload. References and actors never change routing. `archive organizations list | set --id ID --project P ... | remove --id ID` edits the organizations (`set` replaces the list; a project another organization owns is refused; `remove` drops its destinations too). There is no backwards compatibility: a `destinations.json` written before 0.23.0 (a bare list of destinations with `projectId`) is refused until it is rewritten in this shape.
 
 The server manages routes over HTTP too, so Foundry can read and set them. Only Kingdom destinations are set this way, through the Signets `pair` collected; direct token destinations stay CLI-only.
 
 | Action | Body | Returns |
 |---|---|---|
-| `destinations/list` | `projectId?` | `destinations`: each as `connect` reports it, with `delivered` (archives acknowledged at their latest digest) and `pending` |
+| `destinations/list` | `organizationId?` | `destinations`: each as `connect` reports it, with `delivered` (the organization's archives acknowledged at their latest digest) and `pending` |
+| `organizations/list` | none | `organizations`: each `id` and its `projects` |
+| `organizations/set` | `id`, `projects` | `organizations` |
+| `organizations/remove` | `id` | `removed` |
 | `destinations/libraries` | none | `paired`, and the `libraries` (`integrationId`, `resourceId`, `name`) the held Signets may write to |
-| `destinations/connect` | `projectId`, `integrationId`, `resourceId` | the saved destination, after Kingdom confirms `sessions.write` on the library (403 otherwise) |
-| `destinations/remove` | `projectId`, `integrationId`, `resourceId` | `removed` |
-| `destinations/routes` | none | each archive with the destinations its project routes to; nothing is sent |
+| `destinations/connect` | `organizationId`, `integrationId`, `resourceId` | the saved destination, after Kingdom confirms `sessions.write` on the library (403 otherwise); an organization not declared yet is added with no projects |
+| `destinations/remove` | `organizationId`, `integrationId`, `resourceId` | `removed` |
+| `destinations/routes` | none | each archive with its `organizations` and their destinations; nothing is sent |
 | `destinations/sync` | none | one publication to every destination: `id`, `destination`, `status` per archive and route |
 
 `@inixiative/archive/remote`'s `ArchiveClient` wraps these as `destinations()`, `libraries()`, `connectDestination()`, `removeDestination()`, `routes()` and `sync()`. The sync loop picks up changes within 30 seconds.

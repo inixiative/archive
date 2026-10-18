@@ -5,6 +5,7 @@ import { type ArchiveSnapshot, archiveSnapshotSchema } from '../src/index';
 import type { ArchiveStore } from '../src/store';
 import { withoutToolActivity } from '../src/tool-activity';
 import { freshStore } from './db';
+import { routing } from './routing';
 
 const sourceId = '1ae3ac76-faa8-4498-8072-425ab35f453c';
 const lines = (rows: unknown[]) => rows.map((row) => JSON.stringify(row)).join('\n');
@@ -253,11 +254,19 @@ test('outbox rows no route will deliver are released, and their revisions compac
   });
   expect((await store.maintenanceStatus()).revisionsAwaitingDelivery).toBe(2);
   // An empty list reads like a destinations file that failed to load: nothing is released.
-  await syncArchives(store, []);
+  await syncArchives(store, routing([]));
   expect(await store.db.outbox.count()).toBe(2);
-  await syncArchives(store, [
-    { kind: 'archive', projectId: 'other', url: 'http://localhost:4499/', tokenEnv: 'UNUSED' },
-  ]);
+  await syncArchives(
+    store,
+    routing([
+      {
+        kind: 'archive',
+        organizationId: 'other',
+        url: 'http://localhost:4499/',
+        tokenEnv: 'UNUSED',
+      },
+    ]),
+  );
   await store.maintain();
   expect(await store.db.outbox.count()).toBe(0);
   expect(await store.db.revision.count()).toBe(2);

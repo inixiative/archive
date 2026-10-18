@@ -345,7 +345,7 @@ test('agents CLI edits agents.json declaratively', async () => {
 test('token files: exactly one credential source, private regular file, read at request time', async () => {
   const dir = temp();
   const file = join(dir, 'archive.token');
-  const base = { kind: 'archive', projectId: 'p', url: 'https://a.example/' };
+  const base = { kind: 'archive', organizationId: 'p', url: 'https://a.example/' };
   expect(archiveDestinationSchema.safeParse({ ...base, tokenFile: file }).success).toBe(true);
   expect(archiveDestinationSchema.safeParse({ ...base, tokenFile: 'relative.token' }).success).toBe(
     false,
@@ -393,15 +393,18 @@ test('token files: exactly one credential source, private regular file, read at 
       home,
       '--url',
       instance.server.url.href,
-      '--project-id',
+      '--organization-id',
       'p',
       '--token-file',
       file,
     ]);
     const saved = JSON.parse(readFileSync(destinationsFile(home), 'utf8'));
-    expect(saved).toEqual([
-      { projectId: 'p', url: instance.server.url.href, tokenFile: file, kind: 'archive' },
-    ]);
+    expect(saved).toEqual({
+      organizations: [{ id: 'p', projects: [] }],
+      destinations: [
+        { organizationId: 'p', url: instance.server.url.href, tokenFile: file, kind: 'archive' },
+      ],
+    });
   } finally {
     await instance.close();
   }

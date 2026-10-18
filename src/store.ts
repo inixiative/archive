@@ -369,6 +369,14 @@ export class ArchiveStore {
    * One page of archive metadata, newest first, read from the database in batches. Tags are the
    * captured tags with this archive's edits applied. `keep` narrows each batch further (search).
    */
+  /** One archive's listing (tags with this archive's edits applied), exempt or not. */
+  async listing(id: string) {
+    const row = await this.db.archive.findUnique({
+      where: { id },
+      include: { tagEdits: true, suggestion: { select: { digest: true, by: true, tags: true } } },
+    });
+    return row ? listing(row, { exempt: 'include' })[0] : undefined;
+  }
   async page(
     filter: ArchiveFilter,
     limit: number,
@@ -1210,10 +1218,10 @@ export class ArchiveStore {
     // The revision it held back is compacted unless another destination still waits on it.
     if (pending) await dropRevision(this.db, id, pending.revision);
   }
-  /** A project's archives at one destination: delivered at their latest digest, or pending. */
-  async delivery(projectId: string, destination: string) {
+  /** These archives at one destination: delivered at their latest digest, or pending. */
+  async delivery(archiveIds: string[], destination: string) {
     const archives = await this.db.archive.findMany({
-      where: { projectId, supersededBy: null },
+      where: { id: { in: archiveIds }, supersededBy: null },
       select: {
         storedDigest: true,
         receipts: { where: { destination }, select: { digest: true } },
