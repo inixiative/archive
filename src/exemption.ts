@@ -57,17 +57,27 @@ export function markedRun(cwd: string): string | undefined {
 }
 
 /**
- * INTERIM inference, until every fixture and runner stamps explicitly; delete once they do.
- * Foundry's test fixtures as they exist today: project `P`, the watcher threads, and ACP client
- * probes outside a project.
+ * Agent types Foundry gives the subagents it starts inside a person's session (in-session Wardens:
+ * their root, dispatchers and members) and inside its decision hosts (`d-`/`w-` and 16 hex). Its
+ * permission hook refuses these types to anyone else, so matching them never drops a real subagent.
+ */
+const FOUNDRY_AGENT_TYPE = /^(?:foundry-(?:root|dispatch|warden)|[dw]-[0-9a-f]{16})$/;
+
+/**
+ * The run tags a session's identity implies. `run:foundry` for Foundry's own subagents (above),
+ * by their recorded agent type. INTERIM, until every fixture stamps explicitly (delete then):
+ * `run:test` for Foundry's test fixtures as they exist today: project `P`, the watcher threads,
+ * and ACP client probes outside a project.
  */
 export function identityRunTags(session: {
   source: string;
   sessionId: string;
   projectId?: string | null;
   tags: readonly string[];
+  lineage?: { agentType?: string } | null;
 }): string[] {
-  const { source, sessionId, projectId, tags } = session;
+  const { source, sessionId, projectId, tags, lineage } = session;
+  if (lineage?.agentType && FOUNDRY_AGENT_TYPE.test(lineage.agentType)) return [RUN_TAGS.foundry];
   const test =
     projectId === 'P' ||
     (source === 'foundry' && /^watch-[AB]$/.test(sessionId)) ||

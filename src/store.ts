@@ -118,6 +118,7 @@ const baseTags = (summary: Summary) => [
       sessionId: summary.sessionId,
       projectId: summary.projectId,
       tags: summary.capturedTags,
+      lineage: summary.lineage,
     }),
   ]),
 ];

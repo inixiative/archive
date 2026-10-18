@@ -215,3 +215,40 @@ test('a collector counts what the server dropped and does not send it again', as
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("Foundry's own subagents are run:foundry by agent type; a person's subagents are not", async () => {
+  const store = await freshStore();
+  const subagent = (agentId: string, agentType: string) => ({
+    ...session(`parent/agent-${agentId}`),
+    lineage: { kind: 'subagent' as const, parentSessionId: 'parent', agentType },
+  });
+  for (const [id, type] of [
+    ['w5', 'foundry-warden'],
+    ['g1', 'foundry-dispatch'],
+    ['r', 'foundry-root'],
+    ['d', 'd-0123456789abcdef'],
+  ])
+    await store.capture(subagent(id!, type!));
+  await store.capture(subagent('gp', 'general-purpose'));
+  await store.capture(subagent('lookalike', 'foundry-warden-helper'));
+  expect((await store.list()).map((a) => a.sessionId).sort()).toEqual([
+    'parent/agent-gp',
+    'parent/agent-lookalike',
+  ]);
+  expect(
+    new Set(
+      (await store.list({ exempt: 'only' })).flatMap((a) =>
+        a.tags.filter((t) => t.startsWith('run:')),
+      ),
+    ),
+  ).toEqual(new Set([RUN_TAGS.foundry]));
+  await store.updateSettings({ captureRunSessions: false });
+  await store.maintain();
+  expect((await store.list({ exempt: 'include' })).map((a) => a.sessionId).sort()).toEqual([
+    'parent/agent-gp',
+    'parent/agent-lookalike',
+  ]);
+  expect((await store.capture({ ...subagent('w6', 'foundry-warden') })).dropped).toBe(
+    RUN_TAGS.foundry,
+  );
+});
