@@ -152,7 +152,7 @@ export async function pairedLibraries(directory: string) {
 /** The Kingdom destination for a library, through whichever held Signet grants writing to it. */
 export async function pairedDestination(
   directory: string,
-  route: { projectId: string; integrationId: string; resourceId: string },
+  route: { organizationId: string; integrationId: string; resourceId: string },
 ): Promise<KingdomDestination> {
   for (const credentialFile of heldSignets(directory)) {
     const destination: KingdomDestination = {

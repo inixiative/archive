@@ -111,6 +111,15 @@ export const tokenCount = (text: string) => {
 export const digest = (text: string) => createHash('sha256').update(text).digest('hex');
 export const archiveKey = (snapshot: Pick<ArchiveSnapshot, 'sourceId' | 'source' | 'sessionId'>) =>
   digest(JSON.stringify([snapshot.sourceId, snapshot.source, snapshot.sessionId]));
+/**
+ * The transcript a snapshot was imported from, without what a collector adds around it (tags,
+ * references, runtime, project, capture time): a tombstone matches on it, so a new collector, an
+ * Atlas or tag change never brings a deleted session back, while a resumed one (new entries) does.
+ */
+export const transcriptDigest = (
+  snapshot: Pick<ArchiveSnapshot, 'source' | 'sessionId' | 'entries'>,
+) => digest(JSON.stringify([snapshot.source, snapshot.sessionId, snapshot.entries]));
+
 export const snapshotDigest = (snapshot: ArchiveSnapshot) => {
   const { capturedAt: _, ...content } = snapshot;
   return digest(JSON.stringify(content));

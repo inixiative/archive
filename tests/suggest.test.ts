@@ -8,6 +8,7 @@ import {
   exemptRun,
   identityRunTags,
   markedRun,
+  RUN_INFERRED,
   RUN_TAGS,
   stampedRun,
   stampRunDirectory,
@@ -70,19 +71,64 @@ type Reply = {
   nextCursor: string | null;
 };
 
-test('identity rules exempt Foundry test fixtures, never a project ACP thread', () => {
+test('identity rules exempt Foundry test fixtures, never an ACP thread', () => {
   const run = (session: Partial<Parameters<typeof identityRunTags>[0]>) =>
-    identityRunTags({ source: 'foundry', sessionId: 't1', tags: [], ...session });
+    identityRunTags({ source: 'foundry', sessionId: 't1', ...session });
   expect(run({ projectId: 'P' })).toEqual([RUN_TAGS.test]);
   expect(run({ source: 'claude-code', projectId: 'P' })).toEqual([RUN_TAGS.test]);
   expect(run({ sessionId: 'watch-A', projectId: 'foundry' })).toEqual([RUN_TAGS.test]);
-  expect(run({ tags: ['acp', 'acp:t3-code'] })).toEqual([RUN_TAGS.test]);
-  expect(run({ tags: ['acp:Paseo'], projectId: 'P' })).toEqual([RUN_TAGS.test]);
-  expect(run({ tags: ['acp', 'acp:Paseo'], projectId: 'template' })).toEqual([]);
+  // A person's Zed, T3 or Paseo thread outside a registered project is their work.
+  expect(run({})).toEqual([]);
+  expect(run({ projectId: 'template' })).toEqual([]);
   expect(run({ sessionId: 'watch-C' })).toEqual([]);
   expect(run({ source: 'claude-code', sessionId: 'watch-A' })).toEqual([]);
   expect(exemptRun(['run:test', 'run:oracle'])).toBe('oracle');
   expect(exemptRun(['debugging'])).toBeUndefined();
+});
+
+test('a run marker never stamps from a collector root or above, nor from home or the root', () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'archive-ceiling-')));
+  try {
+    const org = join(dir, 'org');
+    const work = join(org, 'kingdom', 'apps');
+    mkdirSync(work, { recursive: true });
+    // A stray marker at the collector root (the ~/code/inixiative/.archive-run case) and above it.
+    writeFileSync(join(org, '.archive-run'), 'test\n');
+    writeFileSync(join(dir, '.archive-run'), 'oracle\n');
+    expect(markedRun(work, [org])).toBeUndefined();
+    expect(markedRun(org, [org])).toBeUndefined();
+    expect(markedRun(work, [join(org, 'kingdom')])).toBeUndefined();
+    // Below every root it counts.
+    stampRunDirectory(join(org, 'kingdom'), 'foundry');
+    expect(markedRun(work, [org])).toBe(RUN_TAGS.foundry);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  expect(() => stampRunDirectory('/', 'test')).toThrow();
+  expect(() => stampRunDirectory(homedir(), 'test')).toThrow();
+  expect(() => stampRunDirectory('relative/dir', 'test')).toThrow();
+  expect(() => stampRunDirectory('', 'test')).toThrow();
+  const repo = realpathSync(mkdtempSync(join(tmpdir(), 'archive-stamp-repo-')));
+  try {
+    mkdirSync(join(repo, '.git'));
+    expect(() => stampRunDirectory(repo, 'test')).toThrow('git work tree');
+    // Not above a checkout either (`~/code`), nor at or above a collector root (`~/code/inixiative`).
+    const code = join(repo, 'code');
+    mkdirSync(join(code, 'zealot', '.git'), { recursive: true });
+    expect(() => stampRunDirectory(code, 'test', [])).toThrow('above a git checkout');
+    const container = join(repo, 'container');
+    mkdirSync(join(container, 'org'), { recursive: true });
+    expect(() => stampRunDirectory(container, 'test', [join(container, 'org')])).toThrow(
+      'collector root',
+    );
+    expect(() =>
+      stampRunDirectory(join(container, 'org'), 'test', [join(container, 'org')]),
+    ).toThrow('collector root');
+    stampRunDirectory(container, 'test', [join(repo, 'elsewhere')]);
+    expect(markedRun(join(container, 'org'))).toBe(RUN_TAGS.test);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 test('explicit stamps: a run marker file, the ARCHIVE_RUN environment', () => {
@@ -111,7 +157,9 @@ test('interim inference: working directories of tests, decisions, Oracle and ben
   expect(cwdRunTag(join(temp, 'native-text-controlled-abc'))).toBe(RUN_TAGS.test);
   expect(cwdRunTag('/private/tmp/claude-501/x/scratchpad')).toBe(RUN_TAGS.test);
   expect(cwdRunTag('/Users/me/scratchpad')).toBe(RUN_TAGS.test);
-  expect(cwdRunTag('/w/foundry/.foundry/decision-receipts/primed-1/fixture')).toBe(RUN_TAGS.test);
+  expect(cwdRunTag('/w/foundry/.foundry/decision-receipts/primed-1/fixture')).toBe(
+    RUN_TAGS.foundry,
+  );
   expect(cwdRunTag(join(homedir(), '.foundry/repeats/decision-receipts/p/fixture'))).toBe(
     RUN_TAGS.test,
   );
@@ -131,12 +179,12 @@ test('interim inference: working directories of tests, decisions, Oracle and ben
   };
   expect(
     routeSession('/Users/me/.foundry/repeats/decision-receipts/p', [catchAll], {
-      exclude: defaultExclusions(),
+      filters: { exclude: defaultExclusions() },
     }),
   ).toBeUndefined();
-  expect(routeSession('/Users/me/notes', [catchAll], { exclude: defaultExclusions() })).toBe(
-    catchAll,
-  );
+  expect(
+    routeSession('/Users/me/notes', [catchAll], { filters: { exclude: defaultExclusions() } }),
+  ).toBe(catchAll);
 });
 
 test('a collector tags sessions from a test working directory it was told to collect', async () => {
@@ -161,7 +209,11 @@ test('a collector tags sessions from a test working directory it was told to col
     });
     expect(result.imported).toBe(1);
     expect(await store.list()).toEqual([]);
-    expect((await store.list({ exempt: 'include' }))[0]!.tags).toEqual([RUN_TAGS.test]);
+    expect((await store.list({ exempt: 'include' }))[0]!.tags).toEqual([
+      RUN_TAGS.test,
+      RUN_INFERRED,
+      'project:foundry',
+    ]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

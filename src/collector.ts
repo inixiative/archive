@@ -10,7 +10,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { cwdRunTag, temporaryRoots } from './exemption';
+import { cwdRunTags, exemptRun, temporaryRoots } from './exemption';
 import { claudeSessionId } from './import';
 import { importTranscriptFile, transcriptAgentId } from './import-file';
 import {
@@ -21,7 +21,7 @@ import {
   UNROUTED,
 } from './index';
 import type { ArchiveClient } from './remote';
-import { type AtlasFileConcepts, atlasTags, provenanceReferences } from './tags';
+import { type AtlasFileConcepts, atlasTags, projectTags, provenanceReferences } from './tags';
 
 export { UNROUTED } from './index';
 
@@ -42,19 +42,78 @@ export interface CollectionSource {
 }
 
 /**
- * Where sessions are never swept in by a subdirectory or catch-all match: temp directories (test
- * fixtures, agent scratchpads) and decision receipts (Foundry's, the repeat report's, the tagger's).
- * An exact root is explicit and wins.
- * Absolute entries match the directory and below; relative ones match those path segments anywhere.
+ * Folder filters over a session's working directory, globs in the style of Atlas's `include` /
+ * `ignore` and Gloss's `exclude`: a glob names folders and covers everything below them. They
+ * apply to every match (exact roots, worktrees, subdirectories, catch-alls); exclude wins over
+ * include, and with an `include` list only folders it names are collected at all.
  */
-export const defaultExclusions = () => [...temporaryRoots(), 'decision-receipts'];
-export function excluded(cwd: string, exclusions: string[]) {
-  return exclusions.some((entry) =>
-    isAbsolute(entry)
-      ? cwd === resolve(entry) || cwd.startsWith(`${resolve(entry)}/`)
-      : `${cwd}/`.includes(`/${entry.replace(/^\/+|\/+$/g, '')}/`),
-  );
+export type FolderFilters = { include?: string[]; exclude?: string[] };
+
+/**
+ * Excluded for every match unless a deployment drops them from its filters: decision receipts
+ * (Foundry's primed Warden and middleware hosts, the repeat report's, the tagger's).
+ */
+export const defaultExclusions = () => ['**/decision-receipts'];
+
+const escapeGlob = (path: string) => path.replace(/[[\]{}*?!\\]/g, '\\$&');
+
+/**
+ * A folder glob, normalized: `~/` expands to the home directory (taken literally), a leading `./`,
+ * a trailing `/**` and trailing slashes go (a folder glob already covers everything below, so
+ * Atlas's `dir/**` names `dir` too), and a relative glob matches at any depth (it gains a leading
+ * `**` segment). An empty glob, one naming the filesystem root, or one with a `..` segment throws.
+ */
+export function folderGlob(entry: string): string {
+  let glob = entry.trim();
+  if (glob === '~' || glob.startsWith('~/')) glob = escapeGlob(homedir()) + glob.slice(1);
+  glob = glob.replace(/^(\.\/)+/, '');
+  for (let before = ''; before !== glob; ) {
+    before = glob;
+    glob = glob.replace(/\/+$/, '').replace(/\/\*\*$/, '');
+  }
+  if (!glob || glob === '.')
+    throw new Error(`Folder glob "${entry}" is empty or names every folder`);
+  if (glob.split('/').includes('..')) throw new Error(`Folder glob "${entry}" has a .. segment`);
+  return glob.startsWith('/') || glob.startsWith('**') ? glob : `**/${glob}`;
 }
+
+/**
+ * An exclude glob: a folder glob that does not cover the home directory or the filesystem root,
+ * since excluding everything would stop capture silently until the harness's cleanup loses it.
+ */
+export function excludeGlob(entry: string): string {
+  const glob = folderGlob(entry);
+  if (folderMatches(homedir(), [glob]) || folderMatches('/', [glob]))
+    throw new Error(`Exclude glob "${entry}" covers every session`);
+  return glob;
+}
+
+const compiled = new Map<string, InstanceType<typeof Bun.Glob>>();
+/** Whether a normalized folder glob names this directory or one of its ancestors. */
+export function folderMatches(cwd: string, globs: readonly string[]) {
+  if (!globs.length) return false;
+  const matchers = globs.map((glob) => {
+    if (!compiled.has(glob)) compiled.set(glob, new Bun.Glob(glob));
+    return compiled.get(glob)!;
+  });
+  for (let directory = resolve(cwd); ; directory = dirname(directory)) {
+    if (matchers.some((matcher) => matcher.match(directory))) return true;
+    if (directory === dirname(directory)) return false;
+  }
+}
+
+/** Whether the folder filters let a session in this working directory be collected. */
+export function folderAllowed(cwd: string, filters: FolderFilters) {
+  if (folderMatches(cwd, filters.exclude ?? defaultExclusions())) return false;
+  return !filters.include?.length || folderMatches(cwd, filters.include);
+}
+
+/**
+ * Temp directories (test fixtures, agent scratchpads) are never swept in by a subdirectory or
+ * catch-all match; an exact root in one is explicit and still matches.
+ */
+const temporary = (cwd: string) =>
+  temporaryRoots().some((root) => cwd === root || cwd.startsWith(`${root}/`));
 
 /** Every transcript (`.jsonl`) under a directory, in order, without following links. */
 export function transcriptFiles(directory: string): string[] {
@@ -168,18 +227,19 @@ export function collectionRoots(config: CollectionSource): Set<string> {
 }
 
 /**
- * The collector a session's cwd belongs to. The longest matching root wins: a root matches its own
- * directory (and worktrees), and with `subdirectories` the directories below it. Ties go to the
- * first declared. Excluded directories match only exact roots. Unclaimed sessions go to the first
- * catch-all.
+ * The collector a session's cwd belongs to. The folder filters decide first, for every match. The
+ * longest matching root wins: a root matches its own directory (and worktrees), and with
+ * `subdirectories` the directories below it. Ties go to the first declared. Temp directories match
+ * only exact roots. Unclaimed sessions go to the first catch-all.
  */
 export function routeSession(
   cwd: string,
   collectors: CollectionSource[],
-  options: { exclude?: string[]; roots?: (collector: CollectionSource) => Set<string> } = {},
+  options: { filters?: FolderFilters; roots?: (collector: CollectionSource) => Set<string> } = {},
 ) {
+  if (!folderAllowed(cwd, options.filters ?? {})) return undefined;
   const rootsOf = options.roots ?? collectionRoots;
-  const broad = !excluded(cwd, options.exclude ?? defaultExclusions());
+  const broad = !temporary(cwd);
   let best: { collector: CollectionSource; length: number } | undefined;
   for (const collector of collectors) {
     if (collector.catchAll) continue;
@@ -251,7 +311,7 @@ export type CollectorCache = Map<
     size: number;
     mtimeMs: number;
     routing: string;
-    outcome: 'unchanged' | 'skipped' | 'failed';
+    outcome: Outcome;
     meta?: SessionMetadata;
     stored?: { id: string; digest: string; checkedAt: number };
     /** Left to its claimant: asked again once the lease runs out (or the file changes). */
@@ -259,11 +319,18 @@ export type CollectorCache = Map<
   }
 >;
 const REVALIDATE_MS = 10 * 60_000;
+type Outcome = 'unchanged' | 'skipped' | 'held' | 'dropped' | 'failed';
 
 export interface CollectOptions {
   /** Every collector of this source and directory, this one included; the most specific wins. */
   peers?: CollectionSource[];
-  exclude?: string[];
+  /** Folder filters; by default the built-in exclusions. */
+  filters?: FolderFilters;
+  /**
+   * Every collector on this machine, of any source: a session is tagged `project:<projectId>` for
+   * each project whose roots (and worktrees) hold a path its tool calls touched. Defaults to peers.
+   */
+  projects?: CollectionSource[];
   cache?: CollectorCache;
   /** The harness login's access path; defaults to reading the history directory's harness home. */
   harness?: (
@@ -281,13 +348,23 @@ export interface CollectOptions {
   repair?: boolean;
 }
 
+/**
+ * One scan. `held`: sessions this collector now routes that another project already holds (most
+ * often a checkout or worktree that was retired after capture); they stay with that project.
+ * `dropped`: run sessions the server does not keep (`captureRunSessions` off). `refused` and
+ * `heldBy` give the reason for each decided in this scan; a watching collector does not repeat
+ * them for files that have not changed.
+ */
 export type CollectResult = {
   imported: number;
   unchanged: number;
   skipped: number;
+  held: number;
+  dropped: number;
   failed: number;
   repaired?: { file: string; sessionId: string; projectId: string; previousProjectId?: string }[];
-  refused?: { file: string; reason: string }[];
+  refused: { file: string; reason: string }[];
+  heldBy: { file: string; projectId: string }[];
 };
 
 /** A rejection the same snapshot will get again: invalid input or a refused write, not an outage. */
@@ -307,17 +384,24 @@ export async function collectSessions(
   const sourceId = await archive.sourceId();
   const now = options.now ?? Date.now;
   const peers = options.peers ?? [config];
-  const exclude = options.exclude ?? defaultExclusions();
+  const filters = options.filters ?? {};
+  const projects = (options.projects ?? peers).filter((collector) => !collector.catchAll);
   const cache: CollectorCache = options.cache ?? new Map();
-  const routing = JSON.stringify([sourceId, config, peers, exclude]);
-  const result: CollectResult = { imported: 0, unchanged: 0, skipped: 0, failed: 0 };
-  if (options.repair) {
-    result.repaired = [];
-    result.refused = [];
-  }
+  const routing = JSON.stringify([sourceId, config, peers, filters, projects]);
+  const result: CollectResult = {
+    imported: 0,
+    unchanged: 0,
+    skipped: 0,
+    held: 0,
+    dropped: 0,
+    failed: 0,
+    refused: [],
+    heldBy: [],
+  };
+  if (options.repair) result.repaired = [];
   const refuse = (file: string, error: unknown) => {
     result.failed++;
-    result.refused?.push({
+    result.refused.push({
       file,
       reason: error instanceof Error ? error.message : String(error),
     });
@@ -359,7 +443,7 @@ export async function collectSessions(
         }
       }
       const remember = (
-        outcome: 'unchanged' | 'skipped' | 'failed',
+        outcome: Outcome,
         meta?: SessionMetadata,
         stored?: { id: string; digest: string },
         claimedUntil?: number,
@@ -393,7 +477,7 @@ export async function collectSessions(
         continue;
       }
       if (!routes.has(meta.cwd))
-        routes.set(meta.cwd, routeSession(meta.cwd, peers, { exclude, roots }));
+        routes.set(meta.cwd, routeSession(meta.cwd, peers, { filters, roots }));
       if (routes.get(meta.cwd) !== config) {
         result.skipped++;
         remember('skipped', meta);
@@ -424,11 +508,18 @@ export async function collectSessions(
       if (!repositories.has(cwd)) repositories.set(cwd, git(cwd, 'remote', 'get-url', 'origin'));
       if (config.atlas && !graphs.has(cwd)) graphs.set(cwd, atlasGraph(cwd));
       const graph = graphs.get(cwd);
-      const run = cwdRunTag(cwd);
+      // A marker counts only below every collector root; an inferred tag is marked as a guess.
+      const ceilings = projects.flatMap((project) => [...roots(project)]);
+      const run = exemptRun(config.tags ?? []) ? [] : cwdRunTags(cwd, ceilings);
       snapshot.tags = [
         ...new Set([
-          ...(run ? [run] : []),
+          ...run,
           ...(config.tags ?? []),
+          ...projectTags(
+            snapshot,
+            projects.map((project) => ({ projectId: project.projectId, roots: roots(project) })),
+            cwd,
+          ),
           ...(graph ? atlasTags(snapshot, graph, roots(config)) : []),
         ]),
       ].slice(0, 100);
@@ -446,10 +537,13 @@ export async function collectSessions(
       const id = archiveKey(snapshot);
       const old = await archive.head(id);
       // A session belongs to one project; only one the catch-all held moves to its routed project.
-      const moved = old && old.projectId !== config.projectId && old.projectId !== UNROUTED;
+      // A tombstone holds no project: a session deleted here comes back under today's routing.
+      const moved =
+        old && !old.deleted && old.projectId !== config.projectId && old.projectId !== UNROUTED;
       if (moved && !(options.repair && (await collided(archive, id, snapshot)))) {
-        refuse(file, new Error(`Session is held by project ${old.projectId}`));
-        remember('failed', meta);
+        result.held++;
+        result.heldBy.push({ file, projectId: old.projectId! });
+        remember('held', meta);
         continue;
       }
       // An unchanged session is not sent again: the server already holds this digest.
@@ -467,6 +561,11 @@ export async function collectSessions(
       else {
         try {
           const captured = await archive.capture(snapshot);
+          if (captured.dropped) {
+            result.dropped++;
+            remember('dropped', meta);
+            continue;
+          }
           digest = captured.digest;
           result[captured.changed ? 'imported' : 'unchanged']++;
           if (captured.changed)

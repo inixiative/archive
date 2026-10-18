@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { defaultHome } from './agents';
-import type { ArchiveDestination, DescribedDestination } from './config';
+import type { ArchiveDestination, DescribedDestination, Organization } from './config';
 import type { ArchiveChunk, ArchiveSnapshot } from './index';
 import { archiveKey, archiveSnapshotSchema } from './index';
 import type {
@@ -29,13 +29,15 @@ export type DestinationStatus = DescribedDestination & { delivered: number; pend
 /** A hosted Archive library a held Signet may write to. */
 export type ArchiveLibrary = { integrationId: string; resourceId: string; name: string };
 export type ArchiveLibraries = { paired: boolean; libraries: ArchiveLibrary[] };
-export type RoutedDestination = Pick<ArchiveDestination, 'kind' | 'url'> & {
+export type RoutedDestination = Pick<ArchiveDestination, 'kind' | 'url' | 'organizationId'> & {
   integrationId?: string;
 };
 export type RoutingPreview = (Pick<
   ArchiveListing,
   'id' | 'projectId' | 'tags' | 'suggestedTags'
 > & {
+  /** The organizations the session belongs to: its own project's and each touched project's. */
+  organizations: string[];
   destinations: RoutedDestination[];
 })[];
 export type SyncResult = { id: string; destination: string; status: string };
@@ -59,7 +61,8 @@ export type MaintenanceStatus = {
   tables: { table: string; totalBytes: number; liveRows: number; deadRows: number }[];
 };
 /** A project routed to a hosted Archive library through Kingdom. */
-export type KingdomRoute = { projectId: string; integrationId: string; resourceId: string };
+/** An organization's Kingdom library: where that organization's sessions publish. */
+export type KingdomRoute = { organizationId: string; integrationId: string; resourceId: string };
 
 export class ArchiveRequestError extends Error {
   constructor(
@@ -119,10 +122,14 @@ export class ArchiveClient {
     return this.cachedSourceId;
   }
   head(id: string) {
-    return this.request<{ id: string; digest: string; revision: number; projectId: string | null }>(
-      'head',
-      { archiveId: id },
-    ).catch((error) => {
+    return this.request<{
+      id: string;
+      digest: string;
+      revision: number;
+      projectId: string | null;
+      /** A tombstone: the session was deleted here; `digest` is the writer's last one. */
+      deleted?: true;
+    }>('head', { archiveId: id }).catch((error) => {
       if (error instanceof ArchiveRequestError && error.status === 404) return undefined;
       throw error;
     });
@@ -139,6 +146,8 @@ export class ArchiveClient {
           digest: string;
           revision: number;
           changed: boolean;
+          /** The run tag a session was dropped for (`captureRunSessions` off); nothing was stored. */
+          dropped?: string;
         }>('ingest', { snapshot, previousDigest: head?.digest ?? null });
       } catch (error) {
         const conflict =
@@ -262,21 +271,31 @@ export class ArchiveClient {
   reclaim() {
     return this.request<{ started: boolean; beforeBytes: number }>('maintenance/reclaim');
   }
-  destinations(filter: { projectId?: string } = {}) {
+  destinations(filter: { organizationId?: string } = {}) {
     return this.request<{ destinations: DestinationStatus[] }>('destinations/list', filter);
   }
   libraries() {
     return this.request<ArchiveLibraries>('destinations/libraries');
   }
-  /** Each archive and the destinations its project routes to; nothing is sent. */
+  /** Each archive, its organizations and their destinations; nothing is sent. */
   routes() {
     return this.request<RoutingPreview>('destinations/routes');
   }
-  /** Publishes every archive to its project's destinations once. */
+  /** Publishes every archive to its organizations' destinations once. */
   sync() {
     return this.request<SyncResult[]>('destinations/sync', {}, { timeoutMs: 600_000 });
   }
-  /** Routes a project to a library; the server verifies its Signet grants sessions.write first. */
+  /** Organizations and the projects each owns (routing is per organization, projects are tags). */
+  organizations() {
+    return this.request<{ organizations: Organization[] }>('organizations/list');
+  }
+  setOrganization(organization: Organization) {
+    return this.request<{ organizations: Organization[] }>('organizations/set', organization);
+  }
+  removeOrganization(id: string) {
+    return this.request<{ removed: boolean }>('organizations/remove', { id });
+  }
+  /** Publishes an organization to a library; the server verifies its Signet grants sessions.write first. */
   connectDestination(route: KingdomRoute) {
     return this.request<DescribedDestination>('destinations/connect', route);
   }

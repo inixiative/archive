@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { verifySignetProof } from '@inixiative/signet';
 import { requestRegistrationSchema } from '@inixiative/signet/contracts';
 import { pairingRequest, pairWithKingdom } from '../src/kingdom';
+import { routing } from './routing';
 
 const fakeKingdom = () => {
   const nonces = new Set<string>();
@@ -198,7 +199,7 @@ test('pair asks for the named libraries, else the ones its Kingdom destinations 
   const destinations = [
     {
       kind: 'kingdom' as const,
-      projectId: 'kingdom',
+      organizationId: 'kingdom',
       url: `${kingdom}/`,
       credentialFile: '/tmp/signet.json',
       integrationId: crypto.randomUUID(),
@@ -206,7 +207,7 @@ test('pair asks for the named libraries, else the ones its Kingdom destinations 
     },
     {
       kind: 'kingdom' as const,
-      projectId: 'other',
+      organizationId: 'other',
       url: 'https://api.elsewhere.example.com',
       credentialFile: '/tmp/signet.json',
       integrationId: crypto.randomUUID(),

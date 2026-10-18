@@ -44,7 +44,10 @@ test('collectors and clients write through the server over HTTP and retry lost r
     const [listed] = await client.list({ projectId: 'archive' });
     expect(listed.sessionId).toBe('remote-1');
     expect(await client.head(listed.id)).toMatchObject({ revision: 1, projectId: 'archive' });
-    expect((await client.tag(listed.id, { add: ['seen'] })).tags).toEqual(['seen']);
+    expect((await client.tag(listed.id, { add: ['seen'] })).tags).toEqual([
+      'project:archive',
+      'seen',
+    ]);
     expect(await client.head('f'.repeat(64))).toBeUndefined();
 
     // Another writer lands a revision between this client's head and ingest.

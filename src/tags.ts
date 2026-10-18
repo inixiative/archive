@@ -1,3 +1,5 @@
+import { homedir } from 'node:os';
+import { isAbsolute, resolve } from 'node:path';
 import { z } from 'zod';
 import type { ArchiveReference, ArchiveSnapshot } from './index';
 
@@ -131,5 +133,213 @@ export function atlasTags(
     .sort((a, b) => b[1] - a[1])
     .slice(0, limit)
     .map(([concept]) => `atlas:${concept}`)
+    .filter((tag) => tag.length <= 120);
+}
+
+/** `project:<projectId>`: a project whose files a session's tool calls touched. */
+export const PROJECT_TAG_PREFIX = 'project:';
+
+/**
+ * Paths named in tool calls: absolute (`/…`, `~/…`) or relative with a folder (`apps/api/x.ts`),
+ * never the inside of a URL.
+ */
+/** A whole shell word that is a path: absolute, `~/…`, `./…`, `../…`, or relative with a folder. */
+const PATH_WORD = /^(?:~(?=\/|$)|\/|\.{1,2}\/|[\w@.+-]+\/)[\w@.+~/-]*$/;
+
+/**
+ * Shell words, quote-aware, split into commands at `;`, `&&`, `||`, `|`, newlines and
+ * parentheses. Heredoc bodies are dropped: they are content written, not paths accessed.
+ */
+function shellCommands(script: string): string[][] {
+  const lines = script.split('\n');
+  const kept: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    kept.push(lines[i]!);
+    const heredoc = lines[i]!.match(/<<-?\s*(['"]?)(\w+)\1/);
+    if (heredoc) while (i + 1 < lines.length && lines[i + 1]!.trim() !== heredoc[2]) i++;
+  }
+  const commands: string[][] = [[]];
+  let word: string | null = null;
+  let quote: string | null = null;
+  const end = () => {
+    if (word !== null) commands.at(-1)!.push(word);
+    word = null;
+  };
+  const text = kept.join('\n');
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (quote) {
+      if (c === quote) quote = null;
+      else if (c === '\\' && quote === '"' && i + 1 < text.length) word += text[++i]!;
+      else word += c;
+    } else if (c === "'" || c === '"') {
+      quote = c;
+      word ??= '';
+    } else if (c === '\\' && i + 1 < text.length) word = (word ?? '') + text[++i]!;
+    else if (/\s/.test(c) && c !== '\n') end();
+    else if (
+      c === '\n' ||
+      c === ';' ||
+      c === '|' ||
+      c === '&' ||
+      c === '(' ||
+      c === ')' ||
+      c === '`'
+    ) {
+      end();
+      if (commands.at(-1)!.length) commands.push([]);
+    } else if (c === '<' || c === '>') end();
+    else word = (word ?? '') + c;
+  }
+  end();
+  return commands.filter((command) => command.length);
+}
+
+/** The paths a shell script accesses: path-shaped arguments, `cd` and `git -C` targets. */
+export function shellPaths(script: string, cwd?: string): string[] {
+  const paths: string[] = [];
+  let at = cwd;
+  const absolute = (word: string) =>
+    word === '~' || word.startsWith('~/')
+      ? resolve(homedir(), word.slice(2))
+      : word.startsWith('/')
+        ? resolve(word)
+        : at && resolve(at, word);
+  for (const command of shellCommands(script))
+    for (const [i, raw] of command.entries()) {
+      const value =
+        raw.startsWith('-') && raw.includes('=') ? raw.slice(raw.indexOf('=') + 1) : raw;
+      const path = PATH_WORD.test(value) ? absolute(value) : undefined;
+      if (path) paths.push(path);
+      // A later relative path resolves against the directory `cd` moved to.
+      if (i === 1 && command[0] === 'cd' && path) at = path;
+    }
+  return paths;
+}
+
+/** A tool's path argument, absolute: `~/` from home, relative from the working directory. */
+const pathArgument = (value: string, cwd?: string): string[] =>
+  value === '~' || value.startsWith('~/')
+    ? [resolve(homedir(), value.slice(2))]
+    : isAbsolute(value)
+      ? [resolve(value)]
+      : cwd
+        ? [resolve(cwd, value)]
+        : [];
+
+const FILE_TOOLS: Record<string, string[]> = {
+  Read: ['file_path'],
+  Edit: ['file_path'],
+  MultiEdit: ['file_path'],
+  Write: ['file_path'],
+  NotebookEdit: ['notebook_path'],
+  NotebookRead: ['notebook_path'],
+  Glob: ['path'],
+  Grep: ['path'],
+  LS: ['path'],
+  view_image: ['path'],
+};
+const SHELL_TOOLS = new Set(['Bash', 'shell', 'local_shell', 'exec_command', 'unified_exec']);
+
+/**
+ * The paths one tool call accesses: the path arguments of file tools (Claude Code's Read, Edit,
+ * Write, Glob, Grep and the like), the commands and working directory of shell calls (Claude
+ * Code's Bash; Codex's exec_command, shell, the `exec` code cell's commands), and the files a Codex
+ * patch names. Never the content written, a subagent's prompt, a message, or prose.
+ */
+export function toolCallPaths(text: string, cwd?: string): string[] {
+  let call: { name?: unknown; input?: unknown; arguments?: unknown };
+  try {
+    call = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const name = typeof call?.name === 'string' ? call.name : '';
+  let input: Record<string, unknown> = {};
+  let raw = '';
+  if (call.input && typeof call.input === 'object') input = call.input as Record<string, unknown>;
+  else if (typeof call.arguments === 'string') {
+    raw = call.arguments;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') input = parsed;
+    } catch {}
+  } else if (call.arguments && typeof call.arguments === 'object')
+    input = call.arguments as Record<string, unknown>;
+  const string = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
+  const workdir = string(input.workdir) ?? string(input.cwd);
+  const here = workdir ? (shellPaths(workdir, cwd)[0] ?? cwd) : cwd;
+  const paths: string[] = workdir && here ? [here] : [];
+  for (const key of FILE_TOOLS[name] ?? []) {
+    const value = string(input[key]);
+    if (value) paths.push(...pathArgument(value, here));
+  }
+  if (SHELL_TOOLS.has(name)) {
+    const command = input.cmd ?? input.command;
+    const script = Array.isArray(command)
+      ? command
+          .filter((w): w is string => typeof w === 'string')
+          .map((w) => JSON.stringify(w))
+          .join(' ')
+      : string(command);
+    if (script) paths.push(...shellPaths(script, here));
+  }
+  if (name === 'apply_patch') {
+    const patch = string(input.input) ?? string(input.patch) ?? raw;
+    for (const [, file] of patch.matchAll(
+      /^\*\*\* (?:Update|Add|Delete) File: (.+)$|^\*\*\* Move to: (.+)$/gm,
+    ))
+      if (file) paths.push(...pathArgument(file.trim(), here));
+  }
+  if (name === 'exec') {
+    // A Codex code cell: the command strings its tool calls run, best effort.
+    for (const [, , cmd] of raw.matchAll(/\bcmd\s*:\s*(["'`])((?:\\.|(?!\1).)*)\1/g))
+      if (cmd) paths.push(...shellPaths(cmd.replace(/\\(.)/g, '$1'), here));
+  }
+  return paths;
+}
+
+/**
+ * The projects a session worked in, from the paths its tool calls access (`toolCallPaths`) and its
+ * working directory: `project:<projectId>` for each project with a root (or worktree) holding
+ * one, the longest root winning. Mentions (text written, prompts, messages, prose) never count. A
+ * pure container (a root holding other projects' roots, like `~/code/inixiative`) named by itself
+ * tags nothing: listing the folder of every checkout is not working in any. A project's own root
+ * (`git -C ~/code/zealot`), even one holding its own worktrees, counts. Routing is unaffected: a
+ * session keeps its own project and is tagged with every project it touched, its own included.
+ */
+export function projectTags(
+  snapshot: Pick<ArchiveSnapshot, 'entries'>,
+  projects: { projectId: string; roots: Iterable<string> }[],
+  cwd?: string,
+  limit = 20,
+): string[] {
+  const roots = projects
+    .flatMap(({ projectId, roots }) =>
+      [...roots].map((root) => ({ projectId, root: resolve(root) })),
+    )
+    .filter(({ root }) => root !== '/')
+    .sort((a, b) => b.root.length - a.root.length);
+  if (!roots.length) return [];
+  const containers = new Set(
+    roots
+      .filter(({ projectId, root }) =>
+        roots.some((other) => other.projectId !== projectId && other.root.startsWith(`${root}/`)),
+      )
+      .map(({ root }) => root),
+  );
+  const counts = new Map<string, number>();
+  const count = (path: string) => {
+    if (containers.has(path)) return;
+    const owner = roots.find(({ root }) => path === root || path.startsWith(`${root}/`));
+    if (owner) counts.set(owner.projectId, (counts.get(owner.projectId) ?? 0) + 1);
+  };
+  if (cwd) count(resolve(cwd));
+  for (const entry of snapshot.entries)
+    if (entry.kind === 'tool-call') for (const path of toolCallPaths(entry.text, cwd)) count(path);
+  return [...counts]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([projectId]) => `${PROJECT_TAG_PREFIX}${projectId}`)
     .filter((tag) => tag.length <= 120);
 }

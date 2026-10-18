@@ -17,7 +17,14 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { type CollectionSource, defaultExclusions, UNROUTED } from './collector';
+import {
+  type CollectionSource,
+  defaultExclusions,
+  excludeGlob,
+  type FolderFilters,
+  folderGlob,
+  UNROUTED,
+} from './collector';
 
 export const defaultHome = () => join(homedir(), '.local/share/archive');
 export const AGENT_LABEL_PREFIX = 'com.inixiative.archive.';
@@ -26,6 +33,23 @@ export const defaultHistoryDirectory = (source: 'claude-code' | 'codex') =>
   join(homedir(), source === 'codex' ? '.codex/sessions' : '.claude/projects');
 
 const absolute = z.string().max(4096).refine(isAbsolute, 'Path must be absolute');
+/** Folder globs, normalized; an empty entry is refused, never read as "all". */
+const folderGlobs = (normalize: (entry: string) => string) =>
+  z
+    .array(
+      z
+        .string()
+        .max(4096)
+        .transform((entry, ctx) => {
+          try {
+            return normalize(entry);
+          } catch (error) {
+            ctx.addIssue({ code: 'custom', message: (error as Error).message });
+            return z.NEVER;
+          }
+        }),
+    )
+    .max(100);
 export const collectorAgentSchema = z
   .strictObject({
     name: z
@@ -58,8 +82,10 @@ export const agentsConfigSchema = z
   .strictObject({
     /** The Archive server collectors write to; the token is the home's `server.token`. */
     server: z.strictObject({ url: z.url() }).optional(),
-    /** Added to the default exclusions (temp directories, Foundry decision receipts). */
-    exclude: z.array(z.string().min(1).max(4096)).max(100).optional(),
+    /** Only sessions in folders these globs name are collected, by any collector. */
+    include: folderGlobs(folderGlob).optional(),
+    /** Never collected, by any collector; added to the default exclusions (decision receipts). */
+    exclude: folderGlobs(excludeGlob).optional(),
     collectors: z.array(collectorAgentSchema).max(100),
   })
   .refine(
@@ -106,7 +132,10 @@ export function collectorArgs(c: CollectorAgent) {
   return ['collect', '--agent', c.name, '--watch'];
 }
 
-/** A named collector, the peers it is routed against, its exclusions and server, from agents.json. */
+/**
+ * A named collector, the peers it is routed against, the folder filters, every project on the
+ * machine (for `project:` tags) and the server, from agents.json.
+ */
 export function collectorPlan(config: AgentsConfig, name: string) {
   const collector = config.collectors.find((c) => c.name === name);
   if (!collector) throw new Error(`No collector named ${name} in agents.json`);
@@ -125,10 +154,15 @@ export function collectorPlan(config: AgentsConfig, name: string) {
     (c) => c.source === collector.source && resolve(c.directory) === resolve(collector.directory),
   );
   const peers = named.map(source);
+  const filters: FolderFilters = {
+    ...(config.include?.length ? { include: config.include } : {}),
+    exclude: [...defaultExclusions(), ...(config.exclude ?? [])],
+  };
   return {
     collector: peers[named.indexOf(collector)]!,
     peers,
-    exclude: [...defaultExclusions(), ...(config.exclude ?? [])],
+    filters,
+    projects: config.collectors.filter((c) => !c.catchAll).map(source),
     server: config.server,
   };
 }

@@ -9,14 +9,15 @@ import {
   type ArchiveDestination,
   connectDestination,
   destinationsFile,
-  readDestinations,
+  readRouting,
 } from '../src/config';
-import { archiveSnapshotSchema } from '../src/index';
+import { archiveKey, archiveSnapshotSchema } from '../src/index';
 import { verifyKingdomDestination } from '../src/kingdom';
 import { createArchiveHandler, startArchiveServer } from '../src/server';
 import { ArchiveStore } from '../src/store';
 import { freshStore, testDatabaseUrl } from './db';
 import { signetKingdom } from './kingdom';
+import { routing } from './routing';
 
 const captureResponse = z.object({
   data: z.object({ id: z.string(), digest: z.string(), revision: z.number() }),
@@ -130,7 +131,7 @@ test('hosted auth, compacted revisions, concurrent-write conflicts and bounded s
   }
 });
 
-test('three destinations stay isolated; tags never authorize a destination; unknown projects remain local', async () => {
+test('three organizations stay isolated; projects no organization owns remain local', async () => {
   const local = await freshStore();
   const instances = [];
   for (const projectId of ['personal', 'inixiative', 'userevidence'] as const) {
@@ -149,24 +150,24 @@ test('three destinations stay isolated; tags never authorize a destination; unkn
     for (const projectId of ['personal', 'inixiative', 'userevidence', 'unknown'])
       await local.capture(snapshot(projectId, projectId));
     const destinations: ArchiveDestination[] = instances.map(({ projectId, instance }) => ({
-      projectId,
+      organizationId: projectId,
       kind: 'archive',
       url: instance.server.url.href,
       tokenEnv: 'ARCHIVE_ROUTING_TEST_TOKEN',
     }));
-    const routes = await routingPreview(local, destinations);
+    const routes = await routingPreview(local, routing(destinations));
     expect(routes.find((r) => r.projectId === 'unknown')?.destinations).toHaveLength(0);
     expect(routes.find((r) => r.projectId === 'inixiative')?.destinations).toHaveLength(1);
-    expect((await syncArchives(local, destinations)).map((r) => r.status)).toEqual([
+    expect((await syncArchives(local, routing(destinations))).map((r) => r.status)).toEqual([
       'published',
       'published',
       'published',
     ]);
     for (const { projectId, instance } of instances)
       expect((await instance.store.list()).map((a) => a.projectId)).toEqual([projectId]);
-    expect((await syncArchives(local, destinations)).every((r) => r.status === 'unchanged')).toBe(
-      true,
-    );
+    expect(
+      (await syncArchives(local, routing(destinations))).every((r) => r.status === 'unchanged'),
+    ).toBe(true);
   } finally {
     delete process.env.ARCHIVE_ROUTING_TEST_TOKEN;
     for (const { instance } of instances) await instance.close();
@@ -179,7 +180,7 @@ test('lost acknowledgement replays old revision before new content after client 
   process.env.ARCHIVE_RESTART_TEST_TOKEN = token;
   const destination: ArchiveDestination = {
     kind: 'archive',
-    projectId: 'inixiative',
+    organizationId: 'inixiative',
     url: 'http://localhost:4411/',
     tokenEnv: 'ARCHIVE_RESTART_TEST_TOKEN',
   };
@@ -190,13 +191,17 @@ test('lost acknowledgement replays old revision before new content after client 
       await handler(new Request(url, options));
       throw new Error('lost ack');
     }) as unknown as typeof fetch;
-    await expect(publishArchive(local, first.id, destination, lost)).rejects.toThrow('lost ack');
+    await expect(
+      publishArchive(local, first.id, destination, routing([destination]), lost),
+    ).rejects.toThrow('lost ack');
     await local.capture({ ...snapshot(), title: 'Second', capturedAt: 2 });
     local = new ArchiveStore(testDatabaseUrl('main'));
     remote = new ArchiveStore(testDatabaseUrl('remote'));
     handler = createArchiveHandler(remote, token);
-    await publishArchive(local, first.id, destination, ((url: any, options: any) =>
-      handler(new Request(url, options))) as typeof fetch);
+    await publishArchive(local, first.id, destination, routing([destination]), ((
+      url: any,
+      options: any,
+    ) => handler(new Request(url, options))) as typeof fetch);
     expect((await remote.read(first.id))?.revision).toBe(2);
     // The replayed first revision reached the remote before the second, which compacted it.
     expect(remote.read(first.id, 1)).rejects.toThrow('was compacted');
@@ -225,7 +230,7 @@ test('connect validates credentials before changing configuration and repeated s
     dir,
     '--url',
     instance.server.url.href,
-    '--project-id',
+    '--organization-id',
     'inixiative',
     '--token-env',
     'ARCHIVE_CONNECT_TEST_TOKEN',
@@ -233,18 +238,18 @@ test('connect validates credentials before changing configuration and repeated s
   try {
     process.env.ARCHIVE_CONNECT_TEST_TOKEN = 'bad';
     await expect(runCli(args)).rejects.toThrow('401');
-    expect(readDestinations(config)).toHaveLength(0);
+    expect(readRouting(config).destinations).toHaveLength(0);
     process.env.ARCHIVE_CONNECT_TEST_TOKEN = token;
     await runCli(args);
     await runCli(args);
-    expect(readDestinations(config)).toHaveLength(1);
+    expect(readRouting(config).destinations).toHaveLength(1);
     expect(statSync(config).mode & 0o777).toBe(0o600);
-    expect(JSON.stringify(readDestinations(config))).not.toContain(token);
+    expect(JSON.stringify(readRouting(config).destinations)).not.toContain(token);
     expect(() =>
       connectDestination(config, {
         kind: 'archive',
         url: 'http://unsafe.example',
-        projectId: 'p',
+        organizationId: 'p',
         tokenEnv: 'TOKEN',
       }),
     ).toThrow('HTTPS');
@@ -295,7 +300,7 @@ test('Kingdom destinations write and search through the paired Signet', async ()
   const credentialFile = await kingdom.hold(directory);
   const destination: ArchiveDestination = {
     kind: 'kingdom',
-    projectId: 'inixiative',
+    organizationId: 'inixiative',
     url: origin,
     credentialFile,
     integrationId,
@@ -306,7 +311,7 @@ test('Kingdom destinations write and search through the paired Signet', async ()
     await expect(
       verifyKingdomDestination({ ...destination, resourceId: crypto.randomUUID() }),
     ).rejects.toThrow('does not grant sessions.write');
-    await publishArchive(local, id, destination);
+    await publishArchive(local, id, destination, routing([destination]));
     expect(executed[0]).toMatchObject({
       signetId,
       integrationId,
@@ -314,9 +319,11 @@ test('Kingdom destinations write and search through the paired Signet', async ()
       input: { resourceId, previousDigest: null },
     });
     expect(executed[0].input.snapshot?.sessionId).toBe('one');
-    expect(await publishArchive(local, id, destination)).toEqual({ unchanged: true });
-    expect((await routingPreview(local, [destination]))[0].destinations).toEqual([
-      { kind: 'kingdom', url: origin, integrationId },
+    expect(await publishArchive(local, id, destination, routing([destination]))).toEqual({
+      unchanged: true,
+    });
+    expect((await routingPreview(local, routing([destination])))[0].destinations).toEqual([
+      { kind: 'kingdom', organizationId: 'inixiative', url: origin, integrationId },
     ]);
     const [remote] = await searchRemotes([destination], 'anything');
     expect(remote).toMatchObject({ data: { documents: [] } });
@@ -324,5 +331,80 @@ test('Kingdom destinations write and search through the paired Signet', async ()
   } finally {
     kingdom.stop();
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('one archive per organization: a session that touched both organizations publishes to both', async () => {
+  const local = await freshStore();
+  const instances: {
+    projectId: string;
+    instance: Awaited<ReturnType<typeof startArchiveServer>>;
+  }[] = [];
+  for (const projectId of ['inixiative', 'userevidence'] as const) {
+    await freshStore(projectId);
+    instances.push({
+      projectId,
+      instance: await startArchiveServer({
+        databaseUrl: testDatabaseUrl(projectId),
+        token,
+        port: 0,
+      }),
+    });
+  }
+  process.env.ARCHIVE_ORGANIZATION_TEST_TOKEN = token;
+  try {
+    const tagged = (projectId: string, sessionId: string, tags: string[]) => ({
+      ...snapshot(projectId, sessionId),
+      tags,
+    });
+    // Orchestrator work on Zealot, inixiative-only work across repos, a Zealot session that
+    // touched inixiative code, Zealot-only work, and a project no organization owns.
+    await local.capture(
+      tagged('inixiative', 'mixed', ['project:inixiative', 'project:userevidence']),
+    );
+    await local.capture(tagged('inixiative', 'repos', ['project:template', 'project:kingdom']));
+    await local.capture(
+      tagged('userevidence', 'ue-mixed', ['project:userevidence', 'project:tribe']),
+    );
+    await local.capture(tagged('userevidence', 'ue-own', ['project:userevidence']));
+    await local.capture(tagged('scratch', 'local-only', ['project:oracle']));
+    const destinations: ArchiveDestination[] = instances.map(({ projectId, instance }) => ({
+      kind: 'archive',
+      organizationId: projectId,
+      url: instance.server.url.href,
+      tokenEnv: 'ARCHIVE_ORGANIZATION_TEST_TOKEN',
+    }));
+    const routed = routing(destinations, {
+      inixiative: ['inixiative', 'template', 'kingdom', 'tribe'],
+      userevidence: ['userevidence'],
+    });
+    const routes = await routingPreview(local, routed);
+    const organizations = (sessionId: string) =>
+      routes.find((r) => r.id === archiveKey(snapshot(r.projectId ?? '', sessionId)))
+        ?.organizations;
+    expect(organizations('mixed')).toEqual(['inixiative', 'userevidence']);
+    expect(organizations('repos')).toEqual(['inixiative']);
+    expect(organizations('ue-mixed')).toEqual(['inixiative', 'userevidence']);
+    expect(organizations('local-only')).toEqual([]);
+    expect((await syncArchives(local, routed)).every((r) => r.status === 'published')).toBe(true);
+    const held = (i: number) =>
+      instances[i]!.instance.store.list({ exempt: 'include' }).then((l) =>
+        l.map((a) => `${a.sessionId}:${a.projectId}`).sort(),
+      );
+    // Each copy keeps its own project; projects are tags, not folders.
+    expect(await held(0)).toEqual([
+      'mixed:inixiative',
+      'repos:inixiative',
+      'ue-mixed:userevidence',
+    ]);
+    expect(await held(1)).toEqual([
+      'mixed:inixiative',
+      'ue-mixed:userevidence',
+      'ue-own:userevidence',
+    ]);
+    expect((await syncArchives(local, routed)).every((r) => r.status === 'unchanged')).toBe(true);
+  } finally {
+    delete process.env.ARCHIVE_ORGANIZATION_TEST_TOKEN;
+    for (const { instance } of instances) await instance.close();
   }
 });

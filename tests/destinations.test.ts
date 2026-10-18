@@ -8,14 +8,19 @@ import {
   destinationIdentity,
   destinationsFile,
   kingdomDirectory,
-  readDestinations,
+  readRouting,
   removeDestination,
+  removeOrganization,
+  sessionDestinations,
+  sessionOrganizations,
+  setOrganization,
 } from '../src/config';
 import { archiveSnapshotSchema } from '../src/index';
 import { ArchiveClient, ArchiveRequestError } from '../src/remote';
 import { createArchiveHandler } from '../src/server';
 import { freshStore } from './db';
 import { signetKingdom } from './kingdom';
+import { routing } from './routing';
 
 const token = 'synthetic-archive-test-token-0000000000';
 const snapshot = (projectId: string, sessionId: string) =>
@@ -37,7 +42,7 @@ const home = () => {
   return dir;
 };
 
-test('removeDestination drops only that project route and keeps the file private', () => {
+test('removeDestination drops only that organization route and keeps the file private', () => {
   const dir = home();
   const file = destinationsFile(dir);
   try {
@@ -46,14 +51,14 @@ test('removeDestination drops only that project route and keeps the file private
       url: 'https://archive.example/',
       tokenEnv: 'ARCHIVE_TOKEN',
     };
-    connectDestination(file, { ...direct, projectId: 'one' });
-    connectDestination(file, { ...direct, projectId: 'two' });
-    const identity = destinationIdentity({ ...direct, projectId: 'one' });
-    expect(removeDestination(file, { projectId: 'one', identity })).toBe(true);
-    expect(readDestinations(file).map((d) => d.projectId)).toEqual(['two']);
+    connectDestination(file, { ...direct, organizationId: 'one' });
+    connectDestination(file, { ...direct, organizationId: 'two' });
+    const identity = destinationIdentity({ ...direct, organizationId: 'one' });
+    expect(removeDestination(file, { organizationId: 'one', identity })).toBe(true);
+    expect(readRouting(file).destinations.map((d) => d.organizationId)).toEqual(['two']);
     expect(statSync(file).mode & 0o777).toBe(0o600);
-    expect(removeDestination(file, { projectId: 'one', identity })).toBe(false);
-    expect(removeDestination(join(dir, 'missing.json'), { projectId: 'one', identity })).toBe(
+    expect(removeDestination(file, { organizationId: 'one', identity })).toBe(false);
+    expect(removeDestination(join(dir, 'missing.json'), { organizationId: 'one', identity })).toBe(
       false,
     );
   } finally {
@@ -79,7 +84,7 @@ test('destination endpoints list delivery, libraries, connect and remove through
     token,
     fetch: ((url: URL, init: RequestInit) => handler(new Request(url.href, init))) as typeof fetch,
   });
-  const route = { projectId: 'inixiative', integrationId, resourceId };
+  const route = { organizationId: 'inixiative', integrationId, resourceId };
   try {
     expect(await archive.libraries()).toEqual({ paired: false, libraries: [] });
     await expect(archive.connectDestination(route)).rejects.toMatchObject({ status: 403 });
@@ -96,28 +101,35 @@ test('destination endpoints list delivery, libraries, connect and remove through
       status: 403,
       message: expect.stringContaining('sessions.write'),
     });
-    expect(readDestinations(config.destinationsFile)).toEqual([]);
+    expect(readRouting(config.destinationsFile).destinations).toEqual([]);
 
     const connected = await archive.connectDestination(route);
     expect(connected).toEqual({
       configured: true,
       kind: 'kingdom',
-      projectId: 'inixiative',
+      organizationId: 'inixiative',
       url: `${kingdom.origin}/`,
       integrationId,
       resourceId,
     });
-    const [saved] = readDestinations(config.destinationsFile);
+    const [saved] = readRouting(config.destinationsFile).destinations;
     expect(saved).toMatchObject({ kind: 'kingdom', ...route });
     if (saved.kind !== 'kingdom') throw new Error('Expected a Kingdom destination');
     expect(saved.credentialFile.startsWith(config.kingdomDirectory)).toBe(true);
     expect(await archive.connectDestination(route)).toEqual(connected);
     connectDestination(config.destinationsFile, {
       kind: 'archive',
-      projectId: 'personal',
+      organizationId: 'personal',
       url: 'https://personal.example',
       tokenEnv: 'PERSONAL_TOKEN',
     });
+    // Connecting declares the organization; which projects it owns is set separately.
+    expect((await archive.organizations()).organizations).toEqual([
+      { id: 'inixiative', projects: [] },
+      { id: 'personal', projects: [] },
+    ]);
+    await archive.setOrganization({ id: 'inixiative', projects: ['inixiative'] });
+    await archive.setOrganization({ id: 'personal', projects: ['personal'] });
 
     const delivered = await store.capture(snapshot('inixiative', 'delivered'));
     const stale = await store.capture(snapshot('inixiative', 'stale'));
@@ -133,7 +145,7 @@ test('destination endpoints list delivery, libraries, connect and remove through
       {
         configured: true,
         kind: 'archive',
-        projectId: 'personal',
+        organizationId: 'personal',
         url: 'https://personal.example/',
         tokenEnv: 'PERSONAL_TOKEN',
         delivered: 0,
@@ -141,15 +153,24 @@ test('destination endpoints list delivery, libraries, connect and remove through
       },
     ]);
     expect(
-      (await archive.destinations({ projectId: 'personal' })).destinations.map((d) => d.projectId),
+      (await archive.destinations({ organizationId: 'personal' })).destinations.map(
+        (d) => d.organizationId,
+      ),
     ).toEqual(['personal']);
     expect(JSON.stringify(await archive.destinations())).not.toContain('credentialFile');
 
     expect(await archive.removeDestination(route)).toEqual({ removed: true });
     expect(await archive.removeDestination(route)).toEqual({ removed: false });
-    expect(readDestinations(config.destinationsFile).map((d) => d.projectId)).toEqual(['personal']);
+    expect(readRouting(config.destinationsFile).destinations.map((d) => d.organizationId)).toEqual([
+      'personal',
+    ]);
+    expect(await archive.removeOrganization('personal')).toEqual({ removed: true });
+    expect(readRouting(config.destinationsFile)).toEqual({
+      organizations: [{ id: 'inixiative', projects: ['inixiative'] }],
+      destinations: [],
+    });
     await expect(
-      archive.request('destinations/remove', { ...route, projectId: undefined }),
+      archive.request('destinations/remove', { ...route, organizationId: undefined }),
     ).rejects.toMatchObject({ status: 400 });
     await expect(
       archive.request('destinations/connect', { ...route, kind: 'archive' }),
@@ -190,7 +211,7 @@ test('a failed delivery backs off, doubling per failure, and clears once deliver
   const destinations = [
     {
       kind: 'archive' as const,
-      projectId: 'backoff',
+      organizationId: 'backoff',
       url: server.url.href,
       tokenEnv: 'ARCHIVE_BACKOFF_TEST_TOKEN',
     },
@@ -198,7 +219,7 @@ test('a failed delivery backs off, doubling per failure, and clears once deliver
   const backoff: SyncBackoff = new Map();
   let clock = 1_000_000;
   const sync = async () =>
-    (await syncArchives(store, destinations, { backoff, now: () => clock })).find(
+    (await syncArchives(store, routing(destinations), { backoff, now: () => clock })).find(
       (r) => r.id === id,
     )!.status;
   try {
@@ -228,7 +249,7 @@ test('an unreachable destination is skipped for every archive until it is due; a
   const down = [
     {
       kind: 'archive' as const,
-      projectId: 'circuit',
+      organizationId: 'circuit',
       url: 'http://127.0.0.1:9/',
       tokenEnv: 'ARCHIVE_BACKOFF_TEST_TOKEN',
     },
@@ -236,7 +257,7 @@ test('an unreachable destination is skipped for every archive until it is due; a
   const backoff: SyncBackoff = new Map();
   let clock = 1_000_000;
   const statuses = async () =>
-    (await syncArchives(store, down, { backoff, now: () => clock })).map(
+    (await syncArchives(store, routing(down), { backoff, now: () => clock })).map(
       (r) => r.status.split(' ')[0],
     );
   // One connection failure defers the destination's other archives in the same cycle.
@@ -256,7 +277,7 @@ test('an unreachable destination is skipped for every archive until it is due; a
   try {
     const refusing = [{ ...down[0]!, url: server.url.href }];
     const only = async () =>
-      (await syncArchives(store, refusing, { backoff, now: () => clock })).find(
+      (await syncArchives(store, routing(refusing), { backoff, now: () => clock })).find(
         (r) => r.id === first.id,
       )!.status;
     expect(await only()).toStartWith('failed');
@@ -267,5 +288,49 @@ test('an unreachable destination is skipped for every archive until it is due; a
     expect(calls).toBeGreaterThan(0);
   } finally {
     server.stop(true);
+  }
+});
+
+test('routing is per organization: a session publishes to every organization it belongs to', () => {
+  const dir = home();
+  const file = destinationsFile(dir);
+  try {
+    const direct = (organizationId: string, url: string) => ({
+      kind: 'archive' as const,
+      organizationId,
+      url,
+      tokenEnv: 'ARCHIVE_TOKEN',
+    });
+    connectDestination(file, direct('inixiative', 'https://inixiative.example'));
+    connectDestination(file, direct('userevidence', 'https://userevidence.example'));
+    setOrganization(file, { id: 'inixiative', projects: ['inixiative', 'template', 'tribe'] });
+    setOrganization(file, { id: 'userevidence', projects: ['userevidence'] });
+    // A project belongs to at most one organization.
+    expect(() => setOrganization(file, { id: 'userevidence', projects: ['template'] })).toThrow(
+      'another organization',
+    );
+    const routed = readRouting(file);
+    const urls = (session: { projectId?: string; tags: string[] }) =>
+      sessionDestinations(routed, session).map((d) => d.url);
+    // Projects are tags: a mixed session goes to both organizations.
+    expect(
+      urls({ projectId: 'inixiative', tags: ['project:template', 'project:userevidence'] }),
+    ).toEqual(['https://inixiative.example/', 'https://userevidence.example/']);
+    expect(urls({ projectId: 'userevidence', tags: ['project:tribe'] })).toEqual([
+      'https://inixiative.example/',
+      'https://userevidence.example/',
+    ]);
+    expect(sessionOrganizations(routed, { projectId: 'template', tags: [] })).toEqual([
+      'inixiative',
+    ]);
+    // A project in no organization stays local; so does unrouted.
+    expect(urls({ projectId: 'scratch', tags: ['project:oracle'] })).toEqual([]);
+    expect(urls({ projectId: 'unrouted', tags: [] })).toEqual([]);
+    expect(() => setOrganization(file, { id: 'x', projects: ['unrouted'] })).toThrow();
+    // Removing an organization takes its destinations; its projects stay local.
+    expect(removeOrganization(file, 'userevidence')).toBe(true);
+    expect(readRouting(file).destinations.map((d) => d.organizationId)).toEqual(['inixiative']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

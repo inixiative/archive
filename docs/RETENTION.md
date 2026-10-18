@@ -77,7 +77,7 @@ archive agents add-collector --name codex.unrouted --source codex --catch-all
 
 - A catch-all collector captures every session whose cwd no other collector in `agents.json` claims. It gives those sessions the reserved projectId `unrouted`.
 - No destination matches `unrouted`, so by the existing routing rule ("an archive with no matching destination stays local") they never leave the machine. Routing them later is a re-route, not a re-capture.
-- **Exclusions** are declared once in `agents.json` (`exclude: [paths]`), defaulting to the OS temp directories and Claude/Codex scratchpads. Test and fixture sessions stay out.
+- **Folder filters** are declared once in `agents.json` (`include` / `exclude` globs, applied to every match; README, "Collect"), always excluding decision receipts; temp directories stay out of broad matches. Test and fixture sessions stay out.
 - Ancestor matching for nested directories (`kingdom/apps/api/…`) is opt-in per collector (`--subdirectories`); the default stays exact so another organization's nested checkout is never swept in.
 
 Collectors to add on this machine (an `agents.json` edit, no code):
@@ -126,7 +126,7 @@ An archive is **kept** while any of these hold. Each is a *citation* (§5) of a 
 | A subagent or handoff whose parent is kept, or the parent of a kept child | Archive, from lineage | derived, not stored |
 | Pinned by a person | Person (CLI, Foundry, Kingdom) | `pin` |
 
-**Exempt sessions** (`run:test`, `run:oracle`; README, "Run tags") are outside this scheme: they get no citations, no usefulness score and no summary, and readers never cite them. They stay until deleted, and a person removing the run tag brings one back under retention. The tagger's `junk` suggestion is evidence for a lower starting confidence, never a deletion.
+**Exempt sessions** (`run:test`, `run:oracle`, `run:foundry`; README, "Run tags") are outside this scheme, and an Archive with `captureRunSessions` off does not keep them at all: they get no citations, no usefulness score and no summary, and readers never cite them. They stay until deleted, and a person removing the run tag brings one back under retention. The tagger's `junk` suggestion is evidence for a lower starting confidence, never a deletion.
 
 Releasing is deleting the citation (a feedback item is closed, a fixture is retired, a pin is removed). The archive then falls back to its score.
 
@@ -185,7 +185,7 @@ Moving to **summarized**:
 2. Keeps the typed prompts verbatim. They are small, and they are what the Prospector and `foundry repeats` read.
 3. Stores the summary as a new revision with `coverage.completeness: 'partial'` and an omission "summarized from revision N", then compacts (§6.1). Search keeps working on the summary's chunks.
 
-Moving to **pruned** deletes that revision and its chunks and leaves the tombstone. The tombstone keeps `digest`, so the collector's `head()` sees an unchanged file as unchanged and does not re-import it. If the session is resumed, the digest differs, a new revision is captured and the archive is back in **keep**.
+Moving to **pruned** deletes that revision and its chunks and leaves the tombstone. The tombstone keeps `digest`, so the collector's `head()` sees an unchanged file as unchanged and does not re-import it. *Built for deletions (0.23.0):* `delete` and `retentionDays` leave an `archive_tombstones` row (key, writer's digest, project) that `head` answers with `deleted: true`, by the same digest check. If the session is resumed, the digest differs, a new revision is captured and the archive is back in **keep**.
 
 ### 6.3 Schedule
 
@@ -214,7 +214,7 @@ retention: {
 - **Personal and organization Archives** are separate deployments, so each owner sets its own policy. Kingdom shows and edits the hosted ones through the Archive integration's settings endpoints (`settings/read`, `settings/update`), under a Signet that grants `settings.write`.
 - **The local Archive is multi-project.** Per-project overrides: `retention.projects[projectId]` with the same fields. `unrouted` defaults to `summarizeAfterDays: 14`.
 - **Retention is per copy.** Each Archive prunes its own copy; deletions and tier changes do not sync. A hosted org Archive can keep forever what a laptop prunes.
-- **Zealot / UserEvidence.** Zealot sessions get their own collector and projectId `userevidence`, publish only to the UserEvidence Archive (Render), and are never summarized by an inixiative-paired Foundry. Summaries are generated under the session's own boundary: Foundry runs the summarizer only with a model account and owner that match the projectId's context. Until that context exists in Foundry, `userevidence` sessions stay **keep** locally and are never summarized.
+- **Zealot / UserEvidence.** Zealot sessions get their own collector and projectId `userevidence`, in the `userevidence` organization, which publishes to the UserEvidence Archive (Render). Routing is per organization (Aron, 2026-10-18: "Projects are tags"): a session that also touched inixiative projects goes to both organizations' archives. They are never summarized by an inixiative-paired Foundry. Summaries are generated under the session's own boundary: Foundry runs the summarizer only with a model account and owner that match the projectId's context. Until that context exists in Foundry, `userevidence` sessions stay **keep** locally and are never summarized.
 
 ## 8. Who reads from Archive instead of `~/.claude/projects`
 
