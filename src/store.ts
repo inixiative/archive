@@ -10,6 +10,7 @@ import {
   chunkArchive,
   selectChunks,
   snapshotDigest,
+  transcriptDigest,
   UNROUTED,
 } from './index';
 import {
@@ -227,10 +228,21 @@ export class ArchiveStore {
         }
         const old = await tx.archive.findUnique({ where: { id } });
         if (old?.digest === digest) return { id, digest, revision: old.revision, changed: false };
-        // A session deleted here stays deleted while its writer sends it unchanged.
+        // A session deleted here stays deleted while its transcript is unchanged, however a
+        // collector tags it; the tombstone takes the writer's digest so `head` matches it.
+        const transcript = transcriptDigest(incoming);
         const tombstone = old ? null : await tx.archiveTombstone.findUnique({ where: { id } });
-        if (tombstone?.digest === digest) return { id, digest, revision: 0, changed: false };
-        if (expected && (old?.digest ?? tombstone?.digest ?? null) !== expected.previousDigest)
+        if (
+          tombstone &&
+          (tombstone.digest === digest || tombstone.transcriptDigest === transcript)
+        ) {
+          if (tombstone.digest !== digest)
+            await tx.archiveTombstone.update({ where: { id }, data: { digest } });
+          return { id, digest, revision: 0, changed: false };
+        }
+        // Only a tombstone is held: there is no revision to conflict with, whatever the writer
+        // last saw (a destination whose receipts were reset sends none).
+        if (expected && !tombstone && (old?.digest ?? null) !== expected.previousDigest)
           throw new ArchiveConflict('Revision conflict');
         if (old && old.capturedAt > incoming.capturedAt) throw new ArchiveConflict('Stale capture');
         if (tombstone) await tx.archiveTombstone.delete({ where: { id } });
@@ -244,7 +256,7 @@ export class ArchiveStore {
         if (old?.storedDigest === storedDigest) {
           await tx.archive.update({
             where: { id },
-            data: { digest, capturedAt: snapshot.capturedAt },
+            data: { digest, transcriptDigest: transcript, capturedAt: snapshot.capturedAt },
           });
           return { id, digest, revision: old.revision, changed: false };
         }
@@ -260,6 +272,7 @@ export class ArchiveStore {
         const fields = {
           supersededBy,
           digest,
+          transcriptDigest: transcript,
           storedDigest,
           revision,
           source: snapshot.source,
@@ -653,13 +666,18 @@ export class ArchiveStore {
       await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
       const archive = await tx.archive.findUnique({
         where: { id },
-        select: { digest: true, projectId: true },
+        select: { digest: true, transcriptDigest: true, projectId: true },
       });
       if (!archive) return false;
+      const tombstone = {
+        digest: archive.digest,
+        transcriptDigest: archive.transcriptDigest,
+        projectId: archive.projectId,
+      };
       await tx.archiveTombstone.upsert({
         where: { id },
-        create: { id, digest: archive.digest, projectId: archive.projectId },
-        update: { digest: archive.digest, projectId: archive.projectId, deletedAt: new Date() },
+        create: { id, ...tombstone },
+        update: { ...tombstone, deletedAt: new Date() },
       });
       await tx.archive.delete({ where: { id } });
       return true;

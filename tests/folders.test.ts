@@ -195,6 +195,18 @@ test('project tags name every project whose files the tool calls touched, the lo
     projectTags(snapshot([call('Read', { file_path: 'kingdom/a.ts' })]), projects, '/w'),
   ).toEqual(['project:kingdom']);
   expect(projectTags(session, [])).toEqual([]);
+  // Naming the folder that holds every checkout is not working in any of them; a project's own
+  // root or worktree (`git -C`) still counts.
+  const listing = snapshot([
+    call('Bash', { command: 'ls /w && find /w/ -maxdepth 1 && ls ~/notes' }),
+  ]);
+  expect(projectTags(listing, projects, '/t')).toEqual(['project:notes']);
+  expect(
+    projectTags(
+      snapshot([call('Bash', { command: 'git -C /w/kingdom/.worktrees/feat log' })]),
+      projects,
+    ),
+  ).toEqual(['project:kingdom']);
 });
 
 test('a collector tags an org-level session, and its subagent, with the projects it touched; routing is unchanged', async () => {

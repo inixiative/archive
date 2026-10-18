@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { publishArchive } from '../src/client';
@@ -347,4 +347,84 @@ test('a deleted session leaves a tombstone: the same digest is not stored again,
   await store.updateSettings({ retentionDays: 1 });
   expect(await store.prune(10 * 86_400_000)).toEqual([id]);
   expect(await store.head(id)).toMatchObject({ deleted: true });
+});
+
+test('a tombstone matches the transcript, not the tags around it; a stale or missing previous digest is no conflict', async () => {
+  const store = await freshStore();
+  const handler = createArchiveHandler(store, token);
+  const first = session('retagged', ['coding']);
+  const { id, digest } = await store.capture(first);
+  await store.delete(id);
+  // A new collector, Atlas graph or project list tags the same transcript differently.
+  const retagged = { ...first, tags: ['coding', 'project:kingdom', 'atlas:feature:x'] };
+  const answer = await handler(request('ingest', { snapshot: retagged, previousDigest: null }));
+  expect(answer.status).toBe(200);
+  expect(((await answer.json()) as { data: { changed: boolean } }).data.changed).toBe(false);
+  expect(await store.list({ exempt: 'include' })).toEqual([]);
+  // The tombstone takes the writer's new digest, so the collector's head check matches it.
+  const head = await store.head(id);
+  expect(head).toMatchObject({ deleted: true });
+  expect(head!.digest).not.toBe(digest);
+  // A resumed transcript comes back even with no previous digest (a destination reset).
+  const resumed = {
+    ...retagged,
+    capturedAt: 2,
+    entries: [...first.entries, { ...first.entries[0]!, id: 'u2', sourceRef: 'line:2' }],
+  };
+  const back = await handler(request('ingest', { snapshot: resumed, previousDigest: null }));
+  expect(back.status).toBe(200);
+  expect(((await back.json()) as { data: { changed: boolean } }).data.changed).toBe(true);
+});
+
+test('a session deleted here comes back under its current routing when it resumes, after delete or retention', async () => {
+  const dir = realpathSync(mkdtempSync(join(homedir(), '.archive-tombstone-test-')));
+  const store = await freshStore();
+  try {
+    const history = join(dir, 'history');
+    mkdirSync(history);
+    const file = join(history, 'moved.jsonl');
+    const line = (uuid: string, content: string) =>
+      JSON.stringify({
+        sessionId: 'moved',
+        cwd: join(dir, 'b', 'x'),
+        type: 'user',
+        uuid,
+        message: { content },
+      });
+    writeFileSync(file, line('m1', 'Work'));
+    const base = { directory: history, source: 'claude-code' as const, subdirectories: true };
+    const a: CollectionSource = { ...base, projectId: 'a', projectRoots: [dir] };
+    const b: CollectionSource = { ...base, projectId: 'b', projectRoots: [join(dir, 'b')] };
+    const harness = () => undefined;
+    // Captured under a (before b had a collector), then deleted.
+    expect(await collectSessions(store, a, { peers: [a], harness })).toMatchObject({ imported: 1 });
+    const { id } = (await store.list())[0]!;
+    for (const remove of ['delete', 'retention'] as const) {
+      if (remove === 'delete') await store.delete(id);
+      else {
+        await store.updateSettings({ retentionDays: 1 });
+        expect(await store.prune(Date.now() + 10 * 86_400_000)).toEqual([id]);
+        await store.updateSettings({ retentionDays: null });
+      }
+      expect(await store.head(id)).toMatchObject({ deleted: true, projectId: expect.any(String) });
+      // Unchanged under b's routing: still deleted, and never "held by a".
+      expect(await collectSessions(store, b, { peers: [a, b], harness })).toMatchObject({
+        imported: 0,
+        held: 0,
+        unchanged: 1,
+      });
+      // Resumed: back, under b.
+      writeFileSync(
+        file,
+        `${readFileSync(file, 'utf8')}\n${line(`m-${remove}`, `More (${remove})`)}`,
+      );
+      expect(await collectSessions(store, b, { peers: [a, b], harness })).toMatchObject({
+        imported: 1,
+        held: 0,
+      });
+      expect((await store.list()).map((x) => x.projectId)).toEqual(['b']);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -121,10 +121,14 @@ export class ArchiveClient {
     return this.cachedSourceId;
   }
   head(id: string) {
-    return this.request<{ id: string; digest: string; revision: number; projectId: string | null }>(
-      'head',
-      { archiveId: id },
-    ).catch((error) => {
+    return this.request<{
+      id: string;
+      digest: string;
+      revision: number;
+      projectId: string | null;
+      /** A tombstone: the session was deleted here; `digest` is the writer's last one. */
+      deleted?: true;
+    }>('head', { archiveId: id }).catch((error) => {
       if (error instanceof ArchiveRequestError && error.status === 404) return undefined;
       throw error;
     });

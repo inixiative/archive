@@ -148,7 +148,10 @@ const TOOL_PATH = /(?<![\w@.+~:/-])(?:~?\/[\w@.+-]|[\w@.+-]+\/)[\w@.+/-]*/g;
 /**
  * The projects a session worked in, from the paths its tool calls name (files read, edited or
  * written, `git -C`, `cd`, worktree paths): `project:<projectId>` for each project with a root (or
- * worktree) holding one, the longest root winning. Relative paths resolve against the session's
+ * worktree) holding it, the longest root winning. A path that is itself a container root, one
+ * holding other projects' roots (an `ls ~/code/inixiative`), tags nothing: listing the folder
+ * that holds every checkout is not working in any of them. A project's own root or worktree
+ * (`git -C ~/code/inixiative/kingdom`) counts. Relative paths resolve against the session's
  * working directory; without one, only absolute paths count. Routing is unaffected: a session
  * keeps its own project and is tagged with every project it touched, its own included.
  */
@@ -165,6 +168,11 @@ export function projectTags(
     .filter(({ root }) => root)
     .sort((a, b) => b.root.length - a.root.length);
   if (!roots.length) return [];
+  const containers = new Set(
+    roots
+      .filter(({ root }) => roots.some((other) => other.root.startsWith(`${root}/`)))
+      .map(({ root }) => root),
+  );
   const counts = new Map<string, number>();
   for (const entry of snapshot.entries) {
     if (entry.kind !== 'tool-call') continue;
@@ -174,7 +182,7 @@ export function projectTags(
         : match.startsWith('/')
           ? resolve(match)
           : cwd && resolve(cwd, match);
-      if (!path) continue;
+      if (!path || containers.has(path)) continue;
       const owner = roots.find(({ root }) => path === root || path.startsWith(`${root}/`));
       if (owner) counts.set(owner.projectId, (counts.get(owner.projectId) ?? 0) + 1);
     }

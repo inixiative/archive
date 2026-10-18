@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 
@@ -43,12 +43,35 @@ export function stampedRun(env: Record<string, string | undefined> = process.env
   return kind && RUN_TAGS[kind];
 }
 
+/** Every collector root this machine's `agents.json` declares (default home); none if unreadable. */
+export function machineCollectorRoots(
+  file = join(homedir(), '.local/share/archive/agents.json'),
+): string[] {
+  try {
+    const config = JSON.parse(readFileSync(file, 'utf8')) as {
+      collectors?: { projectRoots?: unknown }[];
+    };
+    return (config.collectors ?? []).flatMap((c) =>
+      Array.isArray(c.projectRoots)
+        ? c.projectRoots.filter((r): r is string => typeof r === 'string').map((r) => resolve(r))
+        : [],
+    );
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Marks a workspace a test or eval harness made, so sessions run in it are runs. Refuses a
- * relative path, the filesystem root, the home directory and a git work tree's root: a marker
+ * relative path, the filesystem root, the home directory, a git work tree's root, a directory
+ * holding a git checkout directly below it, and one that is or holds a collector root: a marker
  * there would stamp a person's sessions.
  */
-export function stampRunDirectory(directory: string, kind: RunKind) {
+export function stampRunDirectory(
+  directory: string,
+  kind: RunKind,
+  collectorRoots: Iterable<string> = machineCollectorRoots(),
+) {
   if (!directory || !isAbsolute(directory))
     throw new Error('A run marker needs an absolute directory');
   const target = resolve(directory);
@@ -56,6 +79,12 @@ export function stampRunDirectory(directory: string, kind: RunKind) {
     throw new Error(`Refusing a run marker in ${target}`);
   if (existsSync(join(target, '.git')))
     throw new Error(`Refusing a run marker at the root of a git work tree (${target})`);
+  const children = readdirSync(target, { withFileTypes: true }).filter((e) => e.isDirectory());
+  if (children.some((child) => existsSync(join(target, child.name, '.git'))))
+    throw new Error(`Refusing a run marker above a git checkout (${target})`);
+  for (const root of collectorRoots)
+    if (root === target || root.startsWith(`${target}/`))
+      throw new Error(`Refusing a run marker at or above collector root ${root}`);
   writeFileSync(join(target, RUN_MARKER), `${kind}\n`);
 }
 

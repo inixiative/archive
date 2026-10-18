@@ -537,7 +537,9 @@ export async function collectSessions(
       const id = archiveKey(snapshot);
       const old = await archive.head(id);
       // A session belongs to one project; only one the catch-all held moves to its routed project.
-      const moved = old && old.projectId !== config.projectId && old.projectId !== UNROUTED;
+      // A tombstone holds no project: a session deleted here comes back under today's routing.
+      const moved =
+        old && !old.deleted && old.projectId !== config.projectId && old.projectId !== UNROUTED;
       if (moved && !(options.repair && (await collided(archive, id, snapshot)))) {
         result.held++;
         result.heldBy.push({ file, projectId: old.projectId! });

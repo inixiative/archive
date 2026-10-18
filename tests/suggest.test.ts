@@ -112,6 +112,20 @@ test('a run marker never stamps from a collector root or above, nor from home or
   try {
     mkdirSync(join(repo, '.git'));
     expect(() => stampRunDirectory(repo, 'test')).toThrow('git work tree');
+    // Not above a checkout either (`~/code`), nor at or above a collector root (`~/code/inixiative`).
+    const code = join(repo, 'code');
+    mkdirSync(join(code, 'zealot', '.git'), { recursive: true });
+    expect(() => stampRunDirectory(code, 'test', [])).toThrow('above a git checkout');
+    const container = join(repo, 'container');
+    mkdirSync(join(container, 'org'), { recursive: true });
+    expect(() => stampRunDirectory(container, 'test', [join(container, 'org')])).toThrow(
+      'collector root',
+    );
+    expect(() =>
+      stampRunDirectory(join(container, 'org'), 'test', [join(container, 'org')]),
+    ).toThrow('collector root');
+    stampRunDirectory(container, 'test', [join(repo, 'elsewhere')]);
+    expect(markedRun(join(container, 'org'))).toBe(RUN_TAGS.test);
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

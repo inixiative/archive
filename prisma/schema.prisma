@@ -39,6 +39,8 @@ model Archive {
   summary    Json
   /// A raw capture of a session its driver later stored itself: kept, never delivered onward.
   supersededBy String?
+  /// The incoming transcript without collector additions (`transcriptDigest`), for tombstones.
+  transcriptDigest String?
 
   revisions  Revision[]
   tagEdits   TagEdit[]
@@ -57,10 +59,14 @@ model Archive {
 /// collector that finds the same unchanged source file sees it as unchanged and does not import it
 /// again. A capture with another digest (the session resumed) brings the session back.
 model ArchiveTombstone {
-  id        String   @id
-  digest    String
-  projectId String?
-  deletedAt DateTime @default(now())
+  id               String   @id
+  /// The writer's digest as last seen: what `head` answers.
+  digest           String
+  /// The transcript's own digest: a capture of the same transcript stays deleted however it is
+  /// tagged. Null for a session captured before 0.23.0 (then only `digest` matches).
+  transcriptDigest String?
+  projectId        String?
+  deletedAt        DateTime @default(now())
 
   @@map("archive_tombstones")
 }
