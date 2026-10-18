@@ -139,6 +139,8 @@ export class ArchiveClient {
           digest: string;
           revision: number;
           changed: boolean;
+          /** The run tag a session was dropped for (`captureRunSessions` off); nothing was stored. */
+          dropped?: string;
         }>('ingest', { snapshot, previousDigest: head?.digest ?? null });
       } catch (error) {
         const conflict =

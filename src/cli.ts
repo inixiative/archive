@@ -18,7 +18,14 @@ import {
 } from './agents';
 import { importChatGPTThread } from './chatgpt';
 import { archiveRequest, type SyncBackoff, searchRemotes, syncArchives } from './client';
-import { type CollectorCache, collectSessions, defaultExclusions, UNROUTED } from './collector';
+import {
+  type CollectorCache,
+  collectSessions,
+  defaultExclusions,
+  type FolderFilters,
+  folderGlob,
+  UNROUTED,
+} from './collector';
 import {
   archiveDestinationSchema,
   connectDestination,
@@ -72,6 +79,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       worktrees: { type: 'boolean', default: false },
       subdirectories: { type: 'boolean', default: false },
       'catch-all': { type: 'boolean', default: false },
+      include: { type: 'string', multiple: true },
       exclude: { type: 'string', multiple: true },
       agent: { type: 'string' },
       provider: { type: 'string' },
@@ -90,6 +98,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       limit: { type: 'string' },
       port: { type: 'string' },
       'capture-tool-calls-and-results': { type: 'string' },
+      'capture-run-sessions': { type: 'string' },
       'retention-days': { type: 'string' },
       name: { type: 'string' },
       hostname: { type: 'string', default: '127.0.0.1' },
@@ -112,7 +121,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'up | down   (the local Archive: bundled compose.yaml with Postgres, data in --home)\n' +
         'serve [--port 4700 --hostname 127.0.0.1] [--sync]   (DATABASE_URL; token from ARCHIVE_SERVER_TOKEN or --token-file)\n' +
         'import --file PATH --source codex|claude-code|chatgpt --project-id ID [--tag TAG]\n' +
-        'collect --directory HISTORY --source codex|claude-code (--project-root CWD [--project-root ...] --project-id ID [--worktrees] [--subdirectories] | --catch-all) [--exclude PATH ...] [--atlas] [--watch]\n' +
+        'collect --directory HISTORY --source codex|claude-code (--project-root CWD [--project-root ...] --project-id ID [--worktrees] [--subdirectories] | --catch-all) [--include GLOB ...] [--exclude GLOB ...] [--atlas] [--watch]\n' +
         'collect --agent NAME [--watch]   (one collector from agents.json, routed against the others, re-read each scan)\n' +
         'repair [--agent NAME]   (every collector once, from the transcripts still on disk: re-captures each session as it routes now, taking over one another project holds only when that row holds another transcript, and reports every session re-imported or refused)\n' +
         'list | search --query TEXT [--remote]   [--project-id ID] [--source S] [--tag T] [--suggested T] [--exempt exclude|include|only] [--provider P] [--model M] [--effort E] [--access-path subscription|api|unknown]\n' +
@@ -123,10 +132,10 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH)   (a remote Archive, for serve --sync)\n' +
         'connect --kind kingdom --url KINGDOM_API_URL --credential-file PATH --integration-id UUID --resource-id UUID --project-id ID   (a hosted Archive through Kingdom)\n' +
         'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
-        "settings [--capture-tool-calls-and-results true|false] [--retention-days N|off]   (read, or change, this Archive's settings)\n" +
+        "settings [--capture-tool-calls-and-results true|false] [--capture-run-sessions true|false] [--retention-days N|off]   (read, or change, this Archive's settings)\n" +
         'maintenance status | maintenance reclaim   (compaction left to do and table sizes; return freed space to the OS once compaction is done)\n' +
         'agents add-collector --name N --source codex|claude-code (--project-id ID --project-root DIR [--project-root ...] [--worktrees] [--subdirectories] | --catch-all) [--directory HISTORY] [--atlas]\n' +
-        'agents remove-collector --name N | exclude [--exclude PATH ...] | server --url URL | install | uninstall | status\n' +
+        'agents remove-collector --name N | folders [--include GLOB ...] [--exclude GLOB ...] | server --url URL | install | uninstall | status\n' +
         `Data commands talk to the Archive server at --url (default ${DEFAULT_URL}) with the token in --token-file (default <home>/server.token) or ARCHIVE_TOKEN.\n`,
     );
     return;
@@ -327,9 +336,15 @@ export async function runCli(args = Bun.argv.slice(2)) {
           }),
         ),
       );
-    } else if (action === 'exclude') {
-      const { exclude: _, ...rest } = base;
-      output(writeAgents(file, { ...rest, ...(v.exclude?.length ? { exclude: v.exclude } : {}) }));
+    } else if (action === 'folders') {
+      const { include: _, exclude: __, ...rest } = base;
+      output(
+        writeAgents(file, {
+          ...rest,
+          ...(v.include?.length ? { include: v.include } : {}),
+          ...(v.exclude?.length ? { exclude: v.exclude } : {}),
+        }),
+      );
     } else if (action === 'remove-collector') {
       if (!v.name) throw new Error('remove-collector requires --name');
       output(
@@ -390,12 +405,18 @@ export async function runCli(args = Bun.argv.slice(2)) {
     ...(v.suggested ? { suggestedTag: v.suggested } : {}),
   };
   if (command === 'settings') {
-    const capture = v['capture-tool-calls-and-results'];
+    const flag = (name: string) => {
+      const value = v[name as 'capture-run-sessions'];
+      if (value !== undefined && value !== 'true' && value !== 'false')
+        throw new Error(`--${name} is true or false`);
+      return value === undefined ? undefined : value === 'true';
+    };
+    const capture = flag('capture-tool-calls-and-results');
+    const runs = flag('capture-run-sessions');
     const retention = v['retention-days'];
-    if (capture !== undefined && capture !== 'true' && capture !== 'false')
-      throw new Error('--capture-tool-calls-and-results is true or false');
     const change = {
-      ...(capture === undefined ? {} : { captureToolCallsAndResults: capture === 'true' }),
+      ...(capture === undefined ? {} : { captureToolCallsAndResults: capture }),
+      ...(runs === undefined ? {} : { captureRunSessions: runs }),
       ...(retention === undefined
         ? {}
         : {
@@ -522,7 +543,11 @@ export async function runCli(args = Bun.argv.slice(2)) {
       return {
         collector,
         peers: [collector],
-        exclude: [...defaultExclusions(), ...(v.exclude ?? [])],
+        filters: {
+          ...(v.include?.length ? { include: v.include.map(folderGlob) } : {}),
+          exclude: [...defaultExclusions(), ...(v.exclude ?? []).map(folderGlob)],
+        } as FolderFilters,
+        projects: [collector],
         server: undefined as { url: string } | undefined,
       };
     };
@@ -557,14 +582,19 @@ export async function runCli(args = Bun.argv.slice(2)) {
         continue;
       }
       try {
-        const { collector, peers, exclude, server } = current;
+        const { collector, peers, filters, projects, server } = current;
         const url = v.url ?? server?.url ?? DEFAULT_URL;
         if (url !== clientUrl) {
           client = new ArchiveClient({ url, token });
           clientUrl = url;
         }
         const started = Date.now();
-        const result = await collectSessions(client, collector, { peers, exclude, cache });
+        const result = await collectSessions(client, collector, {
+          peers,
+          filters,
+          projects,
+          cache,
+        });
         output({ ...result, ms: Date.now() - started });
         if (!v.watch && result.failed) process.exitCode = 1;
       } catch (error) {
@@ -585,10 +615,15 @@ export async function runCli(args = Bun.argv.slice(2)) {
     const names = v.agent ? [v.agent] : config.collectors.map((c) => c.name);
     const results = [];
     for (const name of names) {
-      const { collector, peers, exclude, server } = collectorPlan(config, name);
+      const { collector, peers, filters, projects, server } = collectorPlan(config, name);
       const client = new ArchiveClient({ url: v.url ?? server?.url ?? DEFAULT_URL, token });
       const started = Date.now();
-      const result = await collectSessions(client, collector, { peers, exclude, repair: true });
+      const result = await collectSessions(client, collector, {
+        peers,
+        filters,
+        projects,
+        repair: true,
+      });
       results.push({ collector: name, ...result, ms: Date.now() - started });
       if (result.failed) process.exitCode = 1;
     }

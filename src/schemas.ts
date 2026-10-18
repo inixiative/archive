@@ -19,12 +19,20 @@ export const archiveSettingsSchema = z.strictObject({
    * those already held.
    */
   captureToolCallsAndResults: z.boolean(),
+  /**
+   * Whether this Archive keeps run sessions: tests and probes (`run:test`), evaluations
+   * (`run:oracle`) and sessions Foundry starts itself (`run:foundry`). On, they are kept and
+   * exempt. Off, ingest drops them, whoever writes them (collectors, Foundry, a syncing Archive),
+   * and maintenance deletes those already held.
+   */
+  captureRunSessions: z.boolean(),
 });
 export type ArchiveSettings = z.infer<typeof archiveSettingsSchema>;
 export const defaultSettings: ArchiveSettings = {
   integrations: defaultIntegrations,
   retentionDays: null,
   captureToolCallsAndResults: true,
+  captureRunSessions: true,
 };
 
 export const tagSchema = z.string().min(1).max(120);
@@ -47,7 +55,7 @@ export interface ArchiveFilter {
   provider?: string;
   accessPath?: 'subscription' | 'api' | 'unknown';
   /**
-   * Test and evaluation runs (`run:test`, `run:oracle`): left out unless asked for. `include` lists
+   * Run sessions (`run:test`, `run:oracle`, `run:foundry`): left out unless asked for. `include` lists
    * them with the rest, `only` lists only them.
    */
   exempt?: 'exclude' | 'include' | 'only';

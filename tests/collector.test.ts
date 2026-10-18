@@ -7,6 +7,7 @@ import {
   type CollectorCache,
   collectionRoots,
   collectSessions,
+  defaultExclusions,
   routeSession,
 } from '../src/collector';
 import { importTranscript } from '../src/import';
@@ -42,7 +43,7 @@ test('collector matches exact provider cwd, retries partial files and keeps manu
     writeFileSync(join(dir, 'partial.jsonl'), rows('partial', root) + '{');
     symlinkSync(join(dir, 'ue.jsonl'), join(dir, 'linked.jsonl'));
     const first = await collectSessions(store, config);
-    expect(first).toEqual({ imported: 1, unchanged: 0, failed: 1, skipped: 2 });
+    expect(first).toMatchObject({ imported: 1, unchanged: 0, failed: 1, skipped: 2 });
     const id = (await await store.list())[0].id;
     await await store.tag(id, { add: ['manually-reviewed'] });
     writeFileSync(join(dir, 'partial.jsonl'), rows('partial', root));
@@ -55,7 +56,11 @@ test('collector matches exact provider cwd, retries partial files and keeps manu
     ]);
     expect(await await store.list()).toHaveLength(2);
     expect((await collectSessions(store, config)).unchanged).toBe(2);
-    expect((await collectSessions(store, { ...config, projectId: 'personal' })).failed).toBe(2);
+    // Another project's collector leaves both with the project that holds them.
+    expect(await collectSessions(store, { ...config, projectId: 'personal' })).toMatchObject({
+      held: 2,
+      failed: 0,
+    });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -138,13 +143,13 @@ test('several exact roots and their git worktrees collect into one project; nest
       projectId: 'foundry',
     };
     expect(collectionRoots(config)).toEqual(new Set([repo, '/work/second-checkout']));
-    expect(await collectSessions(store, config)).toEqual({
+    expect(await collectSessions(store, config)).toMatchObject({
       imported: 2,
       unchanged: 0,
       skipped: 2,
       failed: 0,
     });
-    expect(await collectSessions(store, { ...config, worktrees: true })).toEqual({
+    expect(await collectSessions(store, { ...config, worktrees: true })).toMatchObject({
       imported: 1,
       unchanged: 2,
       skipped: 1,
@@ -300,7 +305,7 @@ test('the longest root wins; subdirectories, exclusions and the catch-all route 
   };
   const peers = [inixiative, kingdom, tribe, fixtures, unrouted];
   const route = (cwd: string) =>
-    routeSession(cwd, peers, { exclude: ['/tmp', '.foundry/decision-receipts'] })?.projectId;
+    routeSession(cwd, peers, { filters: { exclude: defaultExclusions() } })?.projectId;
   expect(route('/w')).toBe('inixiative');
   expect(route('/w/kingdom')).toBe('kingdom');
   expect(route('/w/kingdom/apps/api')).toBe('kingdom');
@@ -309,7 +314,7 @@ test('the longest root wins; subdirectories, exclusions and the catch-all route 
   // An exact-only root claims no subdirectories; the broader root does.
   expect(route('/w/tribe/apps')).toBe('inixiative');
   expect(route('/elsewhere')).toBe('unrouted');
-  // Exclusions stop subdirectory and catch-all matches; an exact root is explicit.
+  // Temp directories stay out of subdirectory and catch-all matches; an exact root is explicit.
   expect(route('/tmp/probe')).toBeUndefined();
   expect(route('/tmp/fixture')).toBe('fixtures');
   expect(route('/w/foundry/.foundry/decision-receipts/r1')).toBeUndefined();
@@ -334,7 +339,6 @@ test('the longest root wins; subdirectories, exclusions and the catch-all route 
     session('t', '/tmp/probe');
     const options = {
       peers: [inixiative, kingdom, unrouted].map((c) => ({ ...c, directory: dir })),
-      exclude: ['/tmp'],
     };
     const [i, k, u] = options.peers as [CollectionSource, CollectionSource, CollectionSource];
     expect(await collectSessions(store, k, options)).toMatchObject({ imported: 1, skipped: 3 });
@@ -663,8 +667,9 @@ test('a subagent transcript never takes its parent’s key; a parent row holding
     const harness = () => 'subscription' as const;
     // A scan keeps the parent's transcript out: another project holds its key.
     const scan = await collectSessions(store, config, { harness });
-    expect(scan).toEqual({ imported: 2, unchanged: 0, skipped: 0, failed: 1 });
-    expect(scan.refused).toBeUndefined();
+    expect(scan).toMatchObject({ imported: 2, unchanged: 0, skipped: 0, held: 1, failed: 0 });
+    expect(scan.refused).toEqual([]);
+    expect(scan.heldBy.map((h) => h.projectId)).toEqual(['b']);
     const held = (await store.list()).find((a) => a.sessionId === parent)!;
     expect([held.projectId, held.title]).toEqual(['b', 'Review it']);
     // The repair takes it over with its own content, and says so.
@@ -723,10 +728,10 @@ test('a subagent transcript never takes its parent’s key; a parent row holding
     // A repair reports what it refuses, with the reason.
     writeFileSync(join(dir, 'broken.jsonl'), `${row({ type: 'user', message: {} })}\n{`);
     const refused = await collectSessions(store, config, { harness, repair: true });
-    expect(refused).toMatchObject({ failed: 2, repaired: [] });
+    expect(refused).toMatchObject({ failed: 1, held: 1, repaired: [] });
+    expect(refused.heldBy).toEqual([{ file: routed, projectId: 'b' }]);
     expect(refused.refused).toEqual([
       { file: join(dir, 'broken.jsonl'), reason: expect.stringContaining('Invalid transcript') },
-      { file: routed, reason: 'Session is held by project b' },
     ]);
     expect((await store.list()).find((a) => a.sessionId === 'routed')!.projectId).toBe('b');
   } finally {
@@ -777,16 +782,16 @@ test('a refused session is not retried until it changes; the catch-all hands ses
       imported: 1,
     });
     expect((await store.list()).map((x) => x.projectId)).toEqual(['a']);
-    // Another project may not take it: refused once, then not re-read or re-asked.
+    // Another project may not take it: held by a, said once, then not re-read or re-asked.
     const cache: CollectorCache = new Map();
     const moved = { ...b, projectRoots: ['/work/a/x'] };
     expect(
       await collectSessions(writer, moved, { peers: [moved], harness, cache, now }),
-    ).toMatchObject({ failed: 1 });
+    ).toMatchObject({ held: 1, failed: 0, heldBy: [{ projectId: 'a' }] });
     heads = 0;
     expect(
       await collectSessions(writer, moved, { peers: [moved], harness, cache, now }),
-    ).toMatchObject({ failed: 1 });
+    ).toMatchObject({ held: 1, failed: 0, heldBy: [] });
     expect(heads).toBe(0);
     // A stored session is re-checked every 10 minutes; one deleted on the server comes back.
     const own: CollectorCache = new Map();

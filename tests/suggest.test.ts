@@ -111,7 +111,9 @@ test('interim inference: working directories of tests, decisions, Oracle and ben
   expect(cwdRunTag(join(temp, 'native-text-controlled-abc'))).toBe(RUN_TAGS.test);
   expect(cwdRunTag('/private/tmp/claude-501/x/scratchpad')).toBe(RUN_TAGS.test);
   expect(cwdRunTag('/Users/me/scratchpad')).toBe(RUN_TAGS.test);
-  expect(cwdRunTag('/w/foundry/.foundry/decision-receipts/primed-1/fixture')).toBe(RUN_TAGS.test);
+  expect(cwdRunTag('/w/foundry/.foundry/decision-receipts/primed-1/fixture')).toBe(
+    RUN_TAGS.foundry,
+  );
   expect(cwdRunTag(join(homedir(), '.foundry/repeats/decision-receipts/p/fixture'))).toBe(
     RUN_TAGS.test,
   );
@@ -131,12 +133,12 @@ test('interim inference: working directories of tests, decisions, Oracle and ben
   };
   expect(
     routeSession('/Users/me/.foundry/repeats/decision-receipts/p', [catchAll], {
-      exclude: defaultExclusions(),
+      filters: { exclude: defaultExclusions() },
     }),
   ).toBeUndefined();
-  expect(routeSession('/Users/me/notes', [catchAll], { exclude: defaultExclusions() })).toBe(
-    catchAll,
-  );
+  expect(
+    routeSession('/Users/me/notes', [catchAll], { filters: { exclude: defaultExclusions() } }),
+  ).toBe(catchAll);
 });
 
 test('a collector tags sessions from a test working directory it was told to collect', async () => {

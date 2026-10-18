@@ -2,11 +2,11 @@ import { createHash } from 'node:crypto';
 import { typedPrompt } from './import';
 import type { ArchiveSnapshot } from './index';
 import type { TagDefinition } from './schemas';
+import { PROJECT_TAG_PREFIX } from './tags';
 
 /** Suggested for sessions that hold no real work: empty, aborted, probes, accidental starts. */
 export const JUNK_TAG = 'junk';
-/** `project:<projectId>`: the project a weakly routed session belongs to. */
-export const PROJECT_TAG_PREFIX = 'project:';
+export { PROJECT_TAG_PREFIX };
 
 /** What the tagger reads of a session: bounded excerpts and counts, never the whole transcript. */
 export type SessionDigest = {

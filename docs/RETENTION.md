@@ -77,7 +77,7 @@ archive agents add-collector --name codex.unrouted --source codex --catch-all
 
 - A catch-all collector captures every session whose cwd no other collector in `agents.json` claims. It gives those sessions the reserved projectId `unrouted`.
 - No destination matches `unrouted`, so by the existing routing rule ("an archive with no matching destination stays local") they never leave the machine. Routing them later is a re-route, not a re-capture.
-- **Exclusions** are declared once in `agents.json` (`exclude: [paths]`), defaulting to the OS temp directories and Claude/Codex scratchpads. Test and fixture sessions stay out.
+- **Folder filters** are declared once in `agents.json` (`include` / `exclude` globs, applied to every match; README, "Collect"), always excluding decision receipts; temp directories stay out of broad matches. Test and fixture sessions stay out.
 - Ancestor matching for nested directories (`kingdom/apps/api/…`) is opt-in per collector (`--subdirectories`); the default stays exact so another organization's nested checkout is never swept in.
 
 Collectors to add on this machine (an `agents.json` edit, no code):
@@ -126,7 +126,7 @@ An archive is **kept** while any of these hold. Each is a *citation* (§5) of a 
 | A subagent or handoff whose parent is kept, or the parent of a kept child | Archive, from lineage | derived, not stored |
 | Pinned by a person | Person (CLI, Foundry, Kingdom) | `pin` |
 
-**Exempt sessions** (`run:test`, `run:oracle`; README, "Run tags") are outside this scheme: they get no citations, no usefulness score and no summary, and readers never cite them. They stay until deleted, and a person removing the run tag brings one back under retention. The tagger's `junk` suggestion is evidence for a lower starting confidence, never a deletion.
+**Exempt sessions** (`run:test`, `run:oracle`, `run:foundry`; README, "Run tags") are outside this scheme, and an Archive with `captureRunSessions` off does not keep them at all: they get no citations, no usefulness score and no summary, and readers never cite them. They stay until deleted, and a person removing the run tag brings one back under retention. The tagger's `junk` suggestion is evidence for a lower starting confidence, never a deletion.
 
 Releasing is deleting the citation (a feedback item is closed, a fixture is retired, a pin is removed). The archive then falls back to its score.
 

@@ -1,3 +1,5 @@
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { z } from 'zod';
 import type { ArchiveReference, ArchiveSnapshot } from './index';
 
@@ -131,5 +133,55 @@ export function atlasTags(
     .sort((a, b) => b[1] - a[1])
     .slice(0, limit)
     .map(([concept]) => `atlas:${concept}`)
+    .filter((tag) => tag.length <= 120);
+}
+
+/** `project:<projectId>`: a project whose files a session's tool calls touched. */
+export const PROJECT_TAG_PREFIX = 'project:';
+
+/**
+ * Paths named in tool calls: absolute (`/…`, `~/…`) or relative with a folder (`apps/api/x.ts`),
+ * never the inside of a URL.
+ */
+const TOOL_PATH = /(?<![\w@.+~:/-])(?:~?\/[\w@.+-]|[\w@.+-]+\/)[\w@.+/-]*/g;
+
+/**
+ * The projects a session worked in, from the paths its tool calls name (files read, edited or
+ * written, `git -C`, `cd`, worktree paths): `project:<projectId>` for each project with a root (or
+ * worktree) holding one, the longest root winning. Relative paths resolve against the session's
+ * working directory; without one, only absolute paths count. Routing is unaffected: a session
+ * keeps its own project and is tagged with every project it touched, its own included.
+ */
+export function projectTags(
+  snapshot: Pick<ArchiveSnapshot, 'entries'>,
+  projects: { projectId: string; roots: Iterable<string> }[],
+  cwd?: string,
+  limit = 20,
+): string[] {
+  const roots = projects
+    .flatMap(({ projectId, roots }) =>
+      [...roots].map((root) => ({ projectId, root: root.replace(/\/+$/, '') })),
+    )
+    .filter(({ root }) => root)
+    .sort((a, b) => b.root.length - a.root.length);
+  if (!roots.length) return [];
+  const counts = new Map<string, number>();
+  for (const entry of snapshot.entries) {
+    if (entry.kind !== 'tool-call') continue;
+    for (const [match] of entry.text.matchAll(TOOL_PATH)) {
+      const path = match.startsWith('~/')
+        ? join(homedir(), match.slice(2))
+        : match.startsWith('/')
+          ? resolve(match)
+          : cwd && resolve(cwd, match);
+      if (!path) continue;
+      const owner = roots.find(({ root }) => path === root || path.startsWith(`${root}/`));
+      if (owner) counts.set(owner.projectId, (counts.get(owner.projectId) ?? 0) + 1);
+    }
+  }
+  return [...counts]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([projectId]) => `${PROJECT_TAG_PREFIX}${projectId}`)
     .filter((tag) => tag.length <= 120);
 }

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { type Prisma, PrismaClient } from '@prisma/client';
 import { z } from 'zod';
-import { exemptRun, identityRunTags } from './exemption';
+import { exemptRun, identityRunTags, RUN_TAGS, type RunKind } from './exemption';
 import {
   type ArchiveChunk,
   type ArchiveSnapshot,
@@ -98,6 +98,10 @@ const toolActivitySweepSchema = z.strictObject({
   finished: z.boolean().default(false),
   failed: z.array(z.string()).max(10_000).default([]),
 });
+/** The settings row that marks run sessions still to delete, and how far the sweep got. */
+const RUN_SESSION_SWEEP = 'runSessionSweep';
+const runSessionSweepSchema = z.strictObject({ afterSeq: z.string().regex(/^\d+$/) });
+const RUN_SESSION_BATCH = 100;
 const COMPACTION_BATCH = 100;
 /** The trigram index on chunk text (prisma/schema.prisma) that search uses. */
 const SEARCH_INDEX = 'chunks_text_idx';
@@ -117,6 +121,26 @@ const baseTags = (summary: Summary) => [
     }),
   ]),
 ];
+
+/**
+ * The run kind a snapshot is stamped (or, interim, inferred) as, unless a person lifted that
+ * exemption on the stored session by removing its run tag.
+ */
+async function runToDrop(
+  tx: Prisma.TransactionClient,
+  id: string,
+  snapshot: ArchiveSnapshot,
+): Promise<RunKind | undefined> {
+  const run = exemptRun([
+    ...snapshot.tags,
+    ...identityRunTags({ ...snapshot, projectId: snapshot.projectId ?? null }),
+  ]);
+  if (!run) return undefined;
+  const lifted = await tx.tagEdit.findFirst({
+    where: { archiveId: id, added: false, tag: { in: Object.values(RUN_TAGS) } },
+  });
+  return lifted ? undefined : run;
+}
 
 type ArchiveRow = {
   id: string;
@@ -196,12 +220,18 @@ export class ArchiveStore {
         await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
         // A settings change waits for captures in flight, so the sweep it queues sees them all.
         await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock_shared(${SETTINGS_LOCK})`;
+        const settings = await this.settings(tx);
+        const run = settings.captureRunSessions ? undefined : await runToDrop(tx, id, incoming);
+        if (run) {
+          // The digest is the writer's, so a syncing Archive records the delivery and moves on.
+          await tx.archive.deleteMany({ where: { id } });
+          return { id, digest, revision: 0, changed: false, dropped: RUN_TAGS[run] };
+        }
         const old = await tx.archive.findUnique({ where: { id } });
         if (old?.digest === digest) return { id, digest, revision: old.revision, changed: false };
         if (expected && (old?.digest ?? null) !== expected.previousDigest)
           throw new ArchiveConflict('Revision conflict');
         if (old && old.capturedAt > incoming.capturedAt) throw new ArchiveConflict('Stale capture');
-        const settings = await this.settings(tx);
         const { snapshot, changed } = settings.captureToolCallsAndResults
           ? { snapshot: incoming, changed: 0 }
           : withoutToolActivity(incoming, settings.integrations);
@@ -678,6 +708,60 @@ export class ArchiveStore {
     }
     return changed;
   }
+  /**
+   * While `captureRunSessions` is off, deletes the run sessions this Archive took in while it was
+   * on, as listed (a session whose run tag a person removed stays). One page of archives at a
+   * time, one archive per statement, resuming where it stopped. Returns the archives deleted.
+   */
+  async removeRunSessions() {
+    let removed = 0;
+    while (!this.stopping) {
+      const row = await this.db.setting.findUnique({ where: { key: RUN_SESSION_SWEEP } });
+      if (!row) return removed;
+      if ((await this.settings()).captureRunSessions) {
+        await this.db.setting.deleteMany({ where: { key: RUN_SESSION_SWEEP } });
+        return removed;
+      }
+      const { afterSeq } = runSessionSweepSchema.parse(row.value);
+      const page = await this.db.archive.findMany({
+        where: { seq: { gt: BigInt(afterSeq) } },
+        orderBy: { seq: 'asc' },
+        take: RUN_SESSION_BATCH,
+        select: {
+          id: true,
+          seq: true,
+          revision: true,
+          digest: true,
+          summary: true,
+          tagEdits: { select: { tag: true, added: true } },
+          suggestion: { select: { digest: true, by: true, tags: true } },
+        },
+      });
+      let reached = afterSeq;
+      let finished = page.length < RUN_SESSION_BATCH;
+      for (const archive of page) {
+        if (this.stopping) {
+          finished = false;
+          break;
+        }
+        if (listing(archive, { exempt: 'only' }).length)
+          // A capture that moved the session on meanwhile was itself dropped or lifted.
+          removed += (
+            await this.db.archive.deleteMany({ where: { id: archive.id, digest: archive.digest } })
+          ).count;
+        reached = archive.seq.toString();
+      }
+      if (finished) {
+        await this.db.setting.deleteMany({ where: { key: RUN_SESSION_SWEEP } });
+        return removed;
+      }
+      await this.db.setting.updateMany({
+        where: { key: RUN_SESSION_SWEEP },
+        data: { value: { afterSeq: reached } },
+      });
+    }
+    return removed;
+  }
   private stripToolActivity(id: string, settings: ArchiveSettings) {
     return this.db.$transaction(
       async (tx) => {
@@ -732,7 +816,8 @@ export class ArchiveStore {
   private maintaining?: Promise<void>;
   private stopping = false;
   /**
-   * Retention, compaction, removal of past tool activity, then the search index restored if it was
+   * Retention, compaction, deletion of run sessions and removal of past tool activity (each
+   * while its setting is off), then the search index restored if it was
    * dropped. One run at a time (a call during a run joins it), and none while a reclaim runs.
    */
   maintain(now = Date.now()) {
@@ -741,6 +826,7 @@ export class ArchiveStore {
       try {
         await this.prune(now);
         await this.compact();
+        await this.removeRunSessions();
         await this.removePastToolActivity();
         if (!this.stopping) await this.ensureSearchIndex();
       } finally {
@@ -804,6 +890,7 @@ export class ArchiveStore {
     const [database] = await this.db.$queryRaw<{ bytes: bigint }[]>`
       SELECT pg_database_size(current_database()) AS "bytes"`;
     const sweep = await this.sweepState();
+    const runSessionSweep = await this.db.setting.findUnique({ where: { key: RUN_SESSION_SWEEP } });
     return {
       databaseBytes: Number(database!.bytes),
       /** Earlier revisions compaction will delete. */
@@ -814,6 +901,8 @@ export class ArchiveStore {
       toolActivitySweepPending: Boolean(sweep && !sweep.finished),
       /** Archives whose tool activity could not be removed; retried on each run. */
       toolActivitySweepFailures: sweep?.failed ?? [],
+      /** Run sessions the deletion sweep has yet to reach (`captureRunSessions` off). */
+      runSessionSweepPending: Boolean(runSessionSweep),
       reclaim: this.reclaiming,
       tables: tables.map((t) => ({
         table: t.table,
@@ -840,10 +929,14 @@ export class ArchiveStore {
       this.reclaiming = idle;
       throw error;
     });
-    if (before.supersededRevisions || before.toolActivitySweepPending) {
+    if (
+      before.supersededRevisions ||
+      before.toolActivitySweepPending ||
+      before.runSessionSweepPending
+    ) {
       this.reclaiming = idle;
       throw new MaintenancePending(
-        'Compaction or tool-activity removal is still running; reclaim once maintenance finishes',
+        'Compaction, run-session deletion or tool-activity removal is still running; reclaim once maintenance finishes',
       );
     }
     const finish = (outcome: { afterBytes?: number; error?: string }) => {
@@ -887,7 +980,8 @@ export class ArchiveStore {
   }
   /**
    * Saves settings. Listings are recomputed when the integrations change, since references follow
-   * them. Turning `captureToolCallsAndResults` off queues removal of the tool activity already held.
+   * them. Turning `captureToolCallsAndResults` off queues removal of the tool activity already held;
+   * turning `captureRunSessions` off queues deletion of the run sessions already held.
    */
   async updateSettings(change: Partial<ArchiveSettings>) {
     const { previous, next } = await this.db.$transaction(async (tx) => {
@@ -908,6 +1002,14 @@ export class ArchiveStore {
         });
       if (next.captureToolCallsAndResults)
         await tx.setting.deleteMany({ where: { key: TOOL_ACTIVITY_SWEEP } });
+      if (previous.captureRunSessions && !next.captureRunSessions)
+        await tx.setting.upsert({
+          where: { key: RUN_SESSION_SWEEP },
+          create: { key: RUN_SESSION_SWEEP, value: { afterSeq: '0' } },
+          update: { value: { afterSeq: '0' } },
+        });
+      if (next.captureRunSessions)
+        await tx.setting.deleteMany({ where: { key: RUN_SESSION_SWEEP } });
       return { previous, next };
     });
     if (JSON.stringify(previous.integrations) === JSON.stringify(next.integrations)) return next;

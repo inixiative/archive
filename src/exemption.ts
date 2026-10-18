@@ -4,26 +4,29 @@ import { dirname, join, resolve } from 'node:path';
 
 /**
  * Runs that are not a person's work: tests and probes (`run:test`), Oracle and bench evaluations
- * (`run:oracle`). An exempt session is kept, but never feeds curation, suggestions, retention
- * scoring, correction mining or agent context. A person removing the tag lifts the exemption.
+ * (`run:oracle`), and sessions Foundry itself starts (`run:foundry`: Wardens, middleware roles,
+ * classifiers). An exempt session never feeds curation, suggestions, retention scoring,
+ * correction mining or agent context; an Archive whose `captureRunSessions` setting is off does
+ * not keep it at all. A person removing the tag lifts the exemption.
  *
  * Exemption rests on explicit stamps from the harness that ran the session:
- * - a `run:test` / `run:oracle` tag on the snapshot (a writer's own tags, `collect --tag`);
- * - `ARCHIVE_RUN=test|oracle` in the environment of a process that writes snapshots;
- * - a `.archive-run` file holding `test` or `oracle` in the session's working directory or an
+ * - a run tag on the snapshot (a writer's own tags, `collect --tag`);
+ * - `ARCHIVE_RUN=test|oracle|foundry` in the environment of a process that writes snapshots;
+ * - a `.archive-run` file holding the run kind in the session's working directory or an
  *   ancestor, written by the runner that made the workspace (`stampRunDirectory`).
  */
-export const RUN_TAGS = { test: 'run:test', oracle: 'run:oracle' } as const;
+export const RUN_TAGS = { test: 'run:test', oracle: 'run:oracle', foundry: 'run:foundry' } as const;
 export type RunKind = keyof typeof RUN_TAGS;
 export const RUN_ENV = 'ARCHIVE_RUN';
 export const RUN_MARKER = '.archive-run';
 
-const runKind = (value: unknown): RunKind | undefined =>
-  value === 'test' || value === 'oracle' ? value : undefined;
+export const RUN_KINDS = Object.keys(RUN_TAGS) as RunKind[];
+const runKind = (value: unknown): RunKind | undefined => RUN_KINDS.find((kind) => kind === value);
 
-/** The run kind a session's tags exempt it as, if any; `run:oracle` wins over `run:test`. */
+/** The run kind a session's tags exempt it as, if any, in the order `oracle`, `foundry`, `test`. */
 export function exemptRun(tags: readonly string[]): RunKind | undefined {
   if (tags.includes(RUN_TAGS.oracle)) return 'oracle';
+  if (tags.includes(RUN_TAGS.foundry)) return 'foundry';
   if (tags.includes(RUN_TAGS.test)) return 'test';
   return undefined;
 }
@@ -92,8 +95,9 @@ const segments = (cwd: string) => cwd.split('/').filter(Boolean);
 /**
  * INTERIM inference from a working directory, for sessions no harness stamped; delete once the
  * fixtures and runners that make these directories write `.archive-run`. Oracle: its eval
- * workspaces, a `.oracle` directory, bench run checkouts. Test: decision receipts, agent
- * scratchpads, anything under a temp directory.
+ * workspaces, a `.oracle` directory, bench run checkouts. Foundry: the primed host fixtures its
+ * Wardens, chorus and classifiers run in (`decision-receipts/primed-<host>/fixture`). Test: other
+ * decision receipts, agent scratchpads, anything under a temp directory.
  */
 export function inferredRunTag(cwd: string): string | undefined {
   const parts = segments(cwd);
@@ -106,6 +110,8 @@ export function inferredRunTag(cwd: string): string | undefined {
     (temporary && parts.some((part) => /^oracle-/.test(part)))
   )
     return RUN_TAGS.oracle;
+  if (parts.some((part, i) => part === 'decision-receipts' && /^primed-/.test(parts[i + 1] ?? '')))
+    return RUN_TAGS.foundry;
   if (temporary || parts.includes('decision-receipts') || parts.includes('scratchpad'))
     return RUN_TAGS.test;
   return undefined;

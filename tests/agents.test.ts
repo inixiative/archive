@@ -435,8 +435,9 @@ test('a catch-all collector is unrouted with no roots; a named collector is rout
   expect(plan.collector).toMatchObject({ catchAll: true, projectId: 'unrouted' });
   expect(plan.peers.map((p) => p.projectId)).toEqual(['kingdom', 'unrouted']);
   expect(plan.peers[1]).toBe(plan.collector);
-  expect(plan.exclude).toContain('/Users/me/scratch');
-  expect(plan.exclude).toContain('decision-receipts');
+  expect(plan.filters.exclude).toContain('/Users/me/scratch');
+  expect(plan.filters.exclude).toContain('**/decision-receipts');
+  expect(plan.projects.map((p) => p.projectId)).toEqual(['kingdom', 'kingdom']);
   expect(plan.server).toEqual({ url: 'http://127.0.0.1:4700' });
   // A collector over another history directory is not a peer.
   const elsewhere = {
