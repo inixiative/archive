@@ -33,6 +33,7 @@ import {
   sessionDigest,
 } from './suggest';
 import { archiveReferences } from './tags';
+import { withoutToolActivity } from './tool-activity';
 
 export {
   type ArchiveFilter,
@@ -90,6 +91,19 @@ const toChunk = (row: {
 });
 
 const BATCH = 500;
+/** The settings row that marks past tool activity still to remove, and how far the sweep got. */
+const TOOL_ACTIVITY_SWEEP = 'toolActivitySweep';
+const toolActivitySweepSchema = z.strictObject({
+  afterSeq: z.string().regex(/^\d+$/),
+  finished: z.boolean().default(false),
+  failed: z.array(z.string()).max(10_000).default([]),
+});
+const COMPACTION_BATCH = 100;
+/** The trigram index on chunk text (prisma/schema.prisma) that search uses. */
+const SEARCH_INDEX = 'chunks_text_idx';
+const TOOL_ACTIVITY_BATCH = 50;
+/** Advisory lock key: captures hold it shared, a settings change exclusively. */
+const SETTINGS_LOCK = 0x41524348;
 
 /** A session's tags before edits: as captured, plus the run tags its identity implies. */
 const baseTags = (summary: Summary) => [
@@ -167,20 +181,39 @@ export class ArchiveStore {
     this.cachedSourceId = z.uuid().parse(row.value);
     return this.cachedSourceId;
   }
+  /**
+   * Stores a snapshot as the next revision and compacts the one it replaces. `digest` is the
+   * snapshot as its writer sent it, so a writer's unchanged session stays unchanged; the stored
+   * snapshot (and `storedDigest`) leave out tool activity when the setting says so.
+   */
   async capture(input: unknown, expected?: { previousDigest: string | null }) {
-    const snapshot = archiveSnapshotSchema.parse(input);
-    const id = archiveKey(snapshot);
-    const digest = snapshotDigest(snapshot);
-    const settings = await this.settings();
+    const incoming = archiveSnapshotSchema.parse(input);
+    const id = archiveKey(incoming);
+    const digest = snapshotDigest(incoming);
     return this.db.$transaction(
       async (tx) => {
         // Serializes concurrent captures of one session.
         await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
+        // A settings change waits for captures in flight, so the sweep it queues sees them all.
+        await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock_shared(${SETTINGS_LOCK})`;
         const old = await tx.archive.findUnique({ where: { id } });
         if (old?.digest === digest) return { id, digest, revision: old.revision, changed: false };
         if (expected && (old?.digest ?? null) !== expected.previousDigest)
           throw new ArchiveConflict('Revision conflict');
-        if (old && old.capturedAt > snapshot.capturedAt) throw new ArchiveConflict('Stale capture');
+        if (old && old.capturedAt > incoming.capturedAt) throw new ArchiveConflict('Stale capture');
+        const settings = await this.settings(tx);
+        const { snapshot, changed } = settings.captureToolCallsAndResults
+          ? { snapshot: incoming, changed: 0 }
+          : withoutToolActivity(incoming, settings.integrations);
+        const storedDigest = changed ? snapshotDigest(snapshot) : digest;
+        // The writer changed only what this Archive drops: what it holds stays as it is.
+        if (old?.storedDigest === storedDigest) {
+          await tx.archive.update({
+            where: { id },
+            data: { digest, capturedAt: snapshot.capturedAt },
+          });
+          return { id, digest, revision: old.revision, changed: false };
+        }
         const revision = (old?.revision ?? 0) + 1;
         // A raw capture landing after its driver fulfilled the claim is superseded at once.
         const claim = (CLAIM_SOURCES as readonly string[]).includes(snapshot.source)
@@ -193,6 +226,7 @@ export class ArchiveStore {
         const fields = {
           supersededBy,
           digest,
+          storedDigest,
           revision,
           source: snapshot.source,
           projectId: snapshot.projectId ?? null,
@@ -204,7 +238,12 @@ export class ArchiveStore {
         };
         await tx.archive.upsert({ where: { id }, create: { id, ...fields }, update: fields });
         await tx.revision.create({
-          data: { archiveId: id, revision, digest, snapshot: snapshot as Prisma.InputJsonValue },
+          data: {
+            archiveId: id,
+            revision,
+            digest: storedDigest,
+            snapshot: snapshot as Prisma.InputJsonValue,
+          },
         });
         const chunks = chunkArchive(snapshot);
         for (let offset = 0; offset < chunks.length; offset += 1000)
@@ -216,6 +255,7 @@ export class ArchiveStore {
               ...chunk,
             })),
           });
+        if (old) await dropRevision(tx, id, old.revision);
         return { id, digest, revision, changed: true };
         // A 64 MB session writes tens of thousands of chunks.
       },
@@ -226,10 +266,21 @@ export class ArchiveStore {
   async head(id: string) {
     const row = await this.db.archive.findUnique({
       where: { id },
-      select: { id: true, digest: true, revision: true, projectId: true, supersededBy: true },
+      select: {
+        id: true,
+        digest: true,
+        storedDigest: true,
+        revision: true,
+        projectId: true,
+        supersededBy: true,
+      },
     });
     return row ?? undefined;
   }
+  /**
+   * The current revision, or an earlier one still waiting to be delivered. Other earlier revisions
+   * are compacted away: asking for one throws `RevisionCompacted`.
+   */
   async read(id: string, revision?: number) {
     const archive = await this.db.archive.findUnique({ where: { id } });
     if (!archive) return undefined;
@@ -237,7 +288,13 @@ export class ArchiveStore {
       where: { archiveId_revision: { archiveId: id, revision: revision ?? archive.revision } },
       include: { chunks: { orderBy: { position: 'asc' } } },
     });
-    if (!row) return undefined;
+    if (!row) {
+      if (revision !== undefined && revision < archive.revision)
+        throw new RevisionCompacted(
+          `Revision ${revision} was compacted; this Archive keeps revision ${archive.revision}`,
+        );
+      return undefined;
+    }
     return {
       id,
       revision: row.revision,
@@ -511,40 +568,368 @@ export class ArchiveStore {
     await this.db.archive.deleteMany({ where: { id: { in: expired.map((a) => a.id) } } });
     return expired.map((a) => a.id);
   }
-  async settings(): Promise<ArchiveSettings> {
-    const row = await this.db.setting.findUnique({ where: { key: 'archive' } });
-    return row ? archiveSettingsSchema.parse(row.value) : defaultSettings;
+  /**
+   * Deletes every revision but the current one, keeping any an outbox row still names until it is
+   * delivered. A growing session's earlier revisions are prefixes of its current one. One revision
+   * per statement (its chunks cascade), so no transaction holds a large delete. Outbox rows of
+   * superseded archives, which are never delivered, are released first. Stops between statements
+   * once `stop()` is called; returns how many went.
+   */
+  async compact() {
+    await this.db.outbox.deleteMany({ where: { archive: { supersededBy: { not: null } } } });
+    let removed = 0;
+    while (!this.stopping) {
+      const rows = await this.db.$queryRaw<{ archiveId: string; revision: number }[]>`
+        SELECT r."archiveId", r."revision" FROM "revisions" r
+        JOIN "archives" a ON a."id" = r."archiveId"
+        WHERE r."revision" < a."revision"
+          AND NOT EXISTS (SELECT 1 FROM "outbox" o
+            WHERE o."archiveId" = r."archiveId" AND o."revision" = r."revision")
+        LIMIT ${COMPACTION_BATCH}`;
+      let batch = 0;
+      for (const row of rows) {
+        if (this.stopping) break;
+        batch += await dropRevision(this.db, row.archiveId, row.revision);
+      }
+      removed += batch;
+      if (rows.length < COMPACTION_BATCH || !batch) break;
+    }
+    return removed;
   }
-  /** Saves settings and recomputes listings together, since references follow the integrations. */
-  async updateSettings(change: Partial<ArchiveSettings>) {
-    const next = archiveSettingsSchema.parse({ ...(await this.settings()), ...change });
-    await this.db.$transaction(
-      async (tx) => {
-        await tx.setting.upsert({
-          where: { key: 'archive' },
-          create: { key: 'archive', value: next },
-          update: { value: next },
-        });
-        const archives = await tx.archive.findMany({ select: { id: true, revision: true } });
-        for (const archive of archives) {
-          const row = await tx.revision.findUnique({
-            where: { archiveId_revision: { archiveId: archive.id, revision: archive.revision } },
-            select: { snapshot: true },
-          });
-          if (!row) continue;
-          await tx.archive.update({
-            where: { id: archive.id },
-            data: {
-              summary: summarize(
-                archiveSnapshotSchema.parse(row.snapshot),
-                next,
-              ) as Prisma.InputJsonValue,
-            },
-          });
+  /**
+   * Releases outbox rows no configured destination will deliver (a removed route), so the
+   * revisions they hold can be compacted. `destinations` are the configured identities.
+   */
+  async releaseOutbox(destinations: string[]) {
+    // An empty list is more likely a destinations file that failed to read than no routes at all.
+    if (!destinations.length) return 0;
+    return (await this.db.outbox.deleteMany({ where: { destination: { notIn: destinations } } }))
+      .count;
+  }
+  private async sweepState() {
+    const row = await this.db.setting.findUnique({ where: { key: TOOL_ACTIVITY_SWEEP } });
+    return row ? toolActivitySweepSchema.parse(row.value) : undefined;
+  }
+  /**
+   * While `captureToolCallsAndResults` is off, removes the tool activity this Archive took in while
+   * it was on: each affected archive gets a new revision without it and the old one is compacted. Resumes where it stopped. An archive that fails is
+   * logged, recorded and passed over, and retried on the next run; it never holds up the rest.
+   * Returns the archives changed.
+   */
+  async removePastToolActivity() {
+    let changed = 0;
+    let retried = false;
+    while (!this.stopping) {
+      const state = await this.sweepState();
+      if (!state) return changed;
+      const settings = await this.settings();
+      if (settings.captureToolCallsAndResults) {
+        await this.db.setting.deleteMany({ where: { key: TOOL_ACTIVITY_SWEEP } });
+        return changed;
+      }
+      const failed = new Set<string>();
+      const attempt = async (id: string) => {
+        try {
+          if (await this.stripToolActivity(id, settings)) changed++;
+        } catch (error) {
+          failed.add(id);
+          console.error(
+            JSON.stringify({
+              maintenance: 'tool activity removal failed',
+              archiveId: id,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          );
         }
+      };
+      if (!retried) {
+        retried = true;
+        for (const id of state.failed) await attempt(id);
+      } else for (const id of state.failed) failed.add(id);
+      let { afterSeq, finished } = state;
+      if (!finished) {
+        const page = await this.db.$queryRaw<{ id: string; seq: bigint; tools: boolean }[]>`
+          SELECT a."id", a."seq", jsonb_path_exists(r."snapshot",
+            '$.entries[*] ? (@.kind == "tool-call" || @.kind == "tool-result")') AS "tools"
+          FROM "archives" a
+          JOIN "revisions" r ON r."archiveId" = a."id" AND r."revision" = a."revision"
+          WHERE a."seq" > ${BigInt(afterSeq)}
+          ORDER BY a."seq" LIMIT ${TOOL_ACTIVITY_BATCH}`;
+        finished = page.length < TOOL_ACTIVITY_BATCH;
+        for (const archive of page) {
+          if (this.stopping) {
+            finished = false;
+            break;
+          }
+          if (archive.tools) await attempt(archive.id);
+          afterSeq = archive.seq.toString();
+        }
+      }
+      if (finished && !failed.size) {
+        await this.db.setting.deleteMany({ where: { key: TOOL_ACTIVITY_SWEEP } });
+        return changed;
+      }
+      await this.db.setting.updateMany({
+        where: { key: TOOL_ACTIVITY_SWEEP },
+        data: { value: { afterSeq, finished, failed: [...failed] } },
+      });
+      // Only failures are left: they wait for the next run.
+      if (finished) return changed;
+    }
+    return changed;
+  }
+  private stripToolActivity(id: string, settings: ArchiveSettings) {
+    return this.db.$transaction(
+      async (tx) => {
+        await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
+        const archive = await tx.archive.findUnique({ where: { id } });
+        if (!archive) return false;
+        const current = await tx.revision.findUnique({
+          where: { archiveId_revision: { archiveId: id, revision: archive.revision } },
+          select: { snapshot: true },
+        });
+        if (!current) return false;
+        const { snapshot, changed } = withoutToolActivity(
+          archiveSnapshotSchema.parse(current.snapshot),
+          settings.integrations,
+        );
+        if (!changed) return false;
+        const revision = archive.revision + 1;
+        const storedDigest = snapshotDigest(snapshot);
+        await tx.revision.create({
+          data: {
+            archiveId: id,
+            revision,
+            digest: storedDigest,
+            snapshot: snapshot as Prisma.InputJsonValue,
+          },
+        });
+        // What is left is a small share of the text (no tool output), so it is chunked afresh.
+        const chunks = chunkArchive(snapshot);
+        for (let offset = 0; offset < chunks.length; offset += 1000)
+          await tx.chunk.createMany({
+            data: chunks.slice(offset, offset + 1000).map(({ encoding: _, ...chunk }, i) => ({
+              archiveId: id,
+              revision,
+              position: offset + i,
+              ...chunk,
+            })),
+          });
+        await tx.archive.update({
+          where: { id },
+          data: {
+            revision,
+            storedDigest,
+            summary: summarize(snapshot, settings) as Prisma.InputJsonValue,
+          },
+        });
+        await dropRevision(tx, id, archive.revision);
+        return true;
       },
-      { timeout: 600_000, maxWait: 30_000 },
+      { timeout: 120_000, maxWait: 30_000 },
     );
+  }
+  private maintaining?: Promise<void>;
+  private stopping = false;
+  /**
+   * Retention, compaction, removal of past tool activity, then the search index restored if it was
+   * dropped. One run at a time (a call during a run joins it), and none while a reclaim runs.
+   */
+  maintain(now = Date.now()) {
+    if (this.reclaiming.state === 'running') return Promise.resolve();
+    this.maintaining ??= (async () => {
+      try {
+        await this.prune(now);
+        await this.compact();
+        await this.removePastToolActivity();
+        if (!this.stopping) await this.ensureSearchIndex();
+      } finally {
+        this.maintaining = undefined;
+      }
+    })();
+    return this.maintaining;
+  }
+  /** Stops maintenance after the statement in progress; resolves once it has stopped. */
+  async stop() {
+    this.stopping = true;
+    await this.maintaining;
+  }
+  /**
+   * Recreates the trigram index search uses when it is missing or invalid, once compaction and the
+   * tool-activity sweep have nothing left (or when `force`d, at the end of a reclaim), so it is built
+   * over current rows only. An operator short of disk may drop it before compaction; `reclaim`
+   * drops it too. Built concurrently: writes go on. A build already in progress (an invalid index
+   * being built) is left alone. Returns whether it built one.
+   */
+  async ensureSearchIndex(force = false) {
+    const [index] = await this.db.$queryRaw<{ valid: boolean; building: boolean }[]>`
+      SELECT i."indisvalid" AS "valid",
+        -- index_relid is 0 until a build reaches its later phases; the table is known throughout.
+        EXISTS (SELECT 1 FROM pg_stat_progress_create_index p WHERE p."relid" = i."indrelid")
+          AS "building"
+      FROM pg_index i JOIN pg_class c ON c."oid" = i."indexrelid"
+      WHERE c."relname" = ${SEARCH_INDEX} AND c."relnamespace" = current_schema()::regnamespace`;
+    if (index?.valid || index?.building) return false;
+    if (!force) {
+      const status = await this.maintenanceStatus();
+      if (status.supersededRevisions || status.toolActivitySweepPending) return false;
+    }
+    // An interrupted concurrent build leaves an invalid index behind.
+    if (index)
+      await this.db.$executeRawUnsafe(`DROP INDEX CONCURRENTLY IF EXISTS "${SEARCH_INDEX}"`);
+    await this.db.$executeRawUnsafe(
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS "${SEARCH_INDEX}" ON "chunks" USING GIN ("text" gin_trgm_ops)`,
+    );
+    return true;
+  }
+  /** What maintenance has left and what the tables hold, for deciding when to reclaim space. */
+  async maintenanceStatus() {
+    const [superseded] = await this.db.$queryRaw<{ compactable: bigint; held: bigint }[]>`
+      SELECT
+        count(*) FILTER (WHERE o."archiveId" IS NULL) AS "compactable",
+        count(*) FILTER (WHERE o."archiveId" IS NOT NULL) AS "held"
+      FROM "revisions" r JOIN "archives" a ON a."id" = r."archiveId"
+      LEFT JOIN LATERAL (SELECT o."archiveId" FROM "outbox" o
+        WHERE o."archiveId" = r."archiveId" AND o."revision" = r."revision" LIMIT 1) o ON true
+      WHERE r."revision" < a."revision"`;
+    const tables = await this.db.$queryRaw<
+      { table: string; totalBytes: bigint; liveRows: bigint; deadRows: bigint }[]
+    >`
+      SELECT c."relname"::text AS "table", pg_total_relation_size(c."oid") AS "totalBytes",
+        coalesce(s."n_live_tup", 0) AS "liveRows", coalesce(s."n_dead_tup", 0) AS "deadRows"
+      FROM pg_class c LEFT JOIN pg_stat_user_tables s ON s."relid" = c."oid"
+      WHERE c."relname" IN ('archives', 'revisions', 'chunks') AND c."relkind" = 'r'
+        AND c."relnamespace" = current_schema()::regnamespace
+      ORDER BY c."relname"`;
+    const [database] = await this.db.$queryRaw<{ bytes: bigint }[]>`
+      SELECT pg_database_size(current_database()) AS "bytes"`;
+    const sweep = await this.sweepState();
+    return {
+      databaseBytes: Number(database!.bytes),
+      /** Earlier revisions compaction will delete. */
+      supersededRevisions: Number(superseded!.compactable),
+      /** Earlier revisions kept until a destination acknowledges them. */
+      revisionsAwaitingDelivery: Number(superseded!.held),
+      /** Archives the tool-activity sweep has yet to reach. */
+      toolActivitySweepPending: Boolean(sweep && !sweep.finished),
+      /** Archives whose tool activity could not be removed; retried on each run. */
+      toolActivitySweepFailures: sweep?.failed ?? [],
+      reclaim: this.reclaiming,
+      tables: tables.map((t) => ({
+        table: t.table,
+        totalBytes: Number(t.totalBytes),
+        liveRows: Number(t.liveRows),
+        deadRows: Number(t.deadRows),
+      })),
+    };
+  }
+  /**
+   * Returns the space compaction freed to the operating system. The search index is dropped first,
+   * so VACUUM FULL copies only live rows without rebuilding a large GIN index under its exclusive
+   * lock; the index is always rebuilt at the end, concurrently, over current rows. Needs free disk
+   * for the copied live rows (`maintenanceStatus`). Refused while maintenance runs or has work left.
+   */
+  async reclaim() {
+    if (this.maintaining || this.reclaiming.state === 'running')
+      throw new MaintenancePending('Maintenance or a reclaim is running; try again when it ends');
+    // Claimed before the first await, so a maintenance run starting meanwhile sees it.
+    const idle = this.reclaiming;
+    const startedAt = Date.now();
+    this.reclaiming = { state: 'running', startedAt };
+    const before = await this.maintenanceStatus().catch((error) => {
+      this.reclaiming = idle;
+      throw error;
+    });
+    if (before.supersededRevisions || before.toolActivitySweepPending) {
+      this.reclaiming = idle;
+      throw new MaintenancePending(
+        'Compaction or tool-activity removal is still running; reclaim once maintenance finishes',
+      );
+    }
+    const finish = (outcome: { afterBytes?: number; error?: string }) => {
+      this.reclaiming = {
+        state: 'idle',
+        last: { startedAt, finishedAt: Date.now(), beforeBytes: before.databaseBytes, ...outcome },
+      };
+    };
+    void this.rewrite()
+      .then(async () => finish({ afterBytes: (await this.maintenanceStatus()).databaseBytes }))
+      .catch((error) => finish({ error: error instanceof Error ? error.message : String(error) }));
+    return { started: true, beforeBytes: before.databaseBytes };
+  }
+  /** Reclaim's state in this process: running, or idle with the last run's outcome. */
+  reclaiming: {
+    state: 'running' | 'idle';
+    startedAt?: number;
+    last?: {
+      startedAt: number;
+      finishedAt: number;
+      beforeBytes: number;
+      afterBytes?: number;
+      error?: string;
+    };
+  } = { state: 'idle' };
+  private async rewrite() {
+    try {
+      await this.db.$executeRawUnsafe(`DROP INDEX CONCURRENTLY IF EXISTS "${SEARCH_INDEX}"`);
+      for (const table of ['revisions', 'chunks'])
+        await this.db.$executeRawUnsafe(`VACUUM (FULL, ANALYZE) "${table}"`);
+    } finally {
+      await this.ensureSearchIndex(true);
+    }
+  }
+  async settings(db: Prisma.TransactionClient | PrismaClient = this.db): Promise<ArchiveSettings> {
+    const row = await db.setting.findUnique({ where: { key: 'archive' } });
+    // A setting added after the row was saved takes its default.
+    return row
+      ? archiveSettingsSchema.parse({ ...defaultSettings, ...(row.value as object) })
+      : defaultSettings;
+  }
+  /**
+   * Saves settings. Listings are recomputed when the integrations change, since references follow
+   * them. Turning `captureToolCallsAndResults` off queues removal of the tool activity already held.
+   */
+  async updateSettings(change: Partial<ArchiveSettings>) {
+    const { previous, next } = await this.db.$transaction(async (tx) => {
+      // Waits for captures in flight (they hold it shared), so none lands after the sweep passed it.
+      await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(${SETTINGS_LOCK})`;
+      const previous = await this.settings(tx);
+      const next = archiveSettingsSchema.parse({ ...previous, ...change });
+      await tx.setting.upsert({
+        where: { key: 'archive' },
+        create: { key: 'archive', value: next },
+        update: { value: next },
+      });
+      if (previous.captureToolCallsAndResults && !next.captureToolCallsAndResults)
+        await tx.setting.upsert({
+          where: { key: TOOL_ACTIVITY_SWEEP },
+          create: { key: TOOL_ACTIVITY_SWEEP, value: { afterSeq: '0' } },
+          update: { value: { afterSeq: '0' } },
+        });
+      if (next.captureToolCallsAndResults)
+        await tx.setting.deleteMany({ where: { key: TOOL_ACTIVITY_SWEEP } });
+      return { previous, next };
+    });
+    if (JSON.stringify(previous.integrations) === JSON.stringify(next.integrations)) return next;
+    // After the lock is released, so captures go on. Captures from here on summarize with the new
+    // integrations themselves; a row a capture moved on meanwhile is left to that capture.
+    const archives = await this.db.archive.findMany({ select: { id: true, revision: true } });
+    for (const archive of archives) {
+      const row = await this.db.revision.findUnique({
+        where: { archiveId_revision: { archiveId: archive.id, revision: archive.revision } },
+        select: { snapshot: true },
+      });
+      if (!row) continue;
+      await this.db.archive.updateMany({
+        where: { id: archive.id, revision: archive.revision },
+        data: {
+          summary: summarize(
+            archiveSnapshotSchema.parse(row.snapshot),
+            next,
+          ) as Prisma.InputJsonValue,
+        },
+      });
+    }
     return next;
   }
   /** Offered tags with how many archives carry each; an actor sees archive-wide and their own. */
@@ -603,7 +988,12 @@ export class ArchiveStore {
       update: {},
     });
   }
+  /** Forgets a pending revision compaction removed before anything was sent, so the current one is queued. */
+  async dropPending(id: string, destination: string, revision: number) {
+    await this.db.outbox.deleteMany({ where: { archiveId: id, destination, revision } });
+  }
   async delivered(id: string, destination: string, digest: string) {
+    const pending = await this.pending(id, destination);
     await this.db.$transaction([
       this.db.receipt.upsert({
         where: { archiveId_destination: { archiveId: id, destination } },
@@ -612,14 +1002,19 @@ export class ArchiveStore {
       }),
       this.db.outbox.deleteMany({ where: { archiveId: id, destination } }),
     ]);
+    // The revision it held back is compacted unless another destination still waits on it.
+    if (pending) await dropRevision(this.db, id, pending.revision);
   }
   /** A project's archives at one destination: delivered at their latest digest, or pending. */
   async delivery(projectId: string, destination: string) {
     const archives = await this.db.archive.findMany({
       where: { projectId, supersededBy: null },
-      select: { digest: true, receipts: { where: { destination }, select: { digest: true } } },
+      select: {
+        storedDigest: true,
+        receipts: { where: { destination }, select: { digest: true } },
+      },
     });
-    const delivered = archives.filter((a) => a.receipts[0]?.digest === a.digest).length;
+    const delivered = archives.filter((a) => a.receipts[0]?.digest === a.storedDigest).length;
     return { delivered, pending: archives.length - delivered };
   }
   /**
@@ -762,7 +1157,26 @@ export class ArchiveStore {
   }
 }
 
+/**
+ * Deletes one earlier revision (its chunks cascade) unless it is current or an outbox row names it.
+ * Returns how many went (0 or 1).
+ */
+const dropRevision = (
+  db: Prisma.TransactionClient | PrismaClient,
+  archiveId: string,
+  revision: number,
+) => db.$executeRaw`
+  DELETE FROM "revisions" r
+  WHERE r."archiveId" = ${archiveId} AND r."revision" = ${revision}
+    AND r."revision" < (SELECT a."revision" FROM "archives" a WHERE a."id" = r."archiveId")
+    AND NOT EXISTS (SELECT 1 FROM "outbox" o
+      WHERE o."archiveId" = r."archiveId" AND o."revision" = r."revision")`;
+
 /** A capture that lost a race or arrived out of order; the server answers 409. */
 export class ArchiveConflict extends Error {}
 /** A claim another writer holds, or a fulfil by a writer that does not hold the claim. */
 export class ClaimHeld extends Error {}
+/** A revision compaction removed: only the current one, and one awaiting delivery, are kept. 410. */
+export class RevisionCompacted extends Error {}
+/** Reclaiming space before compaction and tool-activity removal have finished. 409. */
+export class MaintenancePending extends Error {}

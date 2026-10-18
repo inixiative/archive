@@ -4,7 +4,7 @@ MIT-licensed, local-first session storage for Claude Code, Codex and Foundry. Ru
 
 ## What runs today
 
-- Public transcript extraction, exact-project collection, immutable revisions in Postgres (pgvector and pg_trgm enabled), lexical search and lossless text chunks.
+- Public transcript extraction, exact-project collection, immutable revisions in Postgres (only the current one is kept) (pgvector and pg_trgm enabled), lexical search and lossless text chunks.
 - An authenticated HTTP server, published image, Compose deployment with its own Postgres, Railway configuration and a Render blueprint.
 - An HTTP client the CLI, collectors and Foundry write through; only the server holds the database.
 - Multiple explicit destinations, durable publication receipts/outbox, conflict detection and retry after interruption.
@@ -151,7 +151,25 @@ A driver that records its own sessions (Foundry, for the native sessions it runs
 - **Subagents.** A Claude subagent transcript follows its session's claim. A Codex sub-agent thread is its own session, so the driver claims each one.
 - **Checking.** `claims/state` reports `none`, `live` (with `until`), `fulfilled` or `lapsed`. The collector asks before it parses a transcript, and asks again when a lease it saw runs out.
 
-The **retention** setting (`retentionDays`, off by default) deletes archives whose latest capture is older than that, at server start and hourly. It deletes only from the archive it is set on; deletions never sync.
+The **retention** setting (`retentionDays`, off by default) deletes archives whose latest capture is older than that. It deletes only from the archive it is set on; deletions never sync.
+
+**Compaction.** Each capture stores the session as a new immutable revision and deletes the revision it replaces, so an Archive holds only each session's current revision (a growing session's earlier revisions are prefixes of it). A revision an outbox row still names stays until that destination acknowledges it. Revision numbers keep counting. `read` with an earlier `revision` answers 410 (`Revision N was compacted`); one that never existed answers 404.
+
+**Tool activity.** The `captureToolCallsAndResults` setting (on by default) says whether this Archive keeps tool calls and tool results. Off, the server drops `tool-call` and `tool-result` entries from every snapshot it ingests, whoever writes it (collectors, Foundry, a syncing Archive), and marks the snapshot's coverage `partial` with an omission saying so. What the person said or decided through a tool is not tool activity, and the importers record it as theirs (one recogniser per shape, `src/tool-activity.ts`):
+- `user`: Claude Code's AskUserQuestion answers (`The user answered: "question"="answer"`, or the older `Your questions have been answered: …`), a rejected tool use or plan with typed feedback (`… the user said: …`), and Codex `request_user_input` answers, written with their questions;
+- `event`: asking to clarify instead of answering; a rejection without feedback (`{"rejected": tool, "command"?}`); an ExitPlanMode approval, with the approved plan.
+
+The strip keeps them too, re-deriving them from tool results captured before the importers did. Links found only in dropped tool output (a PR `gh pr create` opened) are recorded in `references` (at most 100; a coverage omission counts any cut). Two kinds of call stay as small `event`s with the call's id and `callId`: a subagent spawn (`Agent`, `Task`, `spawn_agent`), so a child's `lineage.toolUseId` still resolves, and a Codex `request_user_input_async` question whose answer message (`<send_user_message_question_reply>`, kept as an event) does not carry it. Foundry wraps native tool output in JSON and asks no questions through tools today, so these shapes are not looked for inside Foundry captures.
+
+The ingest `digest` stays the digest of the snapshot as its writer sent it, so a collector's unchanged session stays unchanged and a change only to tool activity stores nothing new. `head` also returns `storedDigest`, the digest of what this Archive holds and publishes onward; `read` and `search` return the digest of the revision they return, which is that stored digest. Turning the setting off queues removal of the tool activity already held: each affected session gets one new revision without it, and the old one is compacted. That new revision is published to the session's destinations like any change, so a destination converges to the stripped copy even where it keeps tool activity itself: we keep no tool activity anywhere (Aron, 2026-10-18), so this is intended. Turning the setting back on keeps new tool activity from then on; it does not restore what was removed, and an unchanged session stays as stored.
+
+**Maintenance** (retention, compaction, removal of past tool activity, then rebuilding the search index if it is missing) runs in the background at server start and hourly; an upgrade from an Archive that kept every revision compacts it there, one revision per statement. Shutting the server down stops it after the statement in progress; the next start resumes. A session whose tool activity cannot be removed is logged, listed in `maintenance status` and retried on the next run, without holding up the rest. Outbox rows no configured route will deliver (a removed destination, a superseded capture) are released, so the revisions they held are compacted. Maintenance and reclaim never run at once, and an index build already in progress is left to finish. Deleted rows free space inside Postgres; `maintenance reclaim` returns it to the operating system once compaction is done: it drops the trigram search index, runs `VACUUM (FULL, ANALYZE)` on `revisions` and `chunks` (each table locked while it is rewritten; needs free disk for the live rows) and rebuilds the index concurrently over current rows. `maintenance status` reports what is left, the table sizes and the last reclaim. On a disk too full to compact, drop the index first (`DROP INDEX CONCURRENTLY chunks_text_idx`): search still works without it, and maintenance rebuilds it when compaction finishes.
+
+```sh
+bun run archive settings --capture-tool-calls-and-results false
+bun run archive maintenance status
+bun run archive maintenance reclaim
+```
 
 ### HTTP API
 
@@ -160,12 +178,15 @@ All data endpoints are `POST /api/v1/archive/<action>` with a JSON body and `Aut
 | Action | Body | Returns |
 |---|---|---|
 | `ingest` | `snapshot`, `previousDigest` | id, digest, revision |
-| `read` | `archiveId`, `revision?` | snapshot and chunks |
+| `read` | `archiveId`, `revision?` | snapshot and chunks; 410 for a compacted revision |
 | `list` | filters, `limit?`, `beforeId?` | metadata, `nextCursor` |
 | `search` | filters, `query`, `budget?`, `limit?`, `beforeId?` | matching chunks within the token budget |
 | `tag` | `archiveId`, `add?`, `remove?` | tags |
 | `delete` | `archiveId` | deleted |
-| `settings/read`, `settings/update` | `integrations?`, `retentionDays?` | settings |
+| `head` | `archiveId` | `digest` (as its writer sent it), `storedDigest`, `revision`, `projectId`, `supersededBy` |
+| `settings/read`, `settings/update` | `integrations?`, `retentionDays?`, `captureToolCallsAndResults?` | settings |
+| `maintenance/status` | none | `supersededRevisions` (left to compact), `revisionsAwaitingDelivery`, `toolActivitySweepPending`, `toolActivitySweepFailures`, table sizes, `reclaim` state |
+| `maintenance/reclaim` | none | `started`; 409 while maintenance runs or has work left, or a reclaim runs |
 | `tags/list`, `tags/define`, `tags/remove` | `tag`, `actorId?`, `description?` | offered tags with usage counts |
 | `claims/hold` | `claimant`, `ttlMs`, `sessions: [{source, sessionId}]` | `expiresAt` (holding again renews and reopens); 409 while another claimant's lease is live |
 | `claims/fulfil` | `claimant`, `source`, `sessionId`, `archiveId` | `fulfilledBy`, `superseded` (raw captures marked); 404 when unclaimed or the archive is missing, 409 for another claimant |

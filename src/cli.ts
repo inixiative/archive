@@ -89,6 +89,8 @@ export async function runCli(args = Bun.argv.slice(2)) {
       refresh: { type: 'boolean', default: false },
       limit: { type: 'string' },
       port: { type: 'string' },
+      'capture-tool-calls-and-results': { type: 'string' },
+      'retention-days': { type: 'string' },
       name: { type: 'string' },
       hostname: { type: 'string', default: '127.0.0.1' },
       watch: { type: 'boolean', default: false },
@@ -106,7 +108,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
   const command = positionals[0];
   if (v.help || !command) {
     process.stdout.write(
-      'Archive: init | up | down | serve | connect (setup) | preview | import | collect | repair | list | export | tag | tags | suggest | routes | sync | search | agents\n' +
+      'Archive: init | up | down | serve | connect (setup) | preview | import | collect | repair | list | export | tag | tags | suggest | routes | sync | search | settings | maintenance | agents\n' +
         'up | down   (the local Archive: bundled compose.yaml with Postgres, data in --home)\n' +
         'serve [--port 4700 --hostname 127.0.0.1] [--sync]   (DATABASE_URL; token from ARCHIVE_SERVER_TOKEN or --token-file)\n' +
         'import --file PATH --source codex|claude-code|chatgpt --project-id ID [--tag TAG]\n' +
@@ -121,6 +123,8 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'connect --url HTTPS_URL --project-id ID (--token-env ENV | --token-file PATH)   (a remote Archive, for serve --sync)\n' +
         'connect --kind kingdom --url KINGDOM_API_URL --credential-file PATH --integration-id UUID --resource-id UUID --project-id ID   (a hosted Archive through Kingdom)\n' +
         'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
+        "settings [--capture-tool-calls-and-results true|false] [--retention-days N|off]   (read, or change, this Archive's settings)\n" +
+        'maintenance status | maintenance reclaim   (compaction left to do and table sizes; return freed space to the OS once compaction is done)\n' +
         'agents add-collector --name N --source codex|claude-code (--project-id ID --project-root DIR [--project-root ...] [--worktrees] [--subdirectories] | --catch-all) [--directory HISTORY] [--atlas]\n' +
         'agents remove-collector --name N | exclude [--exclude PATH ...] | server --url URL | install | uninstall | status\n' +
         `Data commands talk to the Archive server at --url (default ${DEFAULT_URL}) with the token in --token-file (default <home>/server.token) or ARCHIVE_TOKEN.\n`,
@@ -385,7 +389,28 @@ export async function runCli(args = Bun.argv.slice(2)) {
     ...(v.exempt === undefined ? {} : { exempt: exemptMode(v.exempt) }),
     ...(v.suggested ? { suggestedTag: v.suggested } : {}),
   };
-  if (command === 'routes') output(await archive.routes());
+  if (command === 'settings') {
+    const capture = v['capture-tool-calls-and-results'];
+    const retention = v['retention-days'];
+    if (capture !== undefined && capture !== 'true' && capture !== 'false')
+      throw new Error('--capture-tool-calls-and-results is true or false');
+    const change = {
+      ...(capture === undefined ? {} : { captureToolCallsAndResults: capture === 'true' }),
+      ...(retention === undefined
+        ? {}
+        : {
+            retentionDays: retention === 'off' ? null : whole(retention, 'retention-days', 36_500),
+          }),
+    };
+    output(
+      Object.keys(change).length ? await archive.updateSettings(change) : await archive.settings(),
+    );
+  } else if (command === 'maintenance') {
+    const action = positionals[1] ?? 'status';
+    if (action === 'status') output(await archive.maintenanceStatus());
+    else if (action === 'reclaim') output(await archive.reclaim());
+    else throw new Error('Unknown maintenance command; use --help');
+  } else if (command === 'routes') output(await archive.routes());
   else if (command === 'tags') {
     const action = positionals[1] ?? 'list';
     if (action === 'list') output(await archive.tagDefinitions());

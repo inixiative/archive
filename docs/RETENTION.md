@@ -1,6 +1,6 @@
 # Retention: Archive keeps the transcripts
 
-> **PROPOSAL. Needs Aron's yes before anything is built.** It changes what the `retentionDays` setting means and adds a usefulness score, so it falls under "talk the plan through before changing what something means." Nothing here is implemented.
+> **PROPOSAL. Needs Aron's yes before anything is built.** It changes what the `retentionDays` setting means and adds a usefulness score, so it falls under "talk the plan through before changing what something means." **Built (Aron, 2026-10-18):** §6.1 compaction, and a `captureToolCallsAndResults` setting that keeps tool calls and results out of the Archive (README, "Tags, references, actors and retention"). The rest is not implemented.
 
 **Basis:** Archive `origin/main` 0.13.0 (`44d97a0`), Foundry `origin/main` (`f040582`; foundry-core `src/feedback/correction.ts` from `e10b2f0`), Oracle `origin/main`, and the live local Archive on Aron's machine, read 2026-10-12. Path prefixes: `ar/` = `archive/src`, `pf/` = `foundry/packages/foundry/src`, `pc/` = `foundry/packages/core/src`, `or/` = `oracle/src`.
 
@@ -173,9 +173,9 @@ A fresh, never-read session has `n = 0`, so `B = −0.5 · ln(ageDays)`: about 0
 
 ## 6. Pruning mechanism
 
-### 6.1 Compaction first (no knowledge lost)
+### 6.1 Compaction first (no knowledge lost) — built
 
-Delete every revision and its chunks except the current one, unless an `outbox` row still names it. A growing session's earlier revisions are prefixes of the current one, so this loses nothing. It runs after each capture and in the hourly job. On this machine it frees about 90% of the database (§2.3). This step needs no score and could ship first.
+Delete every revision and its chunks except the current one, unless an `outbox` row still names it. A growing session's earlier revisions are prefixes of the current one, so this loses nothing. As built: each capture deletes the revision it replaced; a delivery deletes the revision the outbox held back; the background maintenance at server start and hourly deletes the rest, one revision per statement, so an upgraded Archive compacts what earlier versions kept without a long transaction. `read` of a compacted revision answers 410. Measured 2026-10-18 on this machine: 15,629 of 16,780 revisions superseded; `chunks` 28 GB heap + 23 GB indexes of a 62 GB database. Space returns to the operating system only through `archive maintenance reclaim` (drop the trigram index, `VACUUM FULL`, rebuild the index over current rows). With `captureToolCallsAndResults` off (Aron, 2026-10-18: no tool activity anywhere we own, past captures included), every destination converges to the stripped copies; what the person typed through a tool, references linked from tool output and subagent spawn anchors survive the strip (README).
 
 ### 6.2 Summarize before prune
 
@@ -252,7 +252,7 @@ No parallel store: summaries are revisions, tombstones are Archive rows, setting
 
 1. **Coverage now (no code):** add the inixiative, zealot and per-repo collectors, drop the `kingdom-workspace` roots, `archive agents install`. This captures the 23 + 125 orchestrator sessions and 43 Codex sessions before Claude's cleanup reaches them. Run collectors from the installed package, not the shared checkout.
 2. **Stop test pollution:** Foundry tests and probes must not write to the machine's Archive; delete the `P` captures.
-3. **Revision compaction** (§6.1), with a migration that compacts existing data.
+3. **Revision compaction** (§6.1), compacting existing data in the background maintenance. Built 2026-10-18.
 4. **Catch-all collector, exclusions and `archive coverage`** (§3.1–3.2).
 5. **Lineage and capture-time corrections** (§3.3).
 6. **Citations, access counts, score, `retention/plan` dry run.** `mode` stays `off`; the plan is visible but nothing transitions.

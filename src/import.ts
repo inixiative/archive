@@ -4,6 +4,7 @@ import {
   type ArchiveSnapshot,
   archiveSnapshotSchema,
 } from './index';
+import { personToolResults } from './tool-activity';
 
 export interface ImportOptions {
   source: 'codex' | 'claude-code';
@@ -385,6 +386,7 @@ export function importTranscriptLines(
         ...omissions,
       ],
     },
-    entries,
+    // What the person typed into a tool (an answer, a rejection's feedback) is theirs, not tool activity.
+    entries: personToolResults(entries),
   });
 }
