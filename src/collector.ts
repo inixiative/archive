@@ -10,7 +10,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { cwdRunTag, temporaryRoots } from './exemption';
+import { cwdRunTags, exemptRun, temporaryRoots } from './exemption';
 import { claudeSessionId } from './import';
 import { importTranscriptFile, transcriptAgentId } from './import-file';
 import {
@@ -55,18 +55,37 @@ export type FolderFilters = { include?: string[]; exclude?: string[] };
  */
 export const defaultExclusions = () => ['**/decision-receipts'];
 
+const escapeGlob = (path: string) => path.replace(/[[\]{}*?!\\]/g, '\\$&');
+
 /**
- * A folder glob, normalized: `~/` expands to the home directory, a leading `./` and trailing
- * slashes go, and a relative glob matches at any depth (it gains a leading `**` segment). An empty glob, or
- * one naming the filesystem root, throws rather than filtering every folder.
+ * A folder glob, normalized: `~/` expands to the home directory (taken literally), a leading `./`,
+ * a trailing `/**` and trailing slashes go (a folder glob already covers everything below, so
+ * Atlas's `dir/**` names `dir` too), and a relative glob matches at any depth (it gains a leading
+ * `**` segment). An empty glob, one naming the filesystem root, or one with a `..` segment throws.
  */
 export function folderGlob(entry: string): string {
   let glob = entry.trim();
-  if (glob === '~' || glob.startsWith('~/')) glob = homedir() + glob.slice(1);
-  glob = glob.replace(/^(\.\/)+/, '').replace(/\/+$/, '');
+  if (glob === '~' || glob.startsWith('~/')) glob = escapeGlob(homedir()) + glob.slice(1);
+  glob = glob.replace(/^(\.\/)+/, '');
+  for (let before = ''; before !== glob; ) {
+    before = glob;
+    glob = glob.replace(/\/+$/, '').replace(/\/\*\*$/, '');
+  }
   if (!glob || glob === '.')
     throw new Error(`Folder glob "${entry}" is empty or names every folder`);
+  if (glob.split('/').includes('..')) throw new Error(`Folder glob "${entry}" has a .. segment`);
   return glob.startsWith('/') || glob.startsWith('**') ? glob : `**/${glob}`;
+}
+
+/**
+ * An exclude glob: a folder glob that does not cover the home directory or the filesystem root,
+ * since excluding everything would stop capture silently until the harness's cleanup loses it.
+ */
+export function excludeGlob(entry: string): string {
+  const glob = folderGlob(entry);
+  if (folderMatches(homedir(), [glob]) || folderMatches('/', [glob]))
+    throw new Error(`Exclude glob "${entry}" covers every session`);
+  return glob;
 }
 
 const compiled = new Map<string, InstanceType<typeof Bun.Glob>>();
@@ -489,10 +508,12 @@ export async function collectSessions(
       if (!repositories.has(cwd)) repositories.set(cwd, git(cwd, 'remote', 'get-url', 'origin'));
       if (config.atlas && !graphs.has(cwd)) graphs.set(cwd, atlasGraph(cwd));
       const graph = graphs.get(cwd);
-      const run = cwdRunTag(cwd);
+      // A marker counts only below every collector root; an inferred tag is marked as a guess.
+      const ceilings = projects.flatMap((project) => [...roots(project)]);
+      const run = exemptRun(config.tags ?? []) ? [] : cwdRunTags(cwd, ceilings);
       snapshot.tags = [
         ...new Set([
-          ...(run ? [run] : []),
+          ...run,
           ...(config.tags ?? []),
           ...projectTags(
             snapshot,

@@ -20,6 +20,7 @@ import { z } from 'zod';
 import {
   type CollectionSource,
   defaultExclusions,
+  excludeGlob,
   type FolderFilters,
   folderGlob,
   UNROUTED,
@@ -32,22 +33,23 @@ export const defaultHistoryDirectory = (source: 'claude-code' | 'codex') =>
   join(homedir(), source === 'codex' ? '.codex/sessions' : '.claude/projects');
 
 const absolute = z.string().max(4096).refine(isAbsolute, 'Path must be absolute');
-/** Folder globs, normalized (`folderGlob`); an empty entry is refused, never read as "all". */
-const folderGlobs = z
-  .array(
-    z
-      .string()
-      .max(4096)
-      .transform((entry, ctx) => {
-        try {
-          return folderGlob(entry);
-        } catch (error) {
-          ctx.addIssue({ code: 'custom', message: (error as Error).message });
-          return z.NEVER;
-        }
-      }),
-  )
-  .max(100);
+/** Folder globs, normalized; an empty entry is refused, never read as "all". */
+const folderGlobs = (normalize: (entry: string) => string) =>
+  z
+    .array(
+      z
+        .string()
+        .max(4096)
+        .transform((entry, ctx) => {
+          try {
+            return normalize(entry);
+          } catch (error) {
+            ctx.addIssue({ code: 'custom', message: (error as Error).message });
+            return z.NEVER;
+          }
+        }),
+    )
+    .max(100);
 export const collectorAgentSchema = z
   .strictObject({
     name: z
@@ -81,9 +83,9 @@ export const agentsConfigSchema = z
     /** The Archive server collectors write to; the token is the home's `server.token`. */
     server: z.strictObject({ url: z.url() }).optional(),
     /** Only sessions in folders these globs name are collected, by any collector. */
-    include: folderGlobs.optional(),
+    include: folderGlobs(folderGlob).optional(),
     /** Never collected, by any collector; added to the default exclusions (decision receipts). */
-    exclude: folderGlobs.optional(),
+    exclude: folderGlobs(excludeGlob).optional(),
     collectors: z.array(collectorAgentSchema).max(100),
   })
   .refine(

@@ -22,6 +22,7 @@ import {
   type CollectorCache,
   collectSessions,
   defaultExclusions,
+  excludeGlob,
   type FolderFilters,
   folderGlob,
   UNROUTED,
@@ -545,7 +546,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         peers: [collector],
         filters: {
           ...(v.include?.length ? { include: v.include.map(folderGlob) } : {}),
-          exclude: [...defaultExclusions(), ...(v.exclude ?? []).map(folderGlob)],
+          exclude: [...defaultExclusions(), ...(v.exclude ?? []).map(excludeGlob)],
         } as FolderFilters,
         projects: [collector],
         server: undefined as { url: string } | undefined,

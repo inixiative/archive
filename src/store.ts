@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { type Prisma, PrismaClient } from '@prisma/client';
 import { z } from 'zod';
-import { exemptRun, identityRunTags, RUN_TAGS, type RunKind } from './exemption';
+import { droppableRun, exemptRun, identityRunTags, RUN_TAGS } from './exemption';
 import {
   type ArchiveChunk,
   type ArchiveSnapshot,
@@ -117,31 +117,25 @@ const baseTags = (summary: Summary) => [
       source: summary.source,
       sessionId: summary.sessionId,
       projectId: summary.projectId,
-      tags: summary.capturedTags,
       lineage: summary.lineage,
     }),
   ]),
 ];
 
-/**
- * The run kind a snapshot is stamped (or, interim, inferred) as, unless a person lifted that
- * exemption on the stored session by removing its run tag.
- */
-async function runToDrop(
-  tx: Prisma.TransactionClient,
-  id: string,
-  snapshot: ArchiveSnapshot,
-): Promise<RunKind | undefined> {
-  const run = exemptRun([
-    ...snapshot.tags,
-    ...identityRunTags({ ...snapshot, projectId: snapshot.projectId ?? null }),
-  ]);
-  if (!run) return undefined;
-  const lifted = await tx.tagEdit.findFirst({
-    where: { archiveId: id, added: false, tag: { in: Object.values(RUN_TAGS) } },
-  });
-  return lifted ? undefined : run;
-}
+const RUN_TAG_VALUES: string[] = Object.values(RUN_TAGS);
+/** Run tags a person removed from a session: they lift its exemption and are never stored. */
+const liftedRunTags = async (db: Prisma.TransactionClient | PrismaClient, id: string) =>
+  (
+    await db.tagEdit.findMany({
+      where: { archiveId: id, added: false, tag: { in: RUN_TAG_VALUES } },
+      select: { tag: true },
+    })
+  ).map((edit) => edit.tag);
+/** The snapshot without the run tags a person lifted, so a copy synced onward is not a run. */
+const withoutLifted = (snapshot: ArchiveSnapshot, lifted: string[]) =>
+  lifted.some((tag) => snapshot.tags.includes(tag))
+    ? { ...snapshot, tags: snapshot.tags.filter((tag) => !lifted.includes(tag)) }
+    : snapshot;
 
 type ArchiveRow = {
   id: string;
@@ -222,20 +216,29 @@ export class ArchiveStore {
         // A settings change waits for captures in flight, so the sweep it queues sees them all.
         await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock_shared(${SETTINGS_LOCK})`;
         const settings = await this.settings(tx);
-        const run = settings.captureRunSessions ? undefined : await runToDrop(tx, id, incoming);
-        if (run) {
+        const lifted = await liftedRunTags(tx, id);
+        const unlifted = withoutLifted(incoming, lifted);
+        // Only explicit stamps drop; a run tag a person removed keeps the session.
+        const run = settings.captureRunSessions ? undefined : droppableRun(unlifted);
+        if (run && !lifted.includes(RUN_TAGS[run])) {
           // The digest is the writer's, so a syncing Archive records the delivery and moves on.
           await tx.archive.deleteMany({ where: { id } });
           return { id, digest, revision: 0, changed: false, dropped: RUN_TAGS[run] };
         }
         const old = await tx.archive.findUnique({ where: { id } });
         if (old?.digest === digest) return { id, digest, revision: old.revision, changed: false };
-        if (expected && (old?.digest ?? null) !== expected.previousDigest)
+        // A session deleted here stays deleted while its writer sends it unchanged.
+        const tombstone = old ? null : await tx.archiveTombstone.findUnique({ where: { id } });
+        if (tombstone?.digest === digest) return { id, digest, revision: 0, changed: false };
+        if (expected && (old?.digest ?? tombstone?.digest ?? null) !== expected.previousDigest)
           throw new ArchiveConflict('Revision conflict');
         if (old && old.capturedAt > incoming.capturedAt) throw new ArchiveConflict('Stale capture');
-        const { snapshot, changed } = settings.captureToolCallsAndResults
-          ? { snapshot: incoming, changed: 0 }
-          : withoutToolActivity(incoming, settings.integrations);
+        if (tombstone) await tx.archiveTombstone.delete({ where: { id } });
+        const stripped = settings.captureToolCallsAndResults
+          ? { snapshot: unlifted, changed: 0 }
+          : withoutToolActivity(unlifted, settings.integrations);
+        const { snapshot } = stripped;
+        const changed = stripped.changed || unlifted !== incoming;
         const storedDigest = changed ? snapshotDigest(snapshot) : digest;
         // The writer changed only what this Archive drops: what it holds stays as it is.
         if (old?.storedDigest === storedDigest) {
@@ -293,7 +296,10 @@ export class ArchiveStore {
       { timeout: 120_000, maxWait: 30_000 },
     );
   }
-  /** Current digest and revision without the content. */
+  /**
+   * Current digest and revision without the content. A session deleted here answers with its
+   * tombstone (`deleted`, revision 0), so a collector sees its unchanged source as unchanged.
+   */
   async head(id: string) {
     const row = await this.db.archive.findUnique({
       where: { id },
@@ -306,7 +312,19 @@ export class ArchiveStore {
         supersededBy: true,
       },
     });
-    return row ?? undefined;
+    if (row) return row;
+    const tombstone = await this.db.archiveTombstone.findUnique({ where: { id } });
+    return tombstone
+      ? {
+          id,
+          digest: tombstone.digest,
+          storedDigest: tombstone.digest,
+          revision: 0,
+          projectId: tombstone.projectId,
+          supersededBy: null,
+          deleted: true as const,
+        }
+      : undefined;
   }
   /**
    * The current revision, or an earlier one still waiting to be delivered. Other earlier revisions
@@ -437,6 +455,7 @@ export class ArchiveStore {
       .max(100)
       .parse(change.remove ?? []);
     return this.db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
       const archive = await tx.archive.findUnique({ where: { id } });
       if (!archive) throw new Error('Archive unavailable');
       const captured = new Set(baseTags(archive.summary as Summary));
@@ -450,6 +469,8 @@ export class ArchiveStore {
       for (const tag of add) await (captured.has(tag) ? clear(tag) : set(tag, true));
       // A removal is kept even for a tag the session lacks, so a later capture or suggestion of it stays removed.
       for (const tag of remove) await set(tag, false);
+      // A lifted run tag leaves the stored copy too, so what syncs onward is not a run.
+      if (remove.some((tag) => RUN_TAG_VALUES.includes(tag))) await this.storeLifted(tx, id);
       const edits = await tx.tagEdit.findMany({ where: { archiveId: id } });
       const removed = new Set(edits.filter((e) => !e.added).map((e) => e.tag));
       const tags = [
@@ -458,6 +479,47 @@ export class ArchiveStore {
       z.array(tagSchema).max(100, 'An archive holds at most 100 tags').parse(tags);
       return { id, tags };
     });
+  }
+  /**
+   * Stores the current revision again without the run tags a person lifted: one new revision with
+   * its chunks copied, the old one compacted, and the listing recomputed. Nothing when none is held.
+   */
+  private async storeLifted(tx: Prisma.TransactionClient, id: string) {
+    const archive = await tx.archive.findUnique({ where: { id } });
+    if (!archive) return;
+    const current = await tx.revision.findUnique({
+      where: { archiveId_revision: { archiveId: id, revision: archive.revision } },
+      select: { snapshot: true },
+    });
+    if (!current) return;
+    const stored = archiveSnapshotSchema.parse(current.snapshot);
+    const snapshot = withoutLifted(stored, await liftedRunTags(tx, id));
+    if (snapshot === stored) return;
+    const revision = archive.revision + 1;
+    const storedDigest = snapshotDigest(snapshot);
+    await tx.revision.create({
+      data: {
+        archiveId: id,
+        revision,
+        digest: storedDigest,
+        snapshot: snapshot as Prisma.InputJsonValue,
+      },
+    });
+    await tx.$executeRaw`
+      INSERT INTO "chunks" ("archiveId", "revision", "position", "id", "entryId", "sourceRef",
+        "kind", "start", "end", "text", "tokenCount", "embedding")
+      SELECT "archiveId", ${revision}, "position", "id", "entryId", "sourceRef", "kind", "start",
+        "end", "text", "tokenCount", "embedding"
+      FROM "chunks" WHERE "archiveId" = ${id} AND "revision" = ${archive.revision}`;
+    await tx.archive.update({
+      where: { id },
+      data: {
+        revision,
+        storedDigest,
+        summary: summarize(snapshot, await this.settings(tx)) as Prisma.InputJsonValue,
+      },
+    });
+    await dropRevision(tx, id, archive.revision);
   }
   /**
    * Claim native sessions for a writer that records them itself, for `ttlMs` from now; holding
@@ -585,8 +647,23 @@ export class ArchiveStore {
       orderBy: { sessionId: 'desc' },
     });
   }
+  /** Deletes a session and leaves its tombstone (`head`), so it is not imported again unchanged. */
   async delete(id: string) {
-    return (await this.db.archive.deleteMany({ where: { id } })).count > 0;
+    return this.db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
+      const archive = await tx.archive.findUnique({
+        where: { id },
+        select: { digest: true, projectId: true },
+      });
+      if (!archive) return false;
+      await tx.archiveTombstone.upsert({
+        where: { id },
+        create: { id, digest: archive.digest, projectId: archive.projectId },
+        update: { digest: archive.digest, projectId: archive.projectId, deletedAt: new Date() },
+      });
+      await tx.archive.delete({ where: { id } });
+      return true;
+    });
   }
   /** Applies the retention setting; returns the deleted archive ids. */
   async prune(now = Date.now()) {
@@ -596,8 +673,9 @@ export class ArchiveStore {
       where: { capturedAt: { lt: now - retentionDays * 86_400_000 } },
       select: { id: true },
     });
-    await this.db.archive.deleteMany({ where: { id: { in: expired.map((a) => a.id) } } });
-    return expired.map((a) => a.id);
+    const deleted: string[] = [];
+    for (const { id } of expired) if (await this.delete(id)) deleted.push(id);
+    return deleted;
   }
   /**
    * Deletes every revision but the current one, keeping any an outbox row still names until it is
@@ -711,7 +789,8 @@ export class ArchiveStore {
   }
   /**
    * While `captureRunSessions` is off, deletes the run sessions this Archive took in while it was
-   * on, as listed (a session whose run tag a person removed stays). One page of archives at a
+   * on: explicitly stamped (not `run:inferred`), a Foundry subagent type, or tagged a run by a
+   * person; a session whose run tag a person removed stays. One page of archives at a
    * time, one archive per statement, resuming where it stopped. Returns the archives deleted.
    */
   async removeRunSessions() {
@@ -745,11 +824,16 @@ export class ArchiveStore {
           finished = false;
           break;
         }
-        if (listing(archive, { exempt: 'only' }).length)
-          // A capture that moved the session on meanwhile was itself dropped or lifted.
-          removed += (
-            await this.db.archive.deleteMany({ where: { id: archive.id, digest: archive.digest } })
-          ).count;
+        const summary = archive.summary as Summary;
+        const run =
+          droppableRun({ tags: summary.capturedTags, lineage: summary.lineage }) ??
+          exemptRun(archive.tagEdits.filter((e) => e.added).map((e) => e.tag));
+        if (run && listing(archive, { exempt: 'only' }).length)
+          // One statement: a session lifted, or moved on by a capture, meanwhile is left alone.
+          removed += await this.db.$executeRaw`
+            DELETE FROM "archives" a WHERE a."id" = ${archive.id} AND a."digest" = ${archive.digest}
+              AND NOT EXISTS (SELECT 1 FROM "tag_edits" t WHERE t."archiveId" = a."id"
+                AND t."added" = false AND t."tag" = ANY(${RUN_TAG_VALUES}))`;
         reached = archive.seq.toString();
       }
       if (finished) {

@@ -1,12 +1,13 @@
 import { expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { agentsConfigSchema, collectorPlan } from '../src/agents';
 import {
   type CollectionSource,
   collectSessions,
   defaultExclusions,
+  excludeGlob,
   folderAllowed,
   folderGlob,
   routeSession,
@@ -19,9 +20,24 @@ test('folder globs normalize like Atlas and Gloss entries, and an empty one is r
   expect(folderGlob('~/scratch/')).toBe(join(homedir(), 'scratch'));
   expect(folderGlob('decision-receipts')).toBe('**/decision-receipts');
   expect(folderGlob('./.foundry/evals//')).toBe('**/.foundry/evals');
-  expect(folderGlob(' /tmp/** ')).toBe('/tmp/**');
+  // A trailing /** goes: a folder glob covers the folder and everything below (Atlas's `dir/**`).
+  expect(folderGlob(' /tmp/** ')).toBe('/tmp');
+  expect(folderGlob('~/code/inixiative/**/')).toBe(join(homedir(), 'code/inixiative'));
+  expect(
+    folderAllowed(join(homedir(), 'code/inixiative'), {
+      include: [folderGlob('~/code/inixiative/**')],
+    }),
+  ).toBe(true);
   expect(folderGlob('**/primed-*/fixture')).toBe('**/primed-*/fixture');
-  for (const empty of ['', '  ', '/', './', '.']) expect(() => folderGlob(empty)).toThrow();
+  for (const empty of ['', '  ', '/', './', '.', '/**', '//'])
+    expect(() => folderGlob(empty)).toThrow();
+  expect(() => folderGlob('../x')).toThrow('..');
+  // Excludes that cover everything are refused; narrower ones are not.
+  for (const broad of ['**', '*', '/*', '~', '~/', homedir(), dirname(homedir())])
+    expect(() => excludeGlob(broad)).toThrow('covers every session');
+  expect(excludeGlob('~/code/zealot')).toBe(join(homedir(), 'code/zealot'));
+  expect(agentsConfigSchema.safeParse({ exclude: ['**'], collectors: [] }).success).toBe(false);
+  expect(agentsConfigSchema.safeParse({ include: ['**'], collectors: [] }).success).toBe(true);
   const parsed = agentsConfigSchema.parse({
     include: ['~/code/'],
     exclude: ['bench/.runs'],

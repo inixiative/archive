@@ -1,5 +1,13 @@
 import { expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -248,9 +256,9 @@ test('an unchanged session is not sent again, and an untouched file is not read 
     session('one', 'First');
     session('two', 'Second');
     expect(await collectSessions(writer, config, { harness })).toMatchObject({ imported: 2 });
-    // The checkout is in a temp directory, so its sessions are test runs.
+    // The checkout is in a temp directory, so its sessions are inferred test runs: exempt, kept.
     const [listed] = await store.list({ exempt: 'only' });
-    expect(listed!.tags).toEqual(['run:test']);
+    expect(listed!.tags).toEqual(['run:test', 'run:inferred']);
     expect(listed!.references).toEqual([expect.objectContaining({ integration: 'github' })]);
     expect(calls.capture).toBe(2);
     // A restarted collector compares digests: nothing is sent.
@@ -739,7 +747,7 @@ test('a subagent transcript never takes its parent’s key; a parent row holding
   }
 });
 
-test('a refused session is not retried until it changes; the catch-all hands sessions to their project; a deleted archive is captured again', async () => {
+test('a refused session is not retried until it changes; the catch-all hands sessions to their project; a deleted archive stays deleted until it changes', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'archive-refused-'));
   const store = await freshStore();
   let heads = 0;
@@ -793,21 +801,46 @@ test('a refused session is not retried until it changes; the catch-all hands ses
       await collectSessions(writer, moved, { peers: [moved], harness, cache, now }),
     ).toMatchObject({ held: 1, failed: 0, heldBy: [] });
     expect(heads).toBe(0);
-    // A stored session is re-checked every 10 minutes; one deleted on the server comes back.
+    // A stored session is re-checked every 10 minutes. One deleted there leaves a tombstone, so
+    // its unchanged file is not imported again; one the server lost (no tombstone) comes back.
     const own: CollectorCache = new Map();
     expect(
       await collectSessions(writer, a, { peers: [a], harness, cache: own, now }),
     ).toMatchObject({ unchanged: 1 });
-    await store.delete((await store.list())[0]!.id);
+    const { id } = (await store.list())[0]!;
+    await store.delete(id);
+    clock += 10 * 60_000;
     expect(
       await collectSessions(writer, a, { peers: [a], harness, cache: own, now }),
-    ).toMatchObject({ unchanged: 1 });
+    ).toMatchObject({ unchanged: 1, imported: 0 });
+    expect(await collectSessions(writer, a, { peers: [a], harness, now })).toMatchObject({
+      unchanged: 1,
+      imported: 0,
+    });
     expect(await store.list()).toEqual([]);
+    expect(await store.head(id)).toMatchObject({ deleted: true, revision: 0 });
+    await store.db.archiveTombstone.deleteMany({});
     clock += 10 * 60_000;
     expect(
       await collectSessions(writer, a, { peers: [a], harness, cache: own, now }),
     ).toMatchObject({ imported: 1 });
+    // A resumed session (a new digest) comes back after a delete.
+    await store.delete(id);
+    writeFileSync(
+      join(dir, 'one.jsonl'),
+      `${readFileSync(join(dir, 'one.jsonl'), 'utf8')}\n${JSON.stringify({
+        sessionId: 'one',
+        cwd: '/work/a/x',
+        type: 'user',
+        uuid: 'one-2',
+        message: { content: 'More work' },
+      })}`,
+    );
+    expect(
+      await collectSessions(writer, a, { peers: [a], harness, cache: own, now }),
+    ).toMatchObject({ imported: 1 });
     expect((await store.list()).length).toBe(1);
+    expect(await store.db.archiveTombstone.count()).toBe(0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -31,6 +31,8 @@ export type ArchiveLibrary = { integrationId: string; resourceId: string; name: 
 export type ArchiveLibraries = { paired: boolean; libraries: ArchiveLibrary[] };
 export type RoutedDestination = Pick<ArchiveDestination, 'kind' | 'url'> & {
   integrationId?: string;
+  /** Projects in another ownership boundary the session touched: it stays local for this one. */
+  withheld?: string[];
 };
 export type RoutingPreview = (Pick<
   ArchiveListing,

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { publishArchive } from '../src/client';
 import { type CollectionSource, collectSessions } from '../src/collector';
 import { type ArchiveDestination, destinationIdentity } from '../src/config';
-import { RUN_TAGS, stampedRun, stampRunDirectory } from '../src/exemption';
+import { RUN_INFERRED, RUN_TAGS, stampedRun, stampRunDirectory } from '../src/exemption';
 import { archiveSnapshotSchema } from '../src/index';
 import { createArchiveHandler } from '../src/server';
 import { freshStore } from './db';
@@ -53,15 +53,32 @@ test('with run sessions off, ingest keeps no run session, whoever stamped it, an
       revision: 0,
       dropped: tag,
     });
-  // The interim inference counts too: Foundry's fixture project `P`.
-  expect((await store.capture(session('fixture', [], 'P'))).dropped).toBe(RUN_TAGS.test);
+  // Interim inferences only exempt: Foundry's fixture project `P`, a working directory guess.
+  expect((await store.capture(session('fixture', [], 'P'))).dropped).toBeUndefined();
+  expect(
+    (await store.capture(session('scratch', [RUN_TAGS.test, RUN_INFERRED]))).dropped,
+  ).toBeUndefined();
+  // A person's Foundry thread from Zed outside a registered project is their work.
+  const acp = await store.capture({
+    ...session('acp-thread', ['acp', 'acp:zed']),
+    source: 'foundry',
+    projectId: undefined,
+  });
+  expect(acp).toMatchObject({ changed: true });
+  expect(acp.dropped).toBeUndefined();
   // A run session already held goes when it is captured again.
   expect(
     (await store.capture({ ...session('kept-run', [RUN_TAGS.foundry]), capturedAt: 2 })).dropped,
   ).toBe(RUN_TAGS.foundry);
   // A person's work is untouched.
   expect((await store.capture(session('work'))).changed).toBe(true);
-  expect((await store.list({ exempt: 'include' })).map((a) => a.sessionId)).toEqual(['work']);
+  expect((await store.list({ exempt: 'include' })).map((a) => a.sessionId).sort()).toEqual([
+    'acp-thread',
+    'fixture',
+    'scratch',
+    'work',
+  ]);
+  expect((await store.list()).map((a) => a.sessionId).sort()).toEqual(['acp-thread', 'work']);
 
   // Over HTTP too (Foundry's direct writes, a syncing Archive).
   const handler = createArchiveHandler(store, token);
@@ -72,7 +89,7 @@ test('with run sessions off, ingest keeps no run session, whoever stamped it, an
   expect(((await response.json()) as { data: { dropped?: string } }).data.dropped).toBe(
     RUN_TAGS.oracle,
   );
-  expect(await store.list({ exempt: 'include' })).toHaveLength(1);
+  expect(await store.list({ exempt: 'include' })).toHaveLength(4);
 });
 
 test('a session whose run tag a person removed is kept when run sessions go off', async () => {
@@ -164,11 +181,13 @@ test('a collector counts what the server dropped and does not send it again', as
     await store.updateSettings({ captureRunSessions: false });
     const history = join(dir, 'history');
     const project = join(dir, 'project');
-    const primed = join(dir, 'host');
+    const host = join(dir, 'host');
+    const primed = join(host, 'fixture');
     mkdirSync(history);
     mkdirSync(project);
-    mkdirSync(primed);
-    stampRunDirectory(primed, 'foundry');
+    mkdirSync(primed, { recursive: true });
+    // The marker sits below the collector root, as a runner's workspace does.
+    stampRunDirectory(host, 'foundry');
     const transcript = (id: string, cwd: string) =>
       writeFileSync(
         join(history, `${id}.jsonl`),
@@ -195,7 +214,8 @@ test('a collector counts what the server dropped and does not send it again', as
     const config: CollectionSource = {
       directory: history,
       source: 'claude-code',
-      projectRoots: [project, primed],
+      projectRoots: [dir],
+      subdirectories: true,
       projectId: 'inixiative',
     };
     const cache = new Map();
@@ -251,4 +271,80 @@ test("Foundry's own subagents are run:foundry by agent type; a person's subagent
   expect((await store.capture({ ...subagent('w6', 'foundry-warden') })).dropped).toBe(
     RUN_TAGS.foundry,
   );
+});
+
+test('a session a person rescued from a run tag is stored without it, so an "off" destination keeps it', async () => {
+  const store = await freshStore();
+  const remote = await freshStore('remote');
+  process.env.ARCHIVE_RUN_SESSIONS_TEST_TOKEN = token;
+  try {
+    await remote.updateSettings({ captureRunSessions: false });
+    const { id } = await store.capture(session('rescued', [RUN_TAGS.test]));
+    await store.tag(id, { remove: [RUN_TAGS.test] });
+    expect((await store.read(id))!.snapshot.tags).toEqual([]);
+    // A later capture from the writer, still stamped, stays rescued too.
+    await store.capture({ ...session('rescued', [RUN_TAGS.test]), capturedAt: 2 });
+    expect((await store.read(id))!.snapshot.tags).toEqual([]);
+    expect((await store.list()).map((a) => a.sessionId)).toEqual(['rescued']);
+    const destination: ArchiveDestination = {
+      kind: 'archive',
+      projectId: 'inixiative',
+      url: 'http://localhost:4414/',
+      tokenEnv: 'ARCHIVE_RUN_SESSIONS_TEST_TOKEN',
+    };
+    const handler = createArchiveHandler(remote, token);
+    const transport = ((url: string, options: RequestInit) =>
+      handler(new Request(url, options))) as unknown as typeof fetch;
+    expect(await publishArchive(store, id, destination, transport)).toEqual({ unchanged: false });
+    expect((await remote.list()).map((a) => a.sessionId)).toEqual(['rescued']);
+    expect(await publishArchive(store, id, destination, transport)).toEqual({ unchanged: true });
+  } finally {
+    delete process.env.ARCHIVE_RUN_SESSIONS_TEST_TOKEN;
+  }
+});
+
+test('the sweep deletes explicit runs only: an inferred or lifted one stays', async () => {
+  const store = await freshStore();
+  await store.capture(session('stamped', [RUN_TAGS.oracle]));
+  await store.capture(session('inferred', [RUN_TAGS.test, RUN_INFERRED]));
+  await store.capture(session('fixture', [], 'P'));
+  const { id: lifted } = await store.capture(session('lifted', [RUN_TAGS.test]));
+  await store.tag(lifted, { remove: [RUN_TAGS.test] });
+  // A lift recorded straight in tag_edits (no re-store) is honoured by the delete statement.
+  const { id: late } = await store.capture(session('late-lift', [RUN_TAGS.foundry]));
+  await store.db.tagEdit.create({ data: { archiveId: late, tag: RUN_TAGS.foundry, added: false } });
+  await store.updateSettings({ captureRunSessions: false });
+  expect(await store.removeRunSessions()).toBe(1);
+  expect((await store.list({ exempt: 'include' })).map((a) => a.sessionId).sort()).toEqual([
+    'fixture',
+    'inferred',
+    'late-lift',
+    'lifted',
+  ]);
+});
+
+test('a deleted session leaves a tombstone: the same digest is not stored again, a new one is', async () => {
+  const store = await freshStore();
+  const handler = createArchiveHandler(store, token);
+  const first = session('deleted');
+  const { id, digest } = await store.capture(first);
+  expect((await handler(request('delete', { archiveId: id }))).status).toBe(200);
+  expect(await store.head(id)).toMatchObject({ id, digest, revision: 0, deleted: true });
+  // The writer's unchanged copy, with the tombstone's digest as the previous one.
+  const again = await handler(request('ingest', { snapshot: first, previousDigest: digest }));
+  expect(((await again.json()) as { data: { changed: boolean } }).data.changed).toBe(false);
+  expect(await store.list({ exempt: 'include' })).toEqual([]);
+  // Resumed: a new digest is captured, and the tombstone goes.
+  const resumed = {
+    ...first,
+    capturedAt: 2,
+    entries: [...first.entries, { ...first.entries[0]!, id: 'u2', sourceRef: 'line:2' }],
+  };
+  const back = await handler(request('ingest', { snapshot: resumed, previousDigest: digest }));
+  expect(((await back.json()) as { data: { changed: boolean } }).data.changed).toBe(true);
+  expect(await store.db.archiveTombstone.count()).toBe(0);
+  // Retention leaves tombstones too.
+  await store.updateSettings({ retentionDays: 1 });
+  expect(await store.prune(10 * 86_400_000)).toEqual([id]);
+  expect(await store.head(id)).toMatchObject({ deleted: true });
 });

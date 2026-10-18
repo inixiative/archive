@@ -8,6 +8,7 @@ import {
 } from './config';
 import { ArchiveRequestError, type RoutingPreview, refusalDetail, type SyncResult } from './remote';
 import { type ArchiveStore, RevisionCompacted } from './store';
+import { PROJECT_TAG_PREFIX } from './tags';
 
 export { type ArchiveDestination, archiveDestinationSchema } from './config';
 
@@ -88,7 +89,7 @@ export async function publishArchive(
 ) {
   const destination = archiveDestinationSchema.parse(input);
   const archive = await store.head(id);
-  if (!archive || archive.projectId !== destination.projectId)
+  if (!archive || 'deleted' in archive || archive.projectId !== destination.projectId)
     throw new Error('Archive is outside destination project');
   // A raw capture its driver later stored itself stays local: the driver's version is the one that travels.
   if (archive.supersededBy) return { unchanged: true };
@@ -124,6 +125,27 @@ export async function publishArchive(
   throw new Error('Archive changed repeatedly during publication; retry sync');
 }
 
+/**
+ * The projects in another ownership boundary a session touched, for one destination. Boundaries
+ * are the destinations each project routes to (`destinations.json`): a `project:` tag naming a
+ * project routed elsewhere, and never to this destination, crosses one. Such a session stays
+ * local for that destination, so neither its content nor the other boundary's project ids leave
+ * through it. Projects with no destination claim no boundary.
+ */
+export function boundaryCrossings(
+  tags: readonly string[],
+  destination: ArchiveDestination,
+  destinations: ArchiveDestination[],
+): string[] {
+  const identity = destinationIdentity(destination);
+  return tags.flatMap((tag) => {
+    if (!tag.startsWith(PROJECT_TAG_PREFIX)) return [];
+    const projectId = tag.slice(PROJECT_TAG_PREFIX.length);
+    const routes = destinations.filter((d) => d.projectId === projectId).map(destinationIdentity);
+    return routes.length && !routes.includes(identity) ? [projectId] : [];
+  });
+}
+
 export async function routingPreview(
   store: ArchiveStore,
   destinations: ArchiveDestination[],
@@ -135,11 +157,15 @@ export async function routingPreview(
     suggestedTags: archive.suggestedTags,
     destinations: destinations
       .filter((d) => d.projectId === archive.projectId)
-      .map((d) => ({
-        kind: d.kind,
-        url: d.url,
-        ...(d.kind === 'kingdom' ? { integrationId: d.integrationId } : {}),
-      })),
+      .map((d) => {
+        const withheld = boundaryCrossings(archive.tags, d, destinations);
+        return {
+          kind: d.kind,
+          url: d.url,
+          ...(d.kind === 'kingdom' ? { integrationId: d.integrationId } : {}),
+          ...(withheld.length ? { withheld } : {}),
+        };
+      }),
   }));
 }
 
@@ -186,6 +212,15 @@ export async function syncArchives(
       const circuit = backoff?.get(down);
       if (circuit && now() < circuit.until) {
         deferred(circuit.until);
+        continue;
+      }
+      const crossed = boundaryCrossings(archive.tags, destination, destinations);
+      if (crossed.length) {
+        results.push({
+          id: archive.id,
+          destination: destination.url,
+          status: `withheld: touched ${crossed.join(', ')}, in another ownership boundary`,
+        });
         continue;
       }
       const waiting = backoff?.get(key);

@@ -185,7 +185,7 @@ Moving to **summarized**:
 2. Keeps the typed prompts verbatim. They are small, and they are what the Prospector and `foundry repeats` read.
 3. Stores the summary as a new revision with `coverage.completeness: 'partial'` and an omission "summarized from revision N", then compacts (§6.1). Search keeps working on the summary's chunks.
 
-Moving to **pruned** deletes that revision and its chunks and leaves the tombstone. The tombstone keeps `digest`, so the collector's `head()` sees an unchanged file as unchanged and does not re-import it. If the session is resumed, the digest differs, a new revision is captured and the archive is back in **keep**.
+Moving to **pruned** deletes that revision and its chunks and leaves the tombstone. The tombstone keeps `digest`, so the collector's `head()` sees an unchanged file as unchanged and does not re-import it. *Built for deletions (0.23.0):* `delete` and `retentionDays` leave an `archive_tombstones` row (key, writer's digest, project) that `head` answers with `deleted: true`, by the same digest check. If the session is resumed, the digest differs, a new revision is captured and the archive is back in **keep**.
 
 ### 6.3 Schedule
 

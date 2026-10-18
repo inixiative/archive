@@ -11,7 +11,7 @@ import {
   destinationsFile,
   readDestinations,
 } from '../src/config';
-import { archiveSnapshotSchema } from '../src/index';
+import { archiveKey, archiveSnapshotSchema } from '../src/index';
 import { verifyKingdomDestination } from '../src/kingdom';
 import { createArchiveHandler, startArchiveServer } from '../src/server';
 import { ArchiveStore } from '../src/store';
@@ -324,5 +324,72 @@ test('Kingdom destinations write and search through the paired Signet', async ()
   } finally {
     kingdom.stop();
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a session that touched a project in another ownership boundary stays local for that destination', async () => {
+  const local = await freshStore();
+  const instances: {
+    projectId: string;
+    instance: Awaited<ReturnType<typeof startArchiveServer>>;
+  }[] = [];
+  for (const projectId of ['inixiative', 'userevidence'] as const) {
+    await freshStore(projectId);
+    instances.push({
+      projectId,
+      instance: await startArchiveServer({
+        databaseUrl: testDatabaseUrl(projectId),
+        token,
+        port: 0,
+      }),
+    });
+  }
+  process.env.ARCHIVE_BOUNDARY_TEST_TOKEN = token;
+  try {
+    const tagged = (projectId: string, sessionId: string, tags: string[]) => ({
+      ...snapshot(projectId, sessionId),
+      tags,
+    });
+    // An orchestrator session that did Zealot work, one that touched a local-only project, and a
+    // Zealot session that touched inixiative paths.
+    await local.capture(
+      tagged('inixiative', 'crossed', ['project:inixiative', 'project:userevidence']),
+    );
+    await local.capture(
+      tagged('inixiative', 'local-only', ['project:template', 'project:kingdom']),
+    );
+    await local.capture(
+      tagged('userevidence', 'ue-crossed', ['project:userevidence', 'project:kingdom']),
+    );
+    await local.capture(tagged('userevidence', 'ue-own', ['project:userevidence']));
+    const [inixiative, userevidence] = instances.map(({ projectId, instance }) => ({
+      projectId,
+      kind: 'archive' as const,
+      url: instance.server.url.href,
+      tokenEnv: 'ARCHIVE_BOUNDARY_TEST_TOKEN',
+    }));
+    // kingdom routes to the inixiative boundary too; template has no destination.
+    const destinations: ArchiveDestination[] = [
+      inixiative!,
+      { ...inixiative!, projectId: 'kingdom' },
+      userevidence!,
+    ];
+    const routes = await routingPreview(local, destinations);
+    const route = (sessionId: string) =>
+      routes.find((r) => r.id === archiveKey(snapshot(r.projectId ?? '', sessionId)))?.destinations;
+    expect(route('crossed')).toEqual([expect.objectContaining({ withheld: ['userevidence'] })]);
+    expect(route('local-only')?.[0]?.withheld).toBeUndefined();
+    expect(route('ue-crossed')).toEqual([expect.objectContaining({ withheld: ['kingdom'] })]);
+    const results = await syncArchives(local, destinations);
+    expect(results.filter((r) => r.status.startsWith('withheld')).length).toBe(2);
+    const held = (i: number) =>
+      instances[i]!.instance.store.list({ exempt: 'include' }).then((l) =>
+        l.map((a) => a.sessionId).sort(),
+      );
+    expect(await held(0)).toEqual(['local-only']);
+    expect(await held(1)).toEqual(['ue-own']);
+  } finally {
+    delete process.env.ARCHIVE_BOUNDARY_TEST_TOKEN;
+    for (const { instance } of instances) await instance.close();
   }
 });
