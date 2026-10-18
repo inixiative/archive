@@ -44,6 +44,7 @@ export type MaintenanceStatus = {
   supersededRevisions: number;
   revisionsAwaitingDelivery: number;
   toolActivitySweepPending: boolean;
+  toolActivitySweepFailures: string[];
   reclaim: {
     state: 'running' | 'idle';
     startedAt?: number;

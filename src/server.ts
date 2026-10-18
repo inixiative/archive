@@ -372,6 +372,8 @@ export async function startArchiveServer(options: {
       async close() {
         clearInterval(retention);
         await server.stop(true);
+        // Maintenance stops after its current statement; it resumes on the next start.
+        await store.stop();
         await maintenance;
         await store.close();
       },

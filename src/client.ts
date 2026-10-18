@@ -168,6 +168,8 @@ export async function syncArchives(
   const seen = new Set<string>();
   const delay = (failures: number) =>
     Math.min(BACKOFF_BASE_MS * 2 ** (failures - 1), BACKOFF_MAX_MS);
+  // A route that was removed never delivers: release the revisions its outbox rows hold.
+  await store.releaseOutbox(destinations.map(destinationIdentity));
   const archives = await store.list({ exempt: 'include' });
   for (const archive of archives)
     for (const destination of destinations.filter((d) => d.projectId === archive.projectId)) {

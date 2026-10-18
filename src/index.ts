@@ -116,32 +116,6 @@ export const snapshotDigest = (snapshot: ArchiveSnapshot) => {
   return digest(JSON.stringify(content));
 };
 
-/** Entry kinds a deployment can decline to keep (`captureToolCallsAndResults`). */
-export const TOOL_ACTIVITY_KINDS = ['tool-call', 'tool-result'] as const;
-export const TOOL_ACTIVITY_OMISSION =
-  "Tool calls and tool results are not kept: this Archive's captureToolCallsAndResults setting is off.";
-/**
- * The snapshot without its tool calls and tool results, its coverage saying so. `removed` is how many
- * entries went; a snapshot with none is returned as it was.
- */
-export function withoutToolActivity(snapshot: ArchiveSnapshot) {
-  const kinds: readonly string[] = TOOL_ACTIVITY_KINDS;
-  const entries = snapshot.entries.filter((entry) => !kinds.includes(entry.kind));
-  const removed = snapshot.entries.length - entries.length;
-  if (!removed) return { snapshot, removed };
-  const omissions = snapshot.coverage.omissions.includes(TOOL_ACTIVITY_OMISSION)
-    ? snapshot.coverage.omissions
-    : [...snapshot.coverage.omissions, TOOL_ACTIVITY_OMISSION].slice(-100);
-  return {
-    snapshot: archiveSnapshotSchema.parse({
-      ...snapshot,
-      coverage: { ...snapshot.coverage, completeness: 'partial', omissions },
-      entries,
-    }),
-    removed,
-  };
-}
-
 export function chunkArchive(snapshot: ArchiveSnapshot, budget = 512): ArchiveChunk[] {
   if (!Number.isInteger(budget) || budget < 16 || budget > 8192)
     throw new Error('Invalid chunk token budget');

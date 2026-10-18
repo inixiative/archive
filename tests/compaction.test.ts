@@ -6,10 +6,10 @@ import {
   archiveSnapshotSchema,
   chunkArchive,
   snapshotDigest,
-  TOOL_ACTIVITY_OMISSION,
 } from '../src/index';
 import { createArchiveHandler } from '../src/server';
 import type { ArchiveStore } from '../src/store';
+import { TOOL_ACTIVITY_OMISSION } from '../src/tool-activity';
 import { freshStore } from './db';
 
 const token = 'synthetic-archive-test-token-0000000000';
@@ -331,3 +331,59 @@ test('the search index is rebuilt once compaction is done, and reclaim rewrites 
   expect(await searchIndexValid(store)).toBe(true);
   expect((await store.matching([first.id], 'migration')).has(first.id)).toBe(true);
 });
+
+test('maintenance and reclaim never overlap, and a search index build in progress is left alone', async () => {
+  const store = await freshStore();
+  await store.capture(session(turns));
+  // A maintenance run in progress refuses a reclaim.
+  const running = store.maintain();
+  expect(store.reclaim()).rejects.toThrow('Maintenance or a reclaim is running');
+  await running;
+  // A reclaim in progress makes maintenance a no-op.
+  await store.reclaim();
+  expect(store.reclaiming.state).toBe('running');
+  const held = await store.capture({ ...session(turns.slice(0, 1)), sessionId: 'held' });
+  await store.enqueue(held.id, 'destination', { revision: 1 });
+  await store.capture({ ...session(turns.slice(0, 2), 2), sessionId: 'held' });
+  await store.db.outbox.deleteMany({});
+  await store.maintain();
+  expect((await store.maintenanceStatus()).supersededRevisions).toBe(1);
+  for (let i = 0; store.reclaiming.state === 'running' && i < 600; i++) await Bun.sleep(50);
+  await store.maintain();
+  expect((await store.maintenanceStatus()).supersededRevisions).toBe(0);
+  expect(store.reclaiming.last?.error).toBeUndefined();
+  expect(await searchIndexValid(store)).toBe(true);
+
+  // A concurrent build waits on an old snapshot, leaving an invalid index while it is in progress.
+  await store.db.$executeRawUnsafe('DROP INDEX IF EXISTS "chunks_text_idx"');
+  const url = new URL(
+    process.env.ARCHIVE_TEST_DATABASE_URL ??
+      'postgresql://archive:archive@127.0.0.1:6132/archive_test',
+  );
+  url.pathname = `${url.pathname}_main`;
+  const holder = new Bun.SQL(url.href, { max: 1 });
+  const builder = new Bun.SQL(url.href, { max: 1 });
+  const reserved = await holder.reserve();
+  try {
+    await reserved`BEGIN ISOLATION LEVEL REPEATABLE READ`;
+    await reserved`SELECT count(*) FROM "chunks"`;
+    // Bun's queries run when awaited: start the build now, without waiting for it.
+    const build = (async () =>
+      await builder.unsafe(
+        'CREATE INDEX CONCURRENTLY "chunks_text_idx" ON "chunks" USING GIN ("text" gin_trgm_ops)',
+      ))();
+    for (let i = 0; (await searchIndexValid(store)) === undefined && i < 200; i++)
+      await Bun.sleep(50);
+    expect(await searchIndexValid(store)).toBe(false);
+    expect(await store.ensureSearchIndex()).toBe(false);
+    expect(await searchIndexValid(store)).toBe(false);
+    await reserved`COMMIT`;
+    await build;
+    expect(await searchIndexValid(store)).toBe(true);
+  } finally {
+    await reserved`ROLLBACK`.catch(() => {});
+    reserved.release();
+    await holder.close();
+    await builder.close();
+  }
+}, 60_000);
