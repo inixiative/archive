@@ -33,6 +33,7 @@ Store content locally and in more than one remote Archive. Search the local stor
 | [ARC-006](ARC-006-sharing-and-access.md) | Add sharing policies and scoped access | FF |
 | [ARC-008](ARC-008-retrospective-proof.md) | Demonstrate retrospective usefulness | FF |
 | [ARC-012](ARC-012-operational-lifecycle.md) | Extend backup, retention, deletion, and operational management | FF |
+| [ARC-013](ARC-013-session-working-directory.md) | Keep each session's working directory and every branch it worked on | FF |
 
 Billing, the Template-based hosted management site, multiple storage technologies, and automated application of lessons also remain future features. Multiple remote Archive destinations are explicitly in MVP; they do not imply multiple storage technologies.
 
