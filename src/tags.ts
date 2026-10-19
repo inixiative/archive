@@ -54,6 +54,24 @@ function extractors(integration: ArchiveIntegration): Extractor[] {
 export type ArchiveReferenceCount = ArchiveReference & { recorded: boolean; mentions: number };
 
 /**
+ * Every link to the integrations' items in a text, one per mention, integration by integration in
+ * the order given: what `archiveReferences` counts in a session, for any other text (a PR body).
+ */
+export function referencesIn(
+  text: string,
+  integrations: ArchiveIntegration[] = defaultIntegrations,
+): ArchiveReference[] {
+  const references: ArchiveReference[] = [];
+  for (const integration of integrations)
+    for (const [pattern, ref] of extractors(integration))
+      for (const match of text.matchAll(pattern)) {
+        const reference = { integration: integration.key, ref: ref(match) };
+        if (reference.ref) references.push(reference);
+      }
+  return references;
+}
+
+/**
  * References to the archive's integrations: recorded ones first, then linked ones, most-linked
  * first. A link is not proof of work, so linked references are evidence, not assignments.
  */
@@ -70,19 +88,12 @@ export function archiveReferences(
     if (known.has(reference.integration))
       found.set(key(reference), { ...reference, recorded: true, mentions: 0 });
   for (const integration of integrations)
-    for (const [pattern, ref] of extractors(integration))
-      for (const entry of snapshot.entries)
-        for (const match of entry.text.matchAll(pattern)) {
-          const reference = { integration: integration.key, ref: ref(match) };
-          if (!reference.ref) continue;
-          const current = found.get(key(reference)) ?? {
-            ...reference,
-            recorded: false,
-            mentions: 0,
-          };
-          current.mentions++;
-          found.set(key(reference), current);
-        }
+    for (const entry of snapshot.entries)
+      for (const reference of referencesIn(entry.text, [integration])) {
+        const current = found.get(key(reference)) ?? { ...reference, recorded: false, mentions: 0 };
+        current.mentions++;
+        found.set(key(reference), current);
+      }
   return [...found.values()]
     .sort((a, b) => Number(b.recorded) - Number(a.recorded) || b.mentions - a.mentions)
     .slice(0, limit);
@@ -299,6 +310,31 @@ export function toolCallPaths(text: string, cwd?: string): string[] {
   return paths;
 }
 
+/** Where a path sits: the project whose root (or worktree) holds it, that root, and the path inside it. */
+export type ProjectPath = { projectId: string; root: string; path: string };
+
+/**
+ * A resolver from absolute paths to the project holding each, the longest root winning:
+ * worktrees can live inside their main checkout, and a container (`~/code/inixiative`) holds
+ * other projects' roots. A path outside every root resolves to nothing.
+ */
+export function projectPaths(
+  projects: { projectId: string; roots: Iterable<string> }[],
+): (path: string) => ProjectPath | undefined {
+  const roots = projects
+    .flatMap(({ projectId, roots }) =>
+      [...roots].map((root) => ({ projectId, root: resolve(root) })),
+    )
+    .filter(({ root }) => root !== '/')
+    .sort((a, b) => b.root.length - a.root.length);
+  return (path) => {
+    const owner = roots.find(({ root }) => path === root || path.startsWith(`${root}/`));
+    return (
+      owner && { ...owner, path: path === owner.root ? '' : path.slice(owner.root.length + 1) }
+    );
+  };
+}
+
 /**
  * The projects a session worked in, from the paths its tool calls access (`toolCallPaths`) and its
  * working directory: `project:<projectId>` for each project with a root (or worktree) holding
@@ -318,8 +354,7 @@ export function projectTags(
     .flatMap(({ projectId, roots }) =>
       [...roots].map((root) => ({ projectId, root: resolve(root) })),
     )
-    .filter(({ root }) => root !== '/')
-    .sort((a, b) => b.root.length - a.root.length);
+    .filter(({ root }) => root !== '/');
   if (!roots.length) return [];
   const containers = new Set(
     roots
@@ -328,10 +363,11 @@ export function projectTags(
       )
       .map(({ root }) => root),
   );
+  const resolvePath = projectPaths(projects);
   const counts = new Map<string, number>();
   const count = (path: string) => {
     if (containers.has(path)) return;
-    const owner = roots.find(({ root }) => path === root || path.startsWith(`${root}/`));
+    const owner = resolvePath(path);
     if (owner) counts.set(owner.projectId, (counts.get(owner.projectId) ?? 0) + 1);
   };
   if (cwd) count(resolve(cwd));

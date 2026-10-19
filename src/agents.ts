@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import {
   type CollectionSource,
+  collectionRoots,
   defaultExclusions,
   excludeGlob,
   type FolderFilters,
@@ -132,6 +133,27 @@ export function collectorArgs(c: CollectorAgent) {
   return ['collect', '--agent', c.name, '--watch'];
 }
 
+const source = (c: CollectorAgent): CollectionSource => ({
+  directory: c.directory,
+  source: c.source,
+  projectRoots: c.projectRoots,
+  projectId: c.projectId,
+  ...(c.worktrees ? { worktrees: true } : {}),
+  ...(c.subdirectories ? { subdirectories: true } : {}),
+  ...(c.catchAll ? { catchAll: true } : {}),
+  ...(c.atlas ? { atlas: true } : {}),
+});
+
+/**
+ * Every project on the machine and the directories that are its checkouts (worktrees included,
+ * read now), as the collectors tag `project:` with: what `projectPaths` resolves paths against.
+ */
+export function machineProjects(config: AgentsConfig) {
+  return config.collectors
+    .filter((c) => !c.catchAll)
+    .map((c) => ({ projectId: c.projectId, roots: collectionRoots(source(c)) }));
+}
+
 /**
  * A named collector, the peers it is routed against, the folder filters, every project on the
  * machine (for `project:` tags) and the server, from agents.json.
@@ -139,16 +161,6 @@ export function collectorArgs(c: CollectorAgent) {
 export function collectorPlan(config: AgentsConfig, name: string) {
   const collector = config.collectors.find((c) => c.name === name);
   if (!collector) throw new Error(`No collector named ${name} in agents.json`);
-  const source = (c: CollectorAgent): CollectionSource => ({
-    directory: c.directory,
-    source: c.source,
-    projectRoots: c.projectRoots,
-    projectId: c.projectId,
-    ...(c.worktrees ? { worktrees: true } : {}),
-    ...(c.subdirectories ? { subdirectories: true } : {}),
-    ...(c.catchAll ? { catchAll: true } : {}),
-    ...(c.atlas ? { atlas: true } : {}),
-  });
   // Collectors over the same history compete for its sessions; another directory is another history.
   const named = config.collectors.filter(
     (c) => c.source === collector.source && resolve(c.directory) === resolve(collector.directory),

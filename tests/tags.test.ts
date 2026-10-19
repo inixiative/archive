@@ -4,7 +4,9 @@ import {
   archiveReferences,
   atlasTags,
   defaultIntegrations,
+  projectPaths,
   provenanceReferences,
+  referencesIn,
 } from '../src/tags';
 
 const snapshot = (entries: Pick<ArchiveEntry, 'kind' | 'text'>[]) =>
@@ -94,4 +96,34 @@ test('Atlas concepts come from files tool calls touched, in any root, never from
     'atlas:primitive:access',
     'atlas:feature:archive',
   ]);
+});
+
+test('references in plain text, one per mention, as archiveReferences counts them', () => {
+  expect(
+    referencesIn(
+      'Part of https://linear.app/acme/issue/zlt-88/title; see github.com/Acme/Widgets/pull/5 and linear.app/acme/issue/ZLT-88',
+    ),
+  ).toEqual([
+    { integration: 'github', ref: 'acme/widgets#5' },
+    { integration: 'linear', ref: 'ZLT-88' },
+    { integration: 'linear', ref: 'ZLT-88' },
+  ]);
+  expect(referencesIn('ZLT-88 bare', defaultIntegrations)).toEqual([]);
+});
+
+test('a path resolves to the project holding it, the longest root winning', () => {
+  const resolvePath = projectPaths([
+    { projectId: 'code', roots: ['/w'] },
+    { projectId: 'template', roots: ['/w/template', '/w/template/.worktrees/x', '/w/template-wt'] },
+    { projectId: 'kingdom', roots: ['/w/kingdom'] },
+  ]);
+  expect(resolvePath('/w/template/.worktrees/x/src/a.ts')).toEqual({
+    projectId: 'template',
+    root: '/w/template/.worktrees/x',
+    path: 'src/a.ts',
+  });
+  expect(resolvePath('/w/template-wt/package.json')?.path).toBe('package.json');
+  expect(resolvePath('/w/kingdom/src/a.ts')?.projectId).toBe('kingdom');
+  expect(resolvePath('/w/CLAUDE.md')).toEqual({ projectId: 'code', root: '/w', path: 'CLAUDE.md' });
+  expect(resolvePath('/elsewhere/a.ts')).toBeUndefined();
 });
