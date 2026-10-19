@@ -20,6 +20,7 @@ import {
   collectorPlan,
   defaultHome,
   installAgents,
+  machineProjects,
   packageCliPath,
   planAgents,
   readAgents,
@@ -502,4 +503,23 @@ test('a unit that fails to load does not stop the others, and is reloaded by the
   expect(again.loaded).toEqual(['com.inixiative.archive.collect.claude-code.kingdom']);
   expect(again.unchanged).toEqual(['com.inixiative.archive.collect.codex.kingdom']);
   expect(readFileSync(claudeFile, 'utf8')).toContain('<string>--agent</string>');
+});
+
+test('machineProjects: every non-catch-all project and its checkout roots', () => {
+  const project = (name: string, projectId: string, root: string, catchAll = false) => ({
+    name,
+    source: 'claude-code' as const,
+    directory: '/Users/someone/.claude/projects',
+    projectId,
+    projectRoots: [root],
+    ...(catchAll ? { catchAll: true } : {}),
+  });
+  expect(
+    machineProjects({
+      collectors: [
+        project('claude-code.template', 'template', '/nonexistent/template'),
+        project('claude-code.unrouted', 'unrouted', '/nonexistent', true),
+      ],
+    }),
+  ).toEqual([{ projectId: 'template', roots: new Set(['/nonexistent/template']) }]);
 });
