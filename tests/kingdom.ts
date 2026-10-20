@@ -25,6 +25,7 @@ export function signetKingdom(options: {
   const executed: ExecuteBody[] = [];
   const signetId = crypto.randomUUID();
   const localIntegrationId = crypto.randomUUID();
+  const holderUser = { id: crypto.randomUUID(), name: 'Ada', email: 'ada@example.com' };
   const server = Bun.serve({
     port: 0,
     hostname: '127.0.0.1',
@@ -50,7 +51,7 @@ export function signetKingdom(options: {
           integrationId: localIntegrationId,
           provider: 'archive',
           name: 'Laptop Archive',
-          expiresAt: null,
+          expiresAt: new Date(Date.now() + 300000).toISOString(),
           lifecycle: 'ongoing',
           taskId: null,
           currentRevision: 1,
@@ -64,9 +65,23 @@ export function signetKingdom(options: {
                 name: library.name,
                 kind: 'archiveLibrary',
                 integrationId: library.integrationId,
+                lens: {},
               })),
             },
           ],
+          holder: {
+            integration: { id: localIntegrationId, name: 'Laptop Archive', provider: 'archive' },
+            owner: {
+              ownerModel: 'User',
+              name: 'Ada',
+              organization: null,
+              space: null,
+              user: holderUser,
+            },
+            issuedBy: holderUser,
+            webUrl: 'https://kingdom.example',
+            manageUrl: `https://kingdom.example/dashboard?integration=${localIntegrationId}`,
+          },
         });
       if (action === 'execute') {
         const body = (await request.json()) as ExecuteBody;
