@@ -38,7 +38,7 @@
   },
   "dependencies": {
     "@inixiative/agent-session": "^0.6.7",
-    "@inixiative/signet": "^0.4.6",
+    "@inixiative/signet": "^0.5.1",
     "@prisma/client": "^6.6.0",
     "js-tiktoken": "1.0.21",
     "prisma": "^6.6.0",
@@ -46,7 +46,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
-    "@inixiative/config": "^0.5.113",
+    "@inixiative/config": "^0.5.116",
     "@types/bun": "1.4.2",
     "lefthook": "2.1.9",
     "typescript": "6.0.3"
