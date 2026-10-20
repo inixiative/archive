@@ -83,9 +83,10 @@ const fakeKingdom = () => {
                 },
               ]
             : [],
+          hostedSignetRequests: [],
         });
       }
-      if (action === 'installationSignets') return data({ signets: [] });
+      if (action === 'installationSignets') return data({ signets: [], hostedSignets: [] });
       if (action === 'collectSignet') {
         state.collected++;
         return data({
@@ -109,7 +110,7 @@ const fakeKingdom = () => {
           integrationId,
           provider: 'archive',
           name: 'Laptop Archive',
-          expiresAt: null,
+          expiresAt: new Date(Date.now() + 300000).toISOString(),
           lifecycle: 'ongoing',
           taskId: null,
           currentRevision: 1,
@@ -124,10 +125,24 @@ const fakeKingdom = () => {
                   name: 'Acme Archive',
                   kind: 'archiveLibrary',
                   integrationId: hostedId,
+                  lens: {},
                 },
               ],
             },
           ],
+          holder: {
+            integration: { id: integrationId, name: 'Laptop Archive', provider: 'archive' },
+            owner: {
+              ownerModel: 'Organization',
+              name: 'Acme',
+              organization: { id: owner.organizationId, name: 'Acme', slug: 'acme' },
+              space: null,
+              user: null,
+            },
+            issuedBy: { id: crypto.randomUUID(), name: 'Ada', email: 'ada@acme.example' },
+            webUrl: 'https://kingdom.example',
+            manageUrl: `https://kingdom.example/dashboard?integration=${integrationId}`,
+          },
         });
       return Response.json({}, { status: 404 });
     },
