@@ -46,8 +46,8 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
-    "@inixiative/config": "^0.5.118",
-    "@types/bun": "1.4.2",
+    "@inixiative/config": "^0.5.124",
+    "@types/bun": "1.4.4",
     "lefthook": "2.1.9",
     "typescript": "6.0.3"
   },
@@ -64,7 +64,7 @@
     "access": "public"
   },
   "engines": {
-    "bun": ">=1.4.2"
+    "bun": ">=1.4.4"
   },
-  "packageManager": "bun@1.4.2"
+  "packageManager": "bun@1.4.4"
 }
