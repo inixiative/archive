@@ -298,18 +298,26 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
     for (const o of organizations)
       if (o !== PERSONAL && known.has(o) && !allowed.has(o))
         issues.push(`${label}: no evidence for ${o} in its entries`);
+    // Personal beside an organization, or sensitive at all, is the model unsure: it stays here.
+    const unsure = organizations.includes(PERSONAL) || Boolean(part.sensitive);
+    if (unsure && organizations.some((o) => o !== PERSONAL))
+      notes.push(`${label}: personal or sensitive beside an organization, kept personal`);
     const stored: PlanPart = {
       firstEntryId: idAt(part.from)!,
       lastEntryId: idAt(part.to)!,
-      organizations: organizations.filter((o) => known.has(o)),
-      sensitive: Boolean(part.sensitive) && organizations.every((o) => o === PERSONAL),
+      organizations: unsure ? [PERSONAL] : organizations.filter((o) => known.has(o)),
+      sensitive: Boolean(part.sensitive),
       confidence: part.confidence ?? 0.5,
       rationale: (part.why ?? '').slice(0, 500),
     };
     const last = priorParts.at(-1);
+    // A continuation starts at the first new entry, or it would take in entries no part named.
+    if (i === 0 && part.continues && part.from !== context.from)
+      issues.push(`${label} continues the last part but does not start at E${context.from}`);
     if (
       i === 0 &&
       part.continues &&
+      part.from === context.from &&
       last &&
       context.from > 0 &&
       idAt(context.from - 1) === context.prior?.throughEntryId &&

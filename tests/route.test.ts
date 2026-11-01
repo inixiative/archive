@@ -437,3 +437,86 @@ test('decision runs that died leave nothing behind: their directories and primed
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+const leakContext = (prior?: Parameters<typeof validatePlan>[1]['prior']) => {
+  const entries = [
+    'work',
+    'work',
+    'work',
+    'work',
+    'I am interviewing elsewhere; Vlad is useless',
+    'more',
+    'work',
+    'work',
+  ].map((text, i) => ({ id: `e${i}`, text }));
+  return {
+    entries,
+    routing,
+    map,
+    evidence: {
+      key: 'k',
+      anchors: entries.map((e) => ({ entryId: e.id, writes: { zealot: 1 } })),
+      unattributedWrites: 0,
+    },
+    ...(prior ? { prior } : {}),
+    from: prior ? 3 : 0,
+    through: 7,
+    overrides: { organizations: new Set<string>(), personal: false },
+    children: [],
+    foreign: new Map(),
+  };
+};
+
+test('L1: continuing the last part cannot sweep entries no part names into it', () => {
+  const prior = {
+    parts: [
+      {
+        firstEntryId: 'e0',
+        lastEntryId: 'e2',
+        organizations: ['userevidence'],
+        sensitive: false,
+        confidence: 1,
+        rationale: '',
+      },
+    ],
+    prune: [],
+    redactions: [],
+    rationale: '',
+    throughEntryId: 'e2',
+  };
+  const context = leakContext(prior);
+  const result = validatePlan(
+    plan([{ from: 6, to: 7, organizations: ['userevidence'], continues: true }]),
+    context,
+  );
+  const published =
+    result.status === 'valid'
+      ? publishedParts(result.plan, context.entries, new Map()).flatMap((p) => p.entryIds)
+      : [];
+  expect(published).not.toContain('e4');
+  expect(result.status).toBe('held');
+  // Continuing from the first new entry is fine.
+  expect(
+    validatePlan(
+      plan([{ from: 3, to: 7, organizations: ['userevidence'], continues: true }]),
+      context,
+    ).status,
+  ).toBe('valid');
+});
+
+test('L2: a part naming personal beside an organization stays personal, and keeps its sensitive flag', () => {
+  const context = leakContext();
+  const result = validatePlan(
+    plan([{ from: 0, to: 7, organizations: ['personal', 'userevidence'], sensitive: true }]),
+    context,
+  );
+  if (result.status !== 'valid') throw new Error('expected valid');
+  expect(result.plan.parts[0]).toMatchObject({ organizations: ['personal'], sensitive: true });
+  expect(publishedParts(result.plan, context.entries, new Map())).toEqual([]);
+  // `sensitive` with an organization is the same uncertainty: personal.
+  const flagged = validatePlan(
+    plan([{ from: 0, to: 7, organizations: ['userevidence'], sensitive: true }]),
+    context,
+  );
+  expect(flagged.status === 'valid' && flagged.plan.parts[0]!.organizations).toEqual(['personal']);
+});
