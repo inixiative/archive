@@ -2,8 +2,14 @@ import { expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { collectSessions } from '../src/collector';
-import { evidenceByOrganization, evidencedOrganizations, sessionEvidence } from '../src/evidence';
+import { machineProjectMap } from '../src/agents';
+import { collectSessions, routeSession } from '../src/collector';
+import {
+  evidenceByOrganization,
+  evidencedOrganizations,
+  projectMapKey,
+  sessionEvidence,
+} from '../src/evidence';
 import { type ArchiveEntry, archiveSnapshotSchema } from '../src/index';
 import { freshStore } from './db';
 
@@ -165,4 +171,132 @@ test('a collector sends the session’s cwd, and re-sends an unchanged session w
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('repair computes evidence for Codex rollouts Codex archived, and for a session another project holds, keeping its project', async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'archive-evidence-codex-')));
+  const repo = join(dir, 'repo');
+  const moved = join(dir, 'old-checkout');
+  const home = join(dir, 'codex');
+  for (const d of [repo, moved, join(home, 'sessions'), join(home, 'archived_sessions')])
+    mkdirSync(d, { recursive: true });
+  const store = await freshStore();
+  try {
+    const rollout = (id: string, cwd: string) =>
+      [
+        { type: 'session_meta', payload: { id, cwd, timestamp: '2026-01-01T00:00:00Z' } },
+        {
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Edit it' }],
+          },
+        },
+        {
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'exec_command',
+            call_id: 'c1',
+            arguments: JSON.stringify({ cmd: 'touch src/x.ts', workdir: repo }),
+          },
+        },
+      ]
+        .map((row) => JSON.stringify(row))
+        .join('\n');
+    const archived = '019a0000-0000-7000-8000-000000000001';
+    writeFileSync(
+      join(home, 'archived_sessions', `rollout-${archived}.jsonl`),
+      rollout(archived, repo),
+    );
+    const heldId = '019a0000-0000-7000-8000-000000000002';
+    writeFileSync(join(home, 'sessions', `rollout-${heldId}.jsonl`), rollout(heldId, moved));
+    const collector = {
+      directory: join(home, 'sessions'),
+      source: 'codex' as const,
+      projectId: 'repo',
+      projectRoots: [repo],
+    };
+    // Its old checkout now routes elsewhere (on this machine, an old Desktop path routes to the
+    // catch-all; temp directories never do, so here another project's root stands in).
+    const elsewhere = {
+      directory: join(home, 'sessions'),
+      source: 'codex' as const,
+      projectId: 'other',
+      projectRoots: [moved],
+    };
+    // The held session was captured when its checkout still routed to `repo`.
+    await collectSessions(
+      store,
+      { ...collector, projectRoots: [repo, moved] },
+      { harness: () => undefined },
+    );
+    await store.setProjectMap({
+      projects: [{ projectId: 'repo', roots: [repo], repositories: [] }],
+    });
+    const peers = [collector, elsewhere];
+    for (const c of peers)
+      await collectSessions(store, c, {
+        peers,
+        projects: [collector],
+        harness: () => undefined,
+        repair: true,
+      });
+    const rows = await store.db.archive.findMany({
+      select: { projectId: true, evidence: true, summary: true },
+    });
+    const bySession = new Map(rows.map((r) => [(r.summary as { sessionId: string }).sessionId, r]));
+    expect(bySession.get(archived)?.evidence).toMatchObject({ anchors: [{ writes: { repo: 1 } }] });
+    expect(bySession.get(heldId)).toMatchObject({
+      projectId: 'repo',
+      evidence: { anchors: [{ writes: { repo: 1 } }] },
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('formerRoots resolve a project’s old checkout paths for evidence, and move the map’s key; nothing collects from them', () => {
+  const former = {
+    projects: [
+      {
+        projectId: 'template',
+        roots: ['/w/template'],
+        formerRoots: ['/Users/me/Desktop/template'],
+        repositories: [],
+      },
+    ],
+  };
+  const session = snapshot([call('Edit', { file_path: 'src/a.ts' })]);
+  expect(
+    sessionEvidence(session, new Set(['e0']), former, '/Users/me/Desktop/template').anchors,
+  ).toEqual([{ entryId: 'e0', writes: { template: 1 } }]);
+  expect(projectMapKey(former)).not.toBe(
+    projectMapKey({ projects: [{ ...former.projects[0]!, formerRoots: [] }] }),
+  );
+  expect(
+    machineProjectMap({
+      collectors: [
+        {
+          name: 'claude-code.template',
+          source: 'claude-code',
+          directory: '/h',
+          projectId: 'template',
+          projectRoots: ['/w/template'],
+          formerRoots: ['/Users/me/Desktop/template'],
+        },
+      ],
+    }).projects[0],
+  ).toMatchObject({ roots: ['/w/template'], formerRoots: ['/Users/me/Desktop/template'] });
+  expect(
+    routeSession('/Users/me/Desktop/template', [
+      {
+        directory: '/h',
+        source: 'claude-code',
+        projectId: 'template',
+        projectRoots: ['/w/template'],
+      },
+    ]),
+  ).toBeUndefined();
 });

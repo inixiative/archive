@@ -268,13 +268,6 @@ export class ArchiveStore {
         const settings = await this.settings(tx);
         const lifted = await liftedRunTags(tx, id);
         const unlifted = withoutLifted(incoming, lifted);
-        // Only explicit stamps drop; a run tag a person removed keeps the session.
-        const run = settings.captureRunSessions ? undefined : droppableRun(unlifted);
-        if (run && !lifted.includes(RUN_TAGS[run])) {
-          // The digest is the writer's, so a syncing Archive records the delivery and moves on.
-          await tx.archive.deleteMany({ where: { id } });
-          return { id, digest, revision: 0, changed: false, dropped: RUN_TAGS[run] };
-        }
         const old = await tx.archive.findUnique({ where: { id } });
         const map = await this.projectMap(tx);
         // Evidence comes from the snapshot as its writer sent it, before the strip drops tool calls.
@@ -292,6 +285,29 @@ export class ArchiveStore {
           settings.captureToolCallsAndResults
             ? { snapshot: unlifted, changed: 0 }
             : withoutToolActivity(unlifted, settings.integrations);
+        // Only the stored row's evidence, from its own transcript; its writer's tags (a run stamp
+        // included) never touch the row.
+        if (options.evidenceOnly) {
+          if (old && map && old.transcriptDigest === transcriptDigest(incoming))
+            await tx.archive.update({
+              where: { id },
+              data: evidenceFields(evidenceOf(stripOf().snapshot)),
+            });
+          return {
+            id,
+            digest: old?.digest ?? digest,
+            revision: old?.revision ?? 0,
+            changed: false,
+          };
+        }
+        // Only explicit stamps drop; a run tag a person removed keeps the session.
+        const run = settings.captureRunSessions ? undefined : droppableRun(unlifted);
+        if (run && !lifted.includes(RUN_TAGS[run])) {
+          // A copy held here goes as any delete does: tombstoned, its destinations' deletes queued.
+          if (old) await this.deleteIn(tx, id);
+          // The digest is the writer's, so a syncing Archive records the delivery and moves on.
+          return { id, digest, revision: 0, changed: false, dropped: RUN_TAGS[run] };
+        }
         if (old?.digest === digest) {
           // The same session under a new project map: only its evidence is recomputed.
           if (stale(old))
@@ -871,17 +887,22 @@ export class ArchiveStore {
    *   sends the whole session there unredacted and unpruned (its one part holds every entry);
    * - an id with no row here (deleted, or never kept): never.
    */
-  async copiesToKeep(ids: string[], organizationId: string, routing: Routing) {
+  async copiesToKeep(
+    ids: string[],
+    organizationId: string,
+    routing: Routing,
+    /** The digest the destination holds of each copy, where known (its listing, else the receipt). */
+    held: ReadonlyMap<string, string> = new Map(),
+  ) {
     const keep = new Set<string>();
     const rows = await this.db.archive.findMany({
       where: { id: { in: ids } },
       select: {
         id: true,
-        digest: true,
         partOf: true,
         routedTo: true,
         supersededBy: true,
-        routingPlan: { select: { plan: true, digest: true, due: true } },
+        routingPlan: { select: { plan: true, wholeTo: true, wholeDigests: true } },
       },
     });
     for (const row of rows) {
@@ -896,27 +917,16 @@ export class ArchiveStore {
         row.supersededBy
       )
         continue;
-      const plan = row.routingPlan?.plan ? storedPlanSchema.parse(row.routingPlan.plan) : undefined;
-      if (!plan || row.routingPlan?.digest !== row.digest || row.routingPlan.due === 'partial')
-        continue;
-      const work = plan.parts.filter((p) => p.organizations.some((o) => o !== PERSONAL));
+      // Kept only while the copy is a revision a plan reviewed, stripped, and sent there whole:
+      // later captures don't drop it before the re-plan, and a copy unlike it (one with tool
+      // activity, or of a revision no plan read) goes.
+      const plan = row.routingPlan;
+      const digest = held.get(row.id);
       if (
-        work.length !== 1 ||
-        !work[0]!.organizations.includes(organizationId) ||
-        plan.prune.length ||
-        plan.redactions.length
-      )
-        continue;
-      const parts = await this.db.archive.findMany({
-        where: { partOf: row.id },
-        select: { routedTo: true, summary: true },
-      });
-      const session = await this.plannedSession(row.id);
-      if (
-        parts.length === 1 &&
-        parts[0]!.routedTo.includes(organizationId) &&
-        session &&
-        (parts[0]!.summary as Summary).entries === session.snapshot.entries.length
+        plan?.plan &&
+        plan.wholeTo.includes(organizationId) &&
+        digest &&
+        plan.wholeDigests.includes(digest)
       )
         keep.add(row.id);
     }
@@ -946,6 +956,7 @@ export class ArchiveStore {
       select: {
         archiveId: true,
         destination: true,
+        digest: true,
         archive: {
           select: {
             partOf: true,
@@ -968,6 +979,12 @@ export class ArchiveStore {
   async delete(id: string) {
     return this.db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
+      return this.deleteIn(tx, id);
+    });
+  }
+  /** `delete` inside a transaction that already holds the session's lock. */
+  private async deleteIn(tx: Prisma.TransactionClient, id: string) {
+    {
       const archive = await tx.archive.findUnique({
         where: { id },
         select: {
@@ -1032,7 +1049,7 @@ export class ArchiveStore {
       });
       await tx.archive.delete({ where: { id } });
       return true;
-    });
+    }
   }
   /** Applies the retention setting; returns the deleted archive ids. */
   async prune(now = Date.now()) {
@@ -1761,17 +1778,35 @@ export class ArchiveStore {
   private async routingContext(
     session: NonNullable<Awaited<ReturnType<ArchiveStore['plannedSession']>>>,
     routing: Routing,
+    /** The planner's charter and model (`routeKey`): a plan made under another is re-planned. */
+    key?: string,
   ) {
-    const { row, snapshot, plan } = session;
+    const { row, snapshot } = session;
+    // A plan made under another charter is re-planned from the first entry, window by window
+    // (`rebuild`), while it keeps governing what publishes; its sticky decisions carry over.
+    const governing = session.plan;
+    const decided = row.tagEdits
+      .filter((e) => e.added && e.tag.startsWith(ROUTE_TAG_PREFIX))
+      .map((e) => e.tag)
+      .sort();
+    const recharter = Boolean(governing && key && row.routingPlan && row.routingPlan.key !== key);
+    // A person's decision mid-rebuild applies to the governing plan at once (a re-apply under its
+    // own key); the rebuild goes on afterwards.
+    const deferred =
+      recharter && JSON.stringify(row.routingPlan?.overrides ?? []) !== JSON.stringify(decided);
+    const rebuilding = recharter && !deferred;
+    const stored = row.routingPlan?.rebuild as { key?: string; plan?: unknown } | null | undefined;
+    const plan = rebuilding
+      ? stored?.key === key && stored?.plan
+        ? storedPlanSchema.parse(stored.plan)
+        : undefined
+      : governing;
     const entries = snapshot.entries;
     const map = await this.projectMap();
     const evidence = (row.evidence ?? null) as SessionEvidence | null;
     const at = plan ? entries.findIndex((e) => e.id === plan.throughEntryId) : -1;
     const from = at + 1;
-    const overrideTags = row.tagEdits
-      .filter((e) => e.added && e.tag.startsWith(ROUTE_TAG_PREFIX))
-      .map((e) => e.tag)
-      .sort();
+    const overrideTags = decided;
     const known = new Set(routing.organizations.map((o) => o.id));
     const overrides = {
       organizations: new Set(
@@ -1875,6 +1910,9 @@ export class ArchiveStore {
       parentReach,
       parentIssue,
       parent,
+      governing,
+      rebuilding,
+      deferred,
       parentArchiveId:
         lineage && lineage.kind !== 'part'
           ? this.relatedId(snapshot, lineage.parentSessionId)
@@ -1887,10 +1925,10 @@ export class ArchiveStore {
    * What the routing planner reads for one session: the entries since its plan (up to a budget,
    * each clipped), with their evidence and whether they quote another session, and the context.
    */
-  async routingInput(archiveId: string, routing: Routing): Promise<RoutingInput> {
+  async routingInput(archiveId: string, routing: Routing, key?: string): Promise<RoutingInput> {
     const session = await this.plannedSession(archiveId);
     if (!session) throw new Error('Archive unavailable');
-    const context = await this.routingContext(session, routing);
+    const context = await this.routingContext(session, routing, key);
     const { row, snapshot } = session;
     const { entries, evidence, map, plan, from } = context;
     const clip = (text: string, max: number) =>
@@ -2010,9 +2048,9 @@ export class ArchiveStore {
   ): Promise<RecordPlanResult> {
     const session = await this.plannedSession(body.archiveId);
     if (!session) throw new Error('Archive unavailable');
-    const context = await this.routingContext(session, routing);
+    const context = await this.routingContext(session, routing, body.key);
     const { row, snapshot } = session;
-    const { entries, plan: prior } = context;
+    const { entries, plan: prior, governing, rebuilding, deferred } = context;
     // The planner's indices describe the session as it read it.
     if (row.digest !== body.digest) return { status: 'stale' };
     // Nothing new to plan re-applies the plan as it stands (a person's decision changed).
@@ -2022,7 +2060,8 @@ export class ArchiveStore {
       return { status: 'stale' };
     const record = {
       contextKey: await this.routingContextKey(routing),
-      key: body.key,
+      // A decision applied mid-rebuild keeps the governing plan's key: the rebuild resumes.
+      key: deferred ? row.routingPlan!.key : body.key,
       by: body.by,
       digest: row.digest,
       // A plan that covers only part of the session (a window) leaves it due.
@@ -2041,6 +2080,8 @@ export class ArchiveStore {
           notes,
           reviewedAt: null,
           due: null,
+          // A re-plan under a new charter that holds stops there; the plan it was replacing stands.
+          rebuild: Prisma.DbNull,
         };
         const recorded = await this.underSessionLock(body.archiveId, body.digest, (tx) =>
           tx.routingPlan.upsert({
@@ -2078,14 +2119,40 @@ export class ArchiveStore {
       children: context.children,
       ...(context.parentReach ? { parentReach: context.parentReach } : {}),
       foreign: context.foreign,
+      ...(rebuilding && governing ? { sensitive: sensitiveEntries(governing, entries) } : {}),
     });
     if (result.status === 'held') return { ...(await hold(result.issues, result.notes)), holds };
-    const published = publishedParts(
-      result.plan,
-      entries,
-      context.foreign,
-      sensitiveEntries(result.plan, entries),
-    );
+    // A re-plan keeps the decisions of the plan it replaces: its prunes, redactions and sensitive
+    // personal entries stay.
+    if (rebuilding && governing) {
+      result.plan.prune = [
+        ...new Map([...governing.prune, ...result.plan.prune].map((p) => [p.entryId, p])).values(),
+      ];
+      result.plan.redactions = [
+        ...new Map(
+          [...governing.redactions, ...result.plan.redactions].map((r) => [
+            JSON.stringify([r.entryId, r.text]),
+            r,
+          ]),
+        ).values(),
+      ];
+    }
+    const sticky = sensitiveEntries(result.plan, entries);
+    // Until the re-plan reaches the last entry, it is stored aside and the old plan governs.
+    if (rebuilding && body.through < entries.length - 1 && !body.dryRun) {
+      const recorded = await this.underSessionLock(body.archiveId, body.digest, (tx) =>
+        tx.routingPlan.update({
+          where: { archiveId: body.archiveId },
+          data: {
+            rebuild: { key: body.key, plan: result.plan } as Prisma.InputJsonValue,
+            due: 'charter',
+          },
+        }),
+      );
+      if (!recorded) return { status: 'stale' };
+      return { status: 'valid', notes: result.notes, parts: [], holds };
+    }
+    const published = publishedParts(result.plan, entries, context.foreign, sticky);
     const projectsOf = (organizations: string[]) =>
       new Set(
         routing.organizations
@@ -2113,12 +2180,34 @@ export class ArchiveStore {
     // A delta that only moves `through` changes nothing a person reviewed.
     const decisions = (plan?: StoredPlan) =>
       plan && JSON.stringify([plan.parts, plan.prune, plan.redactions]);
-    const changed = decisions(prior) !== decisions(result.plan);
+    const changed = decisions(rebuilding ? governing : prior) !== decisions(result.plan);
+    // The organizations this plan sends the whole reviewed revision to, unredacted and unpruned,
+    // and the stripped digests of the revisions plans sent whole there: a whole copy a destination
+    // holds of one of those is kept under `cleanup: leaked` with publishing off.
+    const all = entries.map((e) => e.id);
+    const whole =
+      body.through === entries.length - 1 &&
+      !result.plan.redactions.length &&
+      published.length === 1 &&
+      published[0]!.entryIds.length === all.length
+        ? [...published[0]!.organizations].sort()
+        : [];
+    const previous = row.routingPlan;
+    const sameWhole =
+      previous && JSON.stringify([...previous.wholeTo].sort()) === JSON.stringify(whole);
+    const wholeDigests = whole.length
+      ? [...new Set([...(sameWhole ? previous.wholeDigests : []), snapshotDigest(snapshot)])].slice(
+          -50,
+        )
+      : [];
     const version = (row.routingPlan?.version ?? 0) + (changed ? 1 : 0);
     const fields = {
       ...record,
       status: 'valid',
       plan: result.plan as Prisma.InputJsonValue,
+      ...(deferred ? {} : { rebuild: Prisma.DbNull }),
+      wholeTo: whole,
+      wholeDigests,
       attempt: Prisma.DbNull,
       issues: [],
       notes: result.notes,
@@ -2238,6 +2327,8 @@ export class ArchiveStore {
     withoutParents?: boolean;
     /** The current `routingContextKey`: a plan validated under another is due to re-validate. */
     contextKey?: string;
+    /** The planner's current charter and model (`routeKey`): a plan made under another is due. */
+    planKey?: string;
   }) {
     const now = input.now ?? Date.now();
     const interval = input.intervalMs ?? 60 * 60_000;
@@ -2256,6 +2347,9 @@ export class ArchiveStore {
           ...(input.unplanned || !input.contextKey
             ? []
             : [{ routingPlan: { contextKey: { not: input.contextKey } } }]),
+          ...(input.unplanned || !input.planKey
+            ? []
+            : [{ routingPlan: { key: { not: input.planKey } } }]),
         ],
       },
       select: {
@@ -2265,7 +2359,7 @@ export class ArchiveStore {
         capturedAt: true,
         summary: true,
         tagEdits: true,
-        routingPlan: { select: { due: true, at: true, contextKey: true } },
+        routingPlan: { select: { due: true, at: true, contextKey: true, key: true } },
       },
     });
     const parentOf = (summary: Summary) =>
@@ -2299,7 +2393,9 @@ export class ArchiveStore {
         plan?.due ??
         (plan && input.contextKey && plan.contextKey !== input.contextKey
           ? 'context'
-          : 'unplanned');
+          : plan && input.planKey && plan.key !== input.planKey
+            ? 'charter'
+            : 'unplanned');
       if (plan && reason === 'new entries') {
         const offset = Number.parseInt(digest(row.id).slice(0, 8), 16) % (stagger + 1);
         const pausedNow = now - row.capturedAt >= paused;
@@ -2434,7 +2530,16 @@ const dropRevision = (
  * digest; checked when given), `cwd` (the session's working directory, for evidence), `restore`
  * (lift this session's tombstone: the writer means to bring a deleted session back).
  */
-export type CaptureOptions = { previousDigest?: string | null; cwd?: string; restore?: boolean };
+export type CaptureOptions = {
+  previousDigest?: string | null;
+  cwd?: string;
+  restore?: boolean;
+  /**
+   * Only recompute the stored row's evidence from this snapshot, when its transcript (source,
+   * session, entries) is the row's: for a session another project holds. Nothing else changes.
+   */
+  evidenceOnly?: boolean;
+};
 
 /** A capture that lost a race or arrived out of order; the server answers 409. */
 export class ArchiveConflict extends Error {}

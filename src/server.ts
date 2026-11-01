@@ -40,6 +40,8 @@ const ingestSchema = z.strictObject({
   cwd: z.string().max(4096).refine(isAbsolute).optional(),
   /** The writer brings a session deleted here back on purpose (a part a re-plan restored). */
   restore: z.boolean().optional(),
+  /** Only recompute the stored row's evidence (a session another project holds). */
+  evidenceOnly: z.boolean().optional(),
 });
 const archiveId = z.string().regex(/^[a-f0-9]{64}$/);
 const filterFields = {
@@ -78,6 +80,9 @@ const suggestionQueueSchema = z.strictObject({
 });
 const suggestionRecordSchema = z.strictObject({ results: z.array(z.unknown()).max(500) });
 const routingInputSchema = z.strictObject({ archiveId });
+const routingInputBodySchema = routingInputSchema.extend({
+  key: z.string().min(1).max(128).optional(),
+});
 const recordPlanSchema = z.strictObject({
   archiveId,
   digest: z.string().regex(/^[a-f0-9]{64}$/),
@@ -94,6 +99,7 @@ const routingDueSchema = z.strictObject({
   now: z.number().optional(),
   unplanned: z.boolean().optional(),
   withoutParents: z.boolean().optional(),
+  planKey: z.string().min(1).max(128).optional(),
 });
 const routingPlansSchema = z.strictObject({
   all: z.boolean().optional(),
@@ -180,12 +186,13 @@ export function createArchiveHandler(
         return json({ data: { sourceId: await store.sourceId(), protocol: 2 } });
       }
       if (path === '/api/v1/archive/ingest') {
-        const { snapshot, previousDigest, cwd, restore } = ingestSchema.parse(body);
+        const { snapshot, previousDigest, cwd, restore, evidenceOnly } = ingestSchema.parse(body);
         return json({
           data: await store.capture(snapshot, {
             previousDigest,
             ...(cwd ? { cwd } : {}),
             ...(restore ? { restore } : {}),
+            ...(evidenceOnly ? { evidenceOnly } : {}),
           }),
         });
       }
@@ -335,10 +342,14 @@ export function createArchiveHandler(
       }
       if (config && path === '/api/v1/archive/routing/input')
         return json({
-          data: await store.routingInput(
-            routingInputSchema.parse(body).archiveId,
-            readRouting(config.destinationsFile),
-          ),
+          data: await (async () => {
+            const input = routingInputBodySchema.parse(body);
+            return store.routingInput(
+              input.archiveId,
+              readRouting(config.destinationsFile),
+              input.key,
+            );
+          })(),
         });
       if (config && path === '/api/v1/archive/routing/record')
         return json({

@@ -206,6 +206,14 @@ test('routes and sync run against the Archive server of the home, without DATABA
       ],
     });
     expect(await cli('cleanup')).toEqual({ cleanup: 'off', cleanupFor: {} });
+    // Without an organization, leaked or all must name every organization on purpose.
+    await expect(cli('cleanup leaked')).rejects.toThrow();
+    expect(await cli('cleanup off')).toEqual({ cleanup: 'off', cleanupFor: {} });
+    expect(await cli('cleanup all --all-organizations')).toEqual({
+      cleanup: 'all',
+      cleanupFor: {},
+    });
+    expect(await cli('cleanup off')).toEqual({ cleanup: 'off', cleanupFor: {} });
     expect(await cli('cleanup inixiative leaked')).toEqual({
       cleanup: 'off',
       cleanupFor: { inixiative: 'leaked' },
