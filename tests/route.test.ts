@@ -153,22 +153,17 @@ test('validation narrows, never widens: closed organizations, evidence per part,
       context,
     ).status,
   ).toBe('held');
-  expect(
-    validatePlan(
-      plan([{ from: 2, to: 3, organizations: ['userevidence'] }], {
-        redactions: [{ entry: 2, text: 'x', reason: 'coworker' }],
-      }),
+  // A redaction that misses its entry, or names no listed reason, holds that part only: personal.
+  for (const redaction of [
+    { entry: 2, text: 'x', reason: 'coworker' },
+    { entry: 2, text: 'c', reason: 'gossip' },
+  ]) {
+    const result = validatePlan(
+      plan([{ from: 2, to: 3, organizations: ['userevidence'] }], { redactions: [redaction] }),
       context,
-    ).status,
-  ).toBe('held');
-  expect(
-    validatePlan(
-      plan([{ from: 2, to: 3, organizations: ['userevidence'] }], {
-        redactions: [{ entry: 2, text: 'c', reason: 'gossip' }],
-      }),
-      context,
-    ).status,
-  ).toBe('held');
+    );
+    expect(result.status === 'valid' && result.plan.parts[0]!.organizations).toEqual(['personal']);
+  }
   // A person's decision is evidence; their `route:personal` keeps everything here.
   expect(
     validatePlan(plan([{ from: 0, to: 1, organizations: ['inixiative'] }]), {
@@ -528,6 +523,7 @@ test('L1: continuing the last part cannot sweep entries no part names into it', 
     rationale: '',
     throughEntryId: 'e2',
     sensitive: [],
+    heldForReview: [],
   };
   const context = leakContext(prior);
   const result = validatePlan(
@@ -723,6 +719,7 @@ test('S4: prior parts are re-validated on every plan: an organization that lost 
     rationale: '',
     throughEntryId: 'e1',
     sensitive: [],
+    heldForReview: [],
   };
   const result = validatePlan(plan([]), {
     entries,
@@ -773,6 +770,7 @@ test('R1: a continuing part is held to the clip check too', () => {
     rationale: '',
     throughEntryId: 'e2',
     sensitive: [],
+    heldForReview: [],
   };
   const result = validatePlan(
     plan([{ from: 3, to: 4, organizations: ['userevidence'], continues: true }]),
@@ -959,4 +957,162 @@ test('a person’s route: decision during a rebuild applies to the governing pla
   const row = await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } });
   expect(row.key).toBe(routeKey('old'));
   expect(row.rebuild).not.toBeNull();
+});
+
+test('(1) a part with organizations [] is personal, never an unparseable plan', () => {
+  const parsed = parsePlan(
+    '{"parts":[{"from":0,"to":1,"organizations":[]},{"from":2,"to":3,"organizations":["userevidence"]}]}',
+  );
+  expect(parsed?.parts).toHaveLength(2);
+  const entries = ['a', 'b', 'c', 'd'].map((text, i) => ({ id: `e${i}`, text }));
+  const result = validatePlan(parsed!, {
+    entries,
+    routing,
+    map,
+    evidence: {
+      key: 'k',
+      anchors: entries.map((e) => ({ entryId: e.id, writes: { zealot: 1 } })),
+      unattributedWrites: 0,
+    },
+    from: 0,
+    through: 3,
+    overrides: { organizations: new Set(), personal: false },
+    children: [],
+    foreign: new Map(),
+  });
+  expect(result.status === 'valid' && result.plan.parts.map((p) => p.organizations)).toEqual([
+    ['personal'],
+    ['userevidence'],
+  ]);
+});
+
+test('(2) a redaction that misses its entry holds only its own part; the rest publishes, and a subagent follows the part at its spawn', async () => {
+  const { store, archive } = await setup();
+  const root = session('partly', [
+    { kind: 'user', text: 'Fix zealot' },
+    { kind: 'tool-call', text: JSON.stringify({ name: 'Agent', input: { description: 'port' } }) },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant', text: 'Fixed' },
+    { kind: 'user', text: 'Vlad is useless, now the docs' },
+    call({ file_path: '/z/docs.md' }),
+    { kind: 'assistant', text: 'Docs done' },
+  ]);
+  root.entries[1]!.callId = 'toolu_partly';
+  const { id } = await store.capture(root, { cwd: '/z' });
+  const child = session(
+    'partly/agent-a',
+    [
+      { kind: 'event', text: 'Port' },
+      call({ file_path: '/z/b.ts' }),
+      { kind: 'assistant', text: 'Ported' },
+    ],
+    {
+      lineage: {
+        kind: 'subagent',
+        parentSessionId: 'partly',
+        rootSessionId: 'partly',
+        toolUseId: 'toolu_partly',
+      },
+    },
+  );
+  const { id: childId } = await store.capture(child, { cwd: '/z' });
+  // Stripped: E0 user, E1 spawn, E2 assistant, E3 user, E4 assistant.
+  const { model } = scripted([
+    plan(
+      [
+        { from: 0, to: 2, organizations: ['userevidence'] },
+        { from: 3, to: 4, organizations: ['userevidence'] },
+      ],
+      { redactions: [{ entry: 3, text: 'Vlad is a useless', reason: 'coworker' }] },
+    ),
+    plan([{ from: 0, to: 1, organizations: ['userevidence'] }]),
+  ]);
+  const result = await planSession(archive, model, id);
+  expect(result.status).toBe('valid');
+  expect(result.parts?.map((p) => [p.sessionId, p.organizations])).toEqual([
+    ['partly#part-partly-0', ['userevidence']],
+  ]);
+  expect(result.notes?.some((n) => n.startsWith('held part E3–E4'))).toBe(true);
+  expect((await store.routingPlans({ limit: 5 })).map((p) => p.archiveId)).toContain(id);
+  expect((await planSession(archive, model, childId)).status).toBe('valid');
+});
+
+test('(3) a published part redacts an echo of a coworker remark through the organization’s roster', async () => {
+  const { store, archive } = await setup();
+  const s = session('echoed', [
+    { kind: 'user', text: 'Review PR 4590. ugh, vlad deleted a bunch of my work again' },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant', text: 'Sorry Vlad deleted a bunch of your work; restored it.' },
+  ]);
+  const { id } = await store.capture(s, { cwd: '/z' });
+  const { model } = scripted([
+    plan([{ from: 0, to: 1, organizations: ['userevidence'] }], {
+      redactions: [{ entry: 0, text: 'vlad deleted a bunch of my work again', reason: 'coworker' }],
+    }),
+  ]);
+  expect((await planSession(archive, model, id)).status).toBe('valid');
+  const [part] = await store.list({ exempt: 'include', parts: 'only' });
+  const text = (await store.read(part!.id))!.snapshot.entries.map((e) => e.text).join('\n');
+  expect(text.toLowerCase()).not.toContain('vlad');
+  expect(text).toContain('Review PR 4590.');
+});
+
+test('P1: a redaction that fails validation still redacts its echoes in every other part', async () => {
+  const { store, archive } = await setup();
+  const s = session('neighbour', [
+    { kind: 'user', text: 'Vlad deleted my work again, port it' },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant', text: 'Porting' },
+    { kind: 'user', text: 'and the docs' },
+    call({ file_path: '/z/d.md' }),
+    { kind: 'assistant', text: 'Sorry Vlad deleted your work again; ported anyway.' },
+  ]);
+  const { id } = await store.capture(s, { cwd: '/z' });
+  // Stripped: E0 user, E1 assistant, E2 user, E3 assistant. The quote is off by case.
+  const { model } = scripted([
+    plan(
+      [
+        { from: 0, to: 1, organizations: ['userevidence'] },
+        { from: 2, to: 3, organizations: ['userevidence'] },
+      ],
+      { redactions: [{ entry: 0, text: 'vlad deleted my work again', reason: 'coworker' }] },
+    ),
+  ]);
+  expect((await planSession(archive, model, id)).status).toBe('valid');
+  const parts = await store.list({ exempt: 'include', parts: 'only' });
+  expect(parts).toHaveLength(1);
+  const text = (await store.read(parts[0]!.id))!.snapshot.entries.map((e) => e.text).join('\n');
+  expect(text).not.toMatch(/vlad/i);
+  expect(text).toContain('and the docs');
+});
+
+test('a part held for a bad redaction stays personal through a rebuild until a person reviews it', async () => {
+  const { store } = await setup();
+  const s = session('sticky-held', [
+    { kind: 'user', text: 'Vlad broke it, fix zealot' },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant', text: 'Fixed' },
+  ]);
+  const { id } = await store.capture(s, { cwd: '/z' });
+  const record = async (key: string, proposal: ProposedPlan) => {
+    const input = await store.routingInput(id, routing, key);
+    return store.recordPlan(
+      { archiveId: id, digest: input.digest, through: input.total - 1, key, by: key, proposal },
+      routing,
+    );
+  };
+  const misquoted = plan([{ from: 0, to: 1, organizations: ['userevidence'] }], {
+    redactions: [{ entry: 0, text: 'vlad broke it', reason: 'coworker' }],
+  });
+  expect(await record('A', misquoted)).toMatchObject({ status: 'valid', parts: [] });
+  // A new charter tries to send the held part to UE with no redaction: it holds.
+  expect(
+    await record('B', plan([{ from: 0, to: 1, organizations: ['userevidence'] }])),
+  ).toMatchObject({ status: 'held' });
+  expect((await store.routingPlans({ limit: 5 })).map((p) => p.archiveId)).toContain(id);
+  // Once a person has reviewed it, a later plan may route it.
+  await store.reviewPlan(id);
+  expect(
+    await record('C', plan([{ from: 0, to: 1, organizations: ['userevidence'] }])),
+  ).toMatchObject({ status: 'valid' });
 });

@@ -86,6 +86,7 @@ export const storedPlanSchema = z.strictObject({
         entryId: z.string().min(1).max(256),
         text: z.string().min(1).max(2_000),
         reason: z.enum(REDACTION_REASONS),
+        echoOnly: z.boolean().optional(),
       }),
     )
     .max(5_000),
@@ -97,6 +98,11 @@ export const storedPlanSchema = z.strictObject({
    * sticky, they never publish, and a work part over one holds.
    */
   sensitive: z.array(z.string().min(1).max(256)).max(50_000).default([]),
+  /**
+   * Entries of parts held for a redaction that failed: sticky like sensitive ones until a person
+   * reviews the plan (`route review`).
+   */
+  heldForReview: z.array(z.string().min(1).max(256)).max(50_000).default([]),
 });
 export type PlanPart = z.infer<typeof planPartSchema>;
 export type StoredPlan = z.infer<typeof storedPlanSchema>;
@@ -108,7 +114,8 @@ export const proposedPlanSchema = z.object({
       z.object({
         from: z.number().int().nonnegative(),
         to: z.number().int().nonnegative(),
-        organizations: z.array(z.string()).min(1).max(50),
+        /** Empty means personal. */
+        organizations: z.array(z.string()).max(50),
         sensitive: z.boolean().optional(),
         continues: z.boolean().optional(),
         confidence: z.number().min(0).max(1).optional(),
@@ -272,6 +279,8 @@ export type ValidationContext = {
   clipped?: ReadonlySet<string>;
   /** Sensitive entries of plans this one replaces (a rebuild's governing plan): sticky. */
   sensitive?: ReadonlySet<string>;
+  /** Entries those plans hold for review: sticky until a person reviews. */
+  held?: ReadonlySet<string>;
   /** A person's `route:` decisions: evidence for those organizations, or everything personal. */
   overrides: { organizations: ReadonlySet<string>; personal: boolean };
   children: ChildEvidence[];
@@ -315,14 +324,50 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
       context.overrides.organizations,
     );
   };
-  const stickySensitive = new Set([
+  // Sticky from earlier plans: sensitive entries (kept for good) and entries held for review
+  // (kept until a person reviews); a work part over either holds.
+  const priorSensitive = new Set([
     ...(context.sensitive ?? []),
-    ...sensitiveEntries(context.prior, entries),
+    ...sensitiveEntries(context.prior, entries, false),
   ]);
+  const priorHeld = new Set([...(context.held ?? []), ...(context.prior?.heldForReview ?? [])]);
+  const stickySensitive = new Set([...priorSensitive, ...priorHeld]);
   const parts: PlanPart[] = [];
   let previousEnd = context.from - 1;
   let continued: PlanPart | undefined;
   const priorParts = context.prior?.parts ?? [];
+  // A redaction that doesn't match its entry holds the part holding that entry, nothing else: that
+  // part stays personal and goes to review. One outside the entries planned holds the plan.
+  const heldParts = new Map<number, string>();
+  const redactions: Redaction[] = [...(context.prior?.redactions ?? [])];
+  for (const r of proposal.redactions) {
+    const entry = entries[r.entry];
+    const reason = REDACTION_REASONS.find((x) => x === r.reason);
+    if (!entry || !inWindow(r.entry)) {
+      issues.push(`redaction in E${r.entry} is outside the entries planned`);
+      continue;
+    }
+    const problem = !reason
+      ? `its redaction in E${r.entry} has no listed reason (${r.reason})`
+      : !r.text || r.text.length > 2_000 || !entry.text.includes(r.text)
+        ? `its redaction in E${r.entry} does not match the entry text byte for byte`
+        : undefined;
+    if (!problem) {
+      redactions.push({ entryId: entry.id, text: r.text, reason: reason! });
+      continue;
+    }
+    // Its text still goes wherever an echo of it appears, in every part.
+    if (r.text && r.text.length <= 2_000)
+      redactions.push({
+        entryId: entry.id,
+        text: r.text,
+        reason: reason ?? 'other',
+        echoOnly: true,
+      });
+    const holder = proposal.parts.findIndex((p) => p.from <= r.entry && r.entry <= p.to);
+    if (holder >= 0 && !heldParts.has(holder)) heldParts.set(holder, problem);
+    else if (holder < 0) notes.push(`${problem}, in no part: kept as an echo-only redaction`);
+  }
   for (const [i, part] of proposal.parts.entries()) {
     const label = `part E${part.from}–E${part.to}`;
     if (part.from > part.to || !inWindow(part.from) || !inWindow(part.to)) {
@@ -331,7 +376,13 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
     }
     if (part.from <= previousEnd) issues.push(`${label} overlaps the part before it`);
     previousEnd = Math.max(previousEnd, part.to);
-    const organizations = [...new Set(part.organizations)];
+    const held = heldParts.get(i);
+    if (held) notes.push(`held part E${part.from}–E${part.to}: ${held}`);
+    const organizations = held
+      ? [PERSONAL]
+      : part.organizations.length
+        ? [...new Set(part.organizations)]
+        : [PERSONAL];
     const unknown = organizations.filter((o) => !known.has(o));
     if (unknown.length) issues.push(`${label} names unknown organizations: ${unknown.join(', ')}`);
     const allowed = allowedFor(entries.slice(part.from, part.to + 1));
@@ -365,6 +416,7 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
     if (
       i === 0 &&
       part.continues &&
+      !held &&
       part.from === context.from &&
       last &&
       context.from > 0 &&
@@ -377,17 +429,6 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
       continue;
     }
     parts.push(stored);
-  }
-  const redactions: Redaction[] = [...(context.prior?.redactions ?? [])];
-  for (const r of proposal.redactions) {
-    const entry = entries[r.entry];
-    const reason = REDACTION_REASONS.find((x) => x === r.reason);
-    if (!entry || !inWindow(r.entry))
-      issues.push(`redaction in E${r.entry} is outside the entries planned`);
-    else if (!reason) issues.push(`redaction in E${r.entry} has no listed reason (${r.reason})`);
-    else if (!r.text || r.text.length > 2_000 || !entry.text.includes(r.text))
-      issues.push(`redaction in E${r.entry} does not match the entry text byte for byte`);
-    else redactions.push({ entryId: entry.id, text: r.text, reason });
   }
   const proposedPrune = new Set(proposal.prune.map((p) => idAt(p.entry)));
   for (const part of continued ? [continued, ...parts] : parts)
@@ -440,8 +481,14 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
     rationale: (proposal.rationale || context.prior?.rationale || '').slice(0, 1_000),
     throughEntryId: idAt(context.through)!,
     sensitive: [],
+    heldForReview: [],
   };
-  plan.sensitive = [...new Set([...stickySensitive, ...sensitiveEntries(plan, entries)])];
+  plan.sensitive = [...new Set([...priorSensitive, ...sensitiveEntries(plan, entries, false)])];
+  // A part held for a bad redaction stays personal until a person reviews the plan.
+  const held = proposal.parts.flatMap((p, i) =>
+    heldParts.has(i) ? entries.slice(p.from, p.to + 1).map((e) => e.id) : [],
+  );
+  plan.heldForReview = [...new Set([...priorHeld, ...held])];
   return { status: 'valid', plan, notes };
 }
 
@@ -500,8 +547,13 @@ export function publishedParts(
 export function sensitiveEntries(
   plan: StoredPlan | undefined,
   entries: Pick<ArchiveEntry, 'id'>[],
+  /** With the entries held for review (default): everything that may not publish yet. */
+  withHeld = true,
 ) {
-  const ids = new Set<string>(plan?.sensitive ?? []);
+  const ids = new Set<string>([
+    ...(plan?.sensitive ?? []),
+    ...(withHeld ? (plan?.heldForReview ?? []) : []),
+  ]);
   if (!plan) return ids;
   const index = new Map(entries.map((e, i) => [e.id, i]));
   for (const part of plan.parts) {

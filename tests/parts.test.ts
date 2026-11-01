@@ -168,3 +168,73 @@ test('S6: a part carries only its organizations’ project tags and no whole-ses
   expect(part.goalIds).toEqual([]);
   expect(part.runIds).toEqual([]);
 });
+
+test('(3) echoes are redacted: case and whitespace variants, shared runs of four words, and a roster name’s clause', () => {
+  const s = session('echo', [
+    { kind: 'user', text: 'ugh, vlad deleted a bunch of my work again. Ship the fix.' },
+    {
+      kind: 'assistant',
+      text: 'Sorry Vlad deleted a bunch of your work; restored it. Ship the fix.',
+    },
+    { kind: 'assistant', text: 'UGH,  VLAD deleted a bunch of my\nwork again' },
+    { kind: 'assistant', text: 'Grant reviewed the PR.' },
+  ]);
+  const part = partSnapshot(
+    s,
+    {
+      firstEntryId: 'e0',
+      lastEntryId: 'e3',
+      entryIds: ['e0', 'e1', 'e2', 'e3'],
+      projects: new Set(),
+      roster: ['Vlad', 'Grant'],
+    },
+    [{ entryId: 'e0', text: 'vlad deleted a bunch of my work again', reason: 'coworker' }],
+  );
+  const texts = part.entries.map((e) => e.text);
+  for (const text of texts.slice(0, 3)) expect(text.toLowerCase()).not.toContain('vlad');
+  expect(texts[0]).toContain('Ship the fix.');
+  expect(texts[1]).toContain('Ship the fix.');
+  // A roster name the redactions never touched stays.
+  expect(texts[3]).toBe('Grant reviewed the PR.');
+});
+
+test('P2: the roster clause fires only for coworker redactions and matches the name as written', () => {
+  const s = session('grant', [
+    { kind: 'user', text: 'I applied for a grant at UE' },
+    {
+      kind: 'assistant',
+      text: 'Issue the Signet grant to the Foundry. Revoke the grant on deletion.',
+    },
+    { kind: 'assistant', text: 'Grant broke the build again; fixed it.' },
+  ]);
+  const part = partSnapshot(
+    s,
+    {
+      firstEntryId: 'e0',
+      lastEntryId: 'e2',
+      entryIds: ['e0', 'e1', 'e2'],
+      projects: new Set(),
+      roster: ['Grant'],
+    },
+    [{ entryId: 'e0', text: 'I applied for a grant at UE', reason: 'career' }],
+  );
+  expect(part.entries[1]!.text).toBe(
+    'Issue the Signet grant to the Foundry. Revoke the grant on deletion.',
+  );
+  expect(part.entries[2]!.text).toBe('Grant broke the build again; fixed it.');
+  const coworker = partSnapshot(
+    s,
+    {
+      firstEntryId: 'e0',
+      lastEntryId: 'e2',
+      entryIds: ['e0', 'e1', 'e2'],
+      projects: new Set(),
+      roster: ['Grant'],
+    },
+    [{ entryId: 'e2', text: 'Grant broke the build again', reason: 'coworker' }],
+  );
+  expect(coworker.entries[1]!.text).toBe(
+    'Issue the Signet grant to the Foundry. Revoke the grant on deletion.',
+  );
+  expect(coworker.entries[2]!.text).not.toContain('Grant');
+});

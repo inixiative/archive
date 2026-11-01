@@ -119,3 +119,32 @@ Every other case is unchanged. In particular 01b0bda06a and 40b206fa84 have writ
 - **Tokens.** 9 runs, 117 planner calls, 4.81M tokens: 4.43M cache writes, 0.35M cache reads and 32k output. Each run was about 0.53M. Nearly all of it is cold prefix writes, since every session is a different prompt.
 - **Window.** The five-hour window went from 0% to 9% over the 9 runs, and the seven-day window from 27% to 28%.
 - **Review.** The design reviews took 2 Opus agent passes, about 0.3M tokens.
+
+## Code fixes re-run (2026-11-01, `fix/planner-robustness`)
+
+Two runs on the shipped charter (`v0-baseline.txt`, sha `1f99358a`), on this branch's code: (1) `organizations: []` reads as personal; (2) a redaction that misses its entry holds only its part; (3) echo redaction (case- and whitespace-insensitive matches, shared runs of four words, a roster name's clause). Same runner, cases and model as above; 13 calls and ~0.52M tokens each; the five-hour window went 13% → 14%, the seven-day window stayed at 29%. Labels as revised: 1d3942e03f passes as UE alone or UE + inixiative; 40b206fa84 is acceptable if its UE part covers only the Zealot-worktree stretch.
+
+| Case | V0 a | V0 b | fix a | fix b |
+|---|---|---|---|---|
+| ae88b51ff2 personal | P | P | H¹ | H¹ |
+| 65fa49fe13 personal | H | H | H (no evidence for inixiative) | P |
+| 512aaec0a6 split | P | P | P | f (one inixiative part; opener unsplit, 4 markers reach inixiative) |
+| 671481a4f6 UE | P | P | P | P |
+| 95a4acd0e0 UE | P | P | P | P |
+| 382e18e4cb UE (subagent) | P | P | P | P |
+| 388f6c08c7 UE | P | P | P | P |
+| 1d3942e03f UE or UE+inixiative (subagent) | P | f\* | f\* (parent → inixiative) | P |
+| 6b93e47069 inixiative (subagent) | P | P | P | P |
+| 01b0bda06a UE + inixiative, split, redacted | f | f | f² | f (no redaction proposed; "vlad deleted" reaches both) |
+| 40b206fa84 mixed | f | f | f (E0–E159 all to UE) | f (E0–E159 to both) |
+| **Passed (pre-registered scoring)** | **8/11** | **7/11** | **6/11** | **7/11** |
+| Passed, a no-evidence hold read as personal | 8/11 | 7/11 | 7/11 | 8/11 |
+| Held | 1 | 1 | 2 | 1 |
+
+1. Held by the no-evidence check (#33): no model call and nothing publishes, which is this case's expected outcome. The pre-registered scoring counts every hold as a fail.
+2. The proposal sent E0–E133 to both organizations and redacted the Vlad remark in E0, plus a second span in E11 that missed its entry. The new per-part hold kept that one part personal, so nothing reached any organization. Re-validated offline with only the matching redaction, the part publishes 127 entries to both organizations with no "vlad" left anywhere: echo redaction removed the assistant's paraphrase in E1, which the exact-span rule let through.
+
+**Reading.**
+- The code fixes do what they target: no answer was rejected as unparseable in either run, one bad redaction no longer holds a whole plan, and an echo of a redacted remark no longer publishes.
+- The remaining failures are planner judgments: 512aaec0a6 (opener unsplit in run b), 01b0bda06a (one part to both organizations, and no redaction in run b) and 40b206fa84 (the whole session to UE or to both, never only the Zealot-worktree stretch).
+- 1d3942e03f still follows its 13k-entry parent's reach, which varies run to run.

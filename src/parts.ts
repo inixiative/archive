@@ -13,7 +13,17 @@ export const REDACTION_REASONS = [
 ] as const;
 export type RedactionReason = (typeof REDACTION_REASONS)[number];
 /** A span of an entry, byte for byte, and why it is replaced. */
-export type Redaction = { entryId: string; text: string; reason: RedactionReason };
+/**
+ * A span of an entry, byte for byte, and why it is replaced. `echoOnly`: a redaction that failed
+ * validation (its text isn't the entry's byte for byte); its text is still removed wherever an echo
+ * of it appears, ignoring case and whitespace.
+ */
+export type Redaction = {
+  entryId: string;
+  text: string;
+  reason: RedactionReason;
+  echoOnly?: boolean;
+};
 
 /**
  * The text with every occurrence of every redaction's span replaced, the spans found on the
@@ -22,14 +32,16 @@ export type Redaction = { entryId: string; text: string; reason: RedactionReason
  */
 export function redactText(
   text: string,
-  redactions: readonly Pick<Redaction, 'text' | 'reason'>[],
+  redactions: readonly Pick<Redaction, 'text' | 'reason' | 'echoOnly'>[],
+  options: { roster?: readonly string[] } = {},
 ) {
   const spans: { start: number; end: number; reasons: RedactionReason[] }[] = [];
   for (const r of redactions) {
-    if (!r.text) continue;
+    if (!r.text || r.echoOnly) continue;
     for (let at = text.indexOf(r.text); at >= 0; at = text.indexOf(r.text, at + 1))
       spans.push({ start: at, end: at + r.text.length, reasons: [r.reason] });
   }
+  spans.push(...echoSpans(text, redactions, options.roster ?? []));
   if (!spans.length) return text;
   spans.sort((a, b) => a.start - b.start);
   const merged = [spans[0]!];
@@ -49,6 +61,74 @@ export function redactText(
   return out + text.slice(at);
 }
 
+/** The text lower-cased with whitespace runs collapsed, and each character's original index. */
+function normalized(text: string) {
+  let out = '';
+  const at: number[] = [];
+  let space = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (/\s/.test(c)) {
+      if (!space) {
+        out += ' ';
+        at.push(i);
+      }
+      space = true;
+      continue;
+    }
+    space = false;
+    const lower = c.toLowerCase();
+    out += lower.length === 1 ? lower : c;
+    at.push(i);
+  }
+  return { out, at };
+}
+const words = (text: string) => normalized(text).out.trim().split(' ').filter(Boolean);
+
+/**
+ * Echoes of redacted spans, beyond the exact text: the span ignoring case and whitespace, every run
+ * of four or more of its words, and the clause around each roster name the redactions name. They
+ * only ever remove text.
+ */
+function echoSpans(
+  text: string,
+  redactions: readonly Pick<Redaction, 'text' | 'reason'>[],
+  roster: readonly string[],
+) {
+  const spans: { start: number; end: number; reasons: RedactionReason[] }[] = [];
+  const { out, at } = normalized(text);
+  const find = (needle: string, reason: RedactionReason) => {
+    if (!needle.trim()) return;
+    for (let i = out.indexOf(needle); i >= 0; i = out.indexOf(needle, i + 1))
+      spans.push({ start: at[i]!, end: at[i + needle.length - 1]! + 1, reasons: [reason] });
+  };
+  for (const r of redactions) {
+    if (!r.text) continue;
+    find(normalized(r.text).out.trim(), r.reason);
+    const run = words(r.text);
+    // Any shared run of four or more words is a union of shared runs of four.
+    for (let i = 0; i + 4 <= run.length; i++) find(run.slice(i, i + 4).join(' '), r.reason);
+    // A remark about a coworker: the clause around their name, written as the roster writes it,
+    // wherever it appears. Only for coworker redactions, so a name that is also a word ("grant")
+    // never takes work text with it.
+    for (const name of r.reason === 'coworker' ? roster : []) {
+      if (!new RegExp(`\\b${RegExp.escape(name)}\\b`, 'i').test(r.text)) continue;
+      for (const match of text.matchAll(new RegExp(`\\b${RegExp.escape(name)}\\b`, 'g'))) {
+        const start = Math.max(
+          ...['.', '!', '?', ';', '\n'].map((b) => text.lastIndexOf(b, match.index) + 1),
+        );
+        const ends = ['.', '!', '?', ';', '\n']
+          .map((b) => text.indexOf(b, match.index))
+          .filter((i) => i >= 0);
+        const end = ends.length ? Math.min(...ends) : text.length;
+        const lead = text.slice(start, match.index).match(/^\s*/)?.[0].length ?? 0;
+        spans.push({ start: start + lead, end, reasons: [r.reason] });
+      }
+    }
+  }
+  return spans;
+}
+
 /** A part's session id: its session's, then the first entry it holds. Stable across re-plans. */
 export function partSessionId(sessionId: string, firstEntryId: string) {
   const id = `${sessionId}#part-${firstEntryId}`;
@@ -64,6 +144,8 @@ export type PartSpec = {
   entryIds: string[];
   /** Projects of the organizations it goes to: only their `project:` tags and projectId travel. */
   projects: ReadonlySet<string>;
+  /** Coworkers of those organizations: a remark about one is redacted wherever it is echoed. */
+  roster?: readonly string[];
 };
 
 const TOOL_KINDS = new Set<string>(['tool-call', 'tool-result']);
@@ -81,7 +163,7 @@ export function partSnapshot(
   redactions: readonly Redaction[],
 ): ArchiveSnapshot {
   const keep = new Set(part.entryIds);
-  const redact = (text: string) => redactText(text, redactions);
+  const redact = (text: string) => redactText(text, redactions, { roster: part.roster ?? [] });
   // Tool activity never publishes in a part, whatever the stored copy keeps.
   const entries: ArchiveEntry[] = source.entries
     .filter((entry) => keep.has(entry.id) && !TOOL_KINDS.has(entry.kind))
