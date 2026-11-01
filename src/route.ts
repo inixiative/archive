@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import type { Routing } from './config';
+import { alwaysPersonal, type Routing } from './config';
 import {
   evidenceByOrganization,
   evidencedOrganizations,
@@ -871,6 +871,15 @@ export async function planSession(
     by: model.model,
     ...(sensitivity ? { checked: sensitivityKey(model.model) } : {}),
   };
+  // Muse is personal only: no tokens are spent and no part is offered anywhere.
+  if (alwaysPersonal(input.session)) {
+    if (!input.entries.length && input.prior) return { status: 'stale', input };
+    const parts = input.entries.length
+      ? [{ from: 0, to: input.entries.length - 1, organizations: [], why: 'Muse is personal' }]
+      : [];
+    const proposal = { parts, prune: [], redactions: [], rationale: 'Muse sessions are personal' };
+    return { ...(await archive.recordPlan({ ...base, proposal, ...recordOptions })), input };
+  }
   // Nothing could reach an organization: no evidence, start directory, person's decision or
   // subagent for one. It holds as it is, and no tokens are spent on it.
   // The validator's own predicate, over the whole session.

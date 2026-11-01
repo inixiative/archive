@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { publishArchive } from '../src/client';
-import type { Routing } from '../src/config';
+import { type Routing, sessionOrganizations } from '../src/config';
 import { quotedOrigins } from '../src/import';
 import { type ArchiveEntry, archiveKey, archiveSnapshotSchema } from '../src/index';
 import {
@@ -1512,4 +1512,37 @@ test('the pass fails closed when the pre-check returns no snapshots', async () =
   const { model } = scripted([plan([{ from: 0, to: 1, organizations: ['userevidence'] }])]);
   await expect(planSession(blind, model, id)).rejects.toThrow();
   expect(await parts(store)).toEqual([]);
+});
+
+test('Muse is personal only: no model call, no part, and no organization whatever the evidence or a person says', async () => {
+  const { store, archive } = await setup();
+  const zealot = [
+    { kind: 'user' as const, text: 'Fix zealot' },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant' as const, text: 'Fixed' },
+  ];
+  const { model, seen } = scripted([plan([{ from: 0, to: 1, organizations: ['userevidence'] }])]);
+  for (const extra of [
+    { source: 'muse' },
+    // Foundry driving Muse: Meta's model behind it.
+    { source: 'foundry', runtime: { provider: 'meta', accessPath: 'subscription' } },
+  ]) {
+    const { id } = await store.capture(session(`muse-${extra.source}`, zealot, extra), {
+      cwd: '/z',
+    });
+    // A person's decision doesn't send it anywhere either.
+    await store.tag(id, { add: ['route:userevidence'] });
+    expect(await planSession(archive, model, id)).toMatchObject({ status: 'valid' });
+    const parts = await store.list({ exempt: 'include', parts: 'only' });
+    expect(parts.filter((p) => p.partOf === id).flatMap((p) => p.routedTo)).toEqual([]);
+    expect(
+      sessionOrganizations(routing, {
+        source: extra.source,
+        runtime: extra.runtime,
+        partOf: id,
+        routedTo: ['userevidence'],
+      }),
+    ).toEqual([]);
+  }
+  expect(seen).toHaveLength(0);
 });
