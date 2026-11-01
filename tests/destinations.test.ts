@@ -188,6 +188,7 @@ test('destination endpoints list delivery, libraries, connect and remove through
       publish: 'off',
       cleanup: 'off',
       cleanupFor: {},
+      personalSpans: 'hold',
     });
     await expect(
       archive.request('destinations/remove', { ...route, organizationId: undefined }),

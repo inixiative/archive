@@ -12,6 +12,7 @@ const routing: Routing = {
   publish: 'off',
   cleanup: 'leaked',
   cleanupFor: {},
+  personalSpans: 'hold',
 };
 const map = { projects: [{ projectId: 'template', roots: ['/w/template'], repositories: [] }] };
 const session = (sessionId: string, n: number, extra: Record<string, unknown> = {}) =>
@@ -40,9 +41,12 @@ const session = (sessionId: string, n: number, extra: Record<string, unknown> = 
     ...extra,
   });
 /** Plans everything shown as one inixiative part (the start directory is evidence). */
+/** The sensitivity pass's answer when it finds nothing. */
+const CLEAN_CHECK = '{"hold": false, "redactions": []}';
 const model: SuggestModel = {
   model: 'claude-sonnet-5-5',
-  async decide({ input }) {
+  async decide({ key, input }) {
+    if (key === 'archive-sensitivity') return { content: CLEAN_CHECK };
     const range = input.match(/## New entries \(E(\d+)–E(\d+)/)!;
     return {
       content: JSON.stringify({
@@ -156,6 +160,7 @@ test('a backfill dry run plans every session, subagents against their parent’s
     publish: 'off',
     cleanup: 'leaked',
     cleanupFor: {},
+    personalSpans: 'hold',
   };
   await store.setProjectMap({
     projects: [
@@ -190,7 +195,8 @@ test('a backfill dry run plans every session, subagents against their parent’s
   };
   const planner: SuggestModel = {
     model: 'claude-sonnet-5-5',
-    async decide({ input }) {
+    async decide({ key, input }) {
+      if (key === 'archive-sensitivity') return { content: CLEAN_CHECK };
       const title = input.match(/^title: (.+)$/m)![1]!;
       return {
         content: JSON.stringify({ parts: [{ from: 0, to: 1, organizations: answers[title] }] }),
@@ -254,12 +260,13 @@ test('a long session plans one window a pass and stays due; a new worktree does 
   long.entries[0]!.text = 'first window words '.repeat(11_000);
   long.entries[1]!.text = 'second window words '.repeat(11_000);
   const { id } = await store.capture(long, { cwd: '/w/template' });
+  // A planner call and the sensitivity pass's call for its one work part.
   const first = await runRouting(archive, model);
-  expect(first).toMatchObject({ calls: 1, valid: 1 });
+  expect(first).toMatchObject({ calls: 2, valid: 1 });
   expect(await store.routingDue({ limit: 10 })).toEqual([
     { archiveId: id, reason: 'partial', depth: 0 },
   ]);
-  expect(await runRouting(archive, model)).toMatchObject({ calls: 1, valid: 1 });
+  expect(await runRouting(archive, model)).toMatchObject({ calls: 2, valid: 1 });
   expect(await store.routingDue({ limit: 10 })).toEqual([]);
   const [part] = await store.list({ exempt: 'include', parts: 'only' });
   expect(part?.entries).toBe(2);
@@ -290,9 +297,11 @@ test('a new planner charter or model makes every plan due', async () => {
 test('a new charter re-plans with the model from the first entry, over passes, keeping sticky redactions; the old plan publishes until it is done', async () => {
   const store = await freshStore();
   await store.setProjectMap(map);
+  // Redacting, so the coworker remark publishes redacted rather than holding its part.
+  const redacting: Routing = { ...routing, personalSpans: 'redact' };
   const archive: RoutingArchive = {
-    routingInput: (b) => store.routingInput(b.archiveId, routing, b.key),
-    recordPlan: (b) => store.recordPlan(b, routing),
+    routingInput: (b) => store.routingInput(b.archiveId, redacting, b.key),
+    recordPlan: (b) => store.recordPlan(b, redacting),
     routingDue: (b) => store.routingDue(b),
   };
   const long = session('retuned', 2);
@@ -303,7 +312,8 @@ test('a new charter re-plans with the model from the first entry, over passes, k
   const seen: string[] = [];
   const planner = (name: string): SuggestModel => ({
     model: name,
-    async decide({ input }) {
+    async decide({ key, input }) {
+      if (key === 'archive-sensitivity') return { content: CLEAN_CHECK };
       seen.push(`${name} ${input.match(/## New entries \(E(\d+)/)![1]}`);
       const range = input.match(/## New entries \(E(\d+)–E(\d+)/)!;
       const from = Number(range[1]);
@@ -324,7 +334,7 @@ test('a new charter re-plans with the model from the first entry, over passes, k
   await runRouting(archive, planner('old'));
   expect(await store.routingDue({ limit: 10, planKey: routeKey('old') })).toEqual([]);
   // A new charter: due, re-planned from E0 with the new model, one window a pass.
-  expect((await runRouting(archive, planner('new'))).calls).toBe(1);
+  expect((await runRouting(archive, planner('new'))).calls).toBe(2);
   // Mid-rebuild, the old plan still publishes.
   const [mid] = await store.list({ exempt: 'include', parts: 'only' });
   expect(mid?.entries).toBe(2);

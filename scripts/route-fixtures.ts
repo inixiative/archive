@@ -84,6 +84,24 @@ const { values: v } = parseArgs({
     label: { type: 'string', default: 'run' },
     out: { type: 'string' },
     concurrency: { type: 'string', default: '2' },
+    /** Run the sensitivity pass (the second call per work part). */
+    sensitivity: { type: 'boolean', default: false },
+    /**
+     * With --replay: no model call at all. The pass's answers come from the replayed run's own
+     * recorded answers too, matched to each part; a call nothing recorded fits fails the run.
+     */
+    offline: { type: 'boolean', default: false },
+    /** `routing.personalSpans` for the run: `hold` (the shipped default) or `redact`. */
+    'personal-spans': { type: 'string', default: 'hold' },
+    /** Plan and score only these case labels (comma-separated): a tiny test. */
+    only: { type: 'string' },
+    /**
+     * Re-score a recorded run with no model call: its proposals are fed back through this code
+     * (a control for code that changed after the run).
+     */
+    replay: { type: 'string' },
+    /** Write the published text of cases with sensitive markers here (private). */
+    texts: { type: 'string' },
   },
 });
 if (!v.database || !v.cases || !v.agents || !v.home)
@@ -94,10 +112,13 @@ if (database.hostname !== '127.0.0.1' || database.port === '6132')
   throw new Error('--database must be a scratch Postgres on 127.0.0.1, not port 6132');
 
 const cases: Cases = casesSchema.parse(JSON.parse(readFileSync(v.cases, 'utf8')));
+const only = v.only ? new Set(v.only.split(',').map((label) => label.trim())) : undefined;
 const routing: Routing = routingSchema.parse({
   organizations: cases.organizations,
   destinations: [],
+  personalSpans: v['personal-spans'],
 });
+if (v.offline && !v.replay) throw new Error('--offline replays a run: --replay is required');
 const store = new ArchiveStore(database.href);
 const agents = readAgents(resolve(v.agents));
 if (!agents) throw new Error(`No agents config at ${v.agents}`);
@@ -171,22 +192,124 @@ if (v['import-only']) {
 
 // The charter under test replaces the shipped one; everything else is the shipped path.
 const charter = v.charter ? readFileSync(v.charter, 'utf8') : ROUTE_PROMPT;
-const base = await claudeRouteModel({ home: resolve(v.home), concurrency: Number(v.concurrency) });
+const replayed = v.replay
+  ? (JSON.parse(readFileSync(v.replay, 'utf8')) as {
+      proposals: Record<string, unknown>;
+      answers?: { key: string; archiveId?: string; content: string }[];
+    })
+  : undefined;
+const recorded = replayed?.proposals;
+/** In a replay (concurrency 1), the session whose input was read last: the one being planned. */
+let replaying: string | undefined;
+// Offline: the pass's recorded answers, each used once. A live run at concurrency > 1 may have
+// tagged an answer with the wrong session, so an answer is matched to the part it quotes.
+const recordedChecks = (replayed?.answers ?? [])
+  .filter((a) => a.key === 'archive-sensitivity')
+  .map((a) => {
+    let texts: string[] = [];
+    try {
+      const parsed = JSON.parse(
+        a.content.slice(a.content.indexOf('{'), a.content.lastIndexOf('}') + 1),
+      );
+      texts = Array.isArray(parsed?.redactions)
+        ? parsed.redactions.flatMap((r: { text?: unknown }) =>
+            typeof r?.text === 'string' ? [r.text] : [],
+          )
+        : [];
+    } catch {}
+    return { ...a, texts, used: false };
+  });
+/** How each offline pass answer was matched: by the text it quotes, or by its session tag. */
+const matched = { quoted: 0, tagged: 0, clean: 0 };
+const offlineCheck = (input: string) => {
+  const open = recordedChecks.filter((a) => !a.used);
+  const own = (a: (typeof open)[number]) => a.archiveId === replaying;
+  const quotes = open
+    .filter((a) => a.texts.length && a.texts.every((t) => input.includes(t)))
+    .sort((a, b) => Number(own(b)) - Number(own(a)));
+  const clean = open.filter((a) => !a.texts.length && /"hold"\s*:\s*false/.test(a.content));
+  const pick =
+    quotes[0] ?? clean.find(own) ?? open.find((a) => own(a) && !a.texts.length) ?? clean[0];
+  if (!pick) throw new Error(`No recorded sensitivity answer fits a part of ${replaying}`);
+  pick.used = true;
+  if (quotes[0] === pick) matched.quoted++;
+  else if (clean.includes(pick)) matched.clean++;
+  else matched.tagged++;
+  return { content: pick.content };
+};
+// A replay answers the planner from the recorded run; the sensitivity pass, when on, is live,
+// unless offline.
+const live =
+  !v.offline && (!recorded || v.sensitivity)
+    ? await claudeRouteModel({ home: resolve(v.home), concurrency: Number(v.concurrency) })
+    : undefined;
+const base: SuggestModel & { close(): Promise<void> } = recorded
+  ? {
+      model: live?.model ?? 'replay',
+      async decide(request) {
+        if (request.key !== 'archive-route') {
+          if (v.offline) return offlineCheck(request.input);
+          if (!live) throw new Error('A replay without --sensitivity makes no other call');
+          return live.decide(request);
+        }
+        if (!replaying || !(replaying in recorded))
+          throw new Error(`No recorded proposal for ${replaying ?? 'an unknown session'}`);
+        const proposal = recorded[replaying];
+        // A recorded failure replays as an answer that does not parse, which holds as it did.
+        return {
+          content: proposal && typeof proposal === 'object' ? JSON.stringify(proposal) : 'no plan',
+        };
+      },
+      async close() {
+        await live?.close();
+      },
+    }
+  : live!;
 /** Answers the plan parser refused, kept whole so a parse failure can be told from a bad plan. */
 const unparseable: { session: string; content: string }[] = [];
+/** Every planner answer and sanitizer answer, by the session title line, for offline re-scoring. */
+const answers: {
+  key: string;
+  session: string;
+  archiveId?: string;
+  content: string;
+  tokens?: unknown;
+}[] = [];
 const model: SuggestModel = {
   model: base.model,
   decide: async (request) => {
+    // Only the planner's call takes the charter under test; the sanitizing call keeps its own.
+    if (request.key !== 'archive-route') {
+      const checked = await base.decide(request);
+      answers.push({
+        key: request.key,
+        session: request.input.split('\n')[0] ?? '',
+        ...(replaying ? { archiveId: replaying } : {}),
+        content: checked.content,
+        ...(checked.tokens ? { tokens: checked.tokens } : {}),
+      });
+      return checked;
+    }
     const answer = await base.decide({ ...request, instructions: charter });
     if (!parsePlan(answer.content))
       unparseable.push({ session: request.input.split('\n')[1] ?? '', content: answer.content });
+    answers.push({
+      key: request.key,
+      session: request.input.split('\n')[1] ?? '',
+      ...(replaying ? { archiveId: replaying } : {}),
+      content: answer.content,
+      ...(answer.tokens ? { tokens: answer.tokens } : {}),
+    });
     return answer;
   },
 };
 const proposals = new Map<string, ProposedPlan | string>();
 const results = new Map<string, RecordPlanResult>();
 const archive: RoutingArchive = {
-  routingInput: ({ archiveId }) => store.routingInput(archiveId, routing),
+  routingInput: ({ archiveId }) => {
+    replaying = archiveId;
+    return store.routingInput(archiveId, routing);
+  },
   recordPlan: async (body) => {
     proposals.set(body.archiveId, body.proposal ?? body.failure ?? 'none');
     const result = await store.recordPlan({ ...body, preview: true }, routing);
@@ -201,7 +324,12 @@ let report: Awaited<ReturnType<typeof runBackfill>>;
 try {
   report = await runBackfill(archive, model, {
     dryRun: true,
-    concurrency: Number(v.concurrency),
+    // The pass is on by default in the shipped path; here it runs only when asked for.
+    sensitivity: v.sensitivity,
+    ...(only
+      ? { only: new Set(cases.cases.filter((c) => only.has(c.label)).map((c) => sessionOf(c).id)) }
+      : {}),
+    concurrency: recorded ? 1 : Number(v.concurrency),
     progress: (line) => console.error(line),
   });
 } finally {
@@ -310,12 +438,15 @@ type Score = Judgement & {
   issues?: string[];
   parts: { from: number; to: number; organizations: string[]; sensitive: boolean }[];
   redactions: number;
+  publishedChars: number;
   prunes: number;
   parent?: { status: string; reach: string[] };
   strict: Judgement;
+  /** Parts held for review: for personal-only talk found in them, and for other reasons. */
+  heldParts: { detected: number; other: number };
 };
 const scores: Score[] = [];
-for (const c of cases.cases) {
+for (const c of cases.cases.filter((c) => !only || only.has(c.label))) {
   const session = sessionOf(c);
   const result = results.get(session.id);
   const valid = result?.status === 'valid';
@@ -348,6 +479,24 @@ for (const c of cases.cases) {
     })),
     redactions: result?.plan?.redactions.length ?? 0,
     prunes: result?.plan?.prune.length ?? 0,
+    heldParts: {
+      detected: (result?.notes ?? []).filter(
+        (n) => n.startsWith('held part') && n.includes('personal for every organization'),
+      ).length,
+      other: (result?.notes ?? []).filter(
+        (n) => n.startsWith('held part') && !n.includes('personal for every organization'),
+      ).length,
+    },
+    // What publishes, in characters, each redaction marker counted as none (over-redaction).
+    publishedChars: published.reduce(
+      (n, p) =>
+        n +
+        p.snapshot.entries.reduce(
+          (m, e) => m + e.text.replace(/\[redacted: [^\]]*\]/g, '').length,
+          0,
+        ),
+      0,
+    ),
     ...(parentId ? { parent: reachOf(parentId) } : {}),
     ...judge(c, session, valid, published),
     strict: judge(c, session, valid, strict),
@@ -361,6 +510,8 @@ const count = (pick: (s: Score) => boolean, undisputed = false) =>
   scores.filter((s) => (!undisputed || !s.disputed) && pick(s)).length;
 const output = {
   label: v.label,
+  personalSpans: routing.personalSpans,
+  ...(v.offline ? { offline: { replayed: v.replay, matched } } : {}),
   charter: new Bun.CryptoHasher('sha256').update(charter).digest('hex').slice(0, 16),
   at: new Date(started).toISOString(),
   seconds: Math.round((Date.now() - started) / 1000),
@@ -376,10 +527,25 @@ const output = {
   others,
   proposals: Object.fromEntries(proposals),
   unparseable,
+  answers,
 };
 if (v.out) {
   mkdirSync(resolve(v.out, '..'), { recursive: true });
   writeFileSync(v.out, `${JSON.stringify(output, null, 2)}\n`);
+}
+// The published text of every case and planned parent, for reading it for meaning (private).
+if (v.texts) {
+  const texts: Record<string, { organizations: string[]; entries: string[] }[]> = {};
+  const labels = new Map(cases.cases.map((c) => [sessionOf(c).id, c.label]));
+  for (const [id, result] of results) {
+    const label = labels.get(id) ?? `parent ${id.slice(0, 10)}`;
+    if (only && labels.has(id) && !only.has(label)) continue;
+    texts[label] = (result?.parts ?? []).map((p, i) => ({
+      organizations: p.organizations,
+      entries: (result?.snapshots?.[i]?.entries ?? []).map((e) => e.text),
+    }));
+  }
+  writeFileSync(v.texts, `${JSON.stringify(texts, null, 2)}\n`, { mode: 0o600 });
 }
 const flags = (j: Judgement) =>
   [

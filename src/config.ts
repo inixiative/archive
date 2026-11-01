@@ -88,6 +88,13 @@ export const routingSchema = z
      */
     cleanup: cleanupMode.default('off'),
     cleanupFor: z.record(organizationId, cleanupMode).default({}),
+    /**
+     * Talk that is personal for every organization (career or job, investor or advisor, remarks
+     * about coworkers), found in a work part by the planner or the sensitivity pass. `hold` (the
+     * default): the whole part stays personal and goes to review (`route review`). `redact`: the
+     * span is redacted and the part publishes.
+     */
+    personalSpans: z.enum(['hold', 'redact']).default('hold'),
   })
   .superRefine((routing, ctx) => {
     const ids = routing.organizations.map((o) => o.id);
@@ -108,6 +115,7 @@ const noRouting = (): Routing => ({
   publish: 'off',
   cleanup: 'off',
   cleanupFor: {},
+  personalSpans: 'hold',
 });
 
 /** Private regular file owned by this user; a symlink or group/world access is refused. */
@@ -284,6 +292,11 @@ export function setCleanup(file: string, mode: Routing['cleanup'], organizationI
     : { ...routing, cleanup: mode };
   const written = writeRouting(file, next);
   return { cleanup: written.cleanup, cleanupFor: written.cleanupFor };
+}
+
+/** Whether career, investor and coworker talk in a work part holds the part or is redacted. */
+export function setPersonalSpans(file: string, personalSpans: Routing['personalSpans']) {
+  return writeRouting(file, { ...readRouting(file), personalSpans }).personalSpans;
 }
 
 /** Turns publishing to organizations on or off (`routing.publish`). */

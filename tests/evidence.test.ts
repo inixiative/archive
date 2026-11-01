@@ -33,6 +33,7 @@ const routing = {
   publish: 'off' as const,
   cleanup: 'leaked' as const,
   cleanupFor: {},
+  personalSpans: 'hold' as const,
 };
 const call = (name: string, input: object) => ({
   kind: 'tool-call' as const,

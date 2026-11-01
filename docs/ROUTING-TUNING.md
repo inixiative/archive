@@ -148,3 +148,75 @@ Two runs on the shipped charter (`v0-baseline.txt`, sha `1f99358a`), on this bra
 - The code fixes do what they target: no answer was rejected as unparseable in either run, one bad redaction no longer holds a whole plan, and an echo of a redacted remark no longer publishes.
 - The remaining failures are planner judgments: 512aaec0a6 (opener unsplit in run b), 01b0bda06a (one part to both organizations, and no redaction in run b) and 40b206fa84 (the whole session to UE or to both, never only the Zealot-worktree stretch).
 - 1d3942e03f still follows its 13k-entry parent's reach, which varies run to run.
+
+## Sensitivity pass (experiment, 2026-11-01, `exp/sensitivity-pass`; UNDER EXPERIMENT, not decided)
+
+**Change.** After the planner proposes, a second Sonnet-low call per work part reads that part's window entries, the organizations they would reach and the roster, and answers with redactions or "hold part". It can only remove: its redactions are added to the planner's, a hold makes the part personal, and an answer it can't read holds the part. The planner is held fixed. Both arms replay the recorded proposals of the `fix a` and `fix b` runs above, so only the pass varies. Controls replay the same proposals with the pass off and match `fix a` / `fix b` case for case (40b206fa84 is excluded: its transcript changed since those runs). Pre-registered design (rev 3, adversarially reviewed, verdict go) and its gates are kept privately with the experiment data.
+
+**Gates.**
+- G1: in each control observation where a marker reached a work organization, the treatment publishes no marker *and* still reaches the control's organizations; the published text is also read for the same content in other words. Three observations: (a, 512aaec0a6), (b, 512aaec0a6) and (b, 01b0bda06a).
+- G2: no paired loss on the 8 replayable non-target cases.
+- G3: published characters per non-target case ≥ 95% of the paired control.
+
+| Case | control a | treatment a | control b | treatment b |
+|---|---|---|---|---|
+| ae88b51ff2 personal | H | H | H | H |
+| 65fa49fe13 personal | H | H | P | P |
+| 512aaec0a6 split | P, 0 markers | P, 0 markers | f, 4 markers to inixiative | **f, 3 markers to inixiative** |
+| 671481a4f6 UE | P | P | P | P |
+| 95a4acd0e0 UE | P | P | P | P (99.3% chars) |
+| 382e18e4cb UE (subagent) | P | P | P | P |
+| 388f6c08c7 UE | P | P | P | P |
+| 1d3942e03f UE or UE+inixiative | f (parent → inixiative) | f (same) | P | P |
+| 6b93e47069 inixiative (subagent) | P | P | P | P |
+| 01b0bda06a UE + inixiative, redacted | f, held to personal | f, same | f, 1 marker to both | f on split only, **0 markers, reaches both** |
+
+**Result: G1 failed (2 of 3 observations met); G2 and G3 met.**
+- G1: (a, 512) still leaks none and reaches inixiative. *Correction (re-review of the next design):* the scorer checked 512aaec0a6's markers only in its opener (E0–E2). Counted anywhere in the published text, control a published one investor marker in a later summary entry, and treatment a published none (the pass redacted it), and treatment b published the same 3 markers. The tiny test published 2. So the pass removed a leak in arm a, and the G1 verdict is unchanged. In (b, 01b0) the pass redacts the coworker remark in both entries where it appears, nothing restates it, and the session still reaches inixiative and UE. In (b, 512) the pass redacts one career sentence and misses the rest: 3 of the 4 markers still reach inixiative. The tiny test, a separate pass call on the same proposal, left 2 of 4. Across the three pass calls on that proposal, a marker reached a work organization every time.
+- G2: no paired loss. 1d3942e03f fails in control a too (it follows its parent's reach).
+- G3: every non-target case keeps ≥ 99.3% of its control's characters. n/a where the control publishes nothing: ae88b51ff2, 65fa49fe13 in both arms, and 40b206fa84 (excluded).
+- The pass held no part and never returned an unreadable answer (21 calls). Its redactions on non-target cases were small (profanity, a frustrated remark, a giphy line).
+- Two G1 observations rest on one pass call each, so this run doesn't estimate how often the pass misses.
+
+**Cost.** Pass calls only (the planner was replayed): tiny test 2 calls, 89k tokens; treatment b 11 calls, 260k; treatment a 10 calls, 228k. Total 577k, nearly all cache writes. Five-hour window 20% → 21%, seven-day 31% → 31%.
+
+## Always-personal categories (experiment, 2026-11-01; stopped at the tiny test)
+
+**Change.** Aron's ruling: career or job talk, investor or advisor talk, and complaints about or disparaging remarks on coworkers are personal for every organization, inixiative included. Both the planner charter (`ROUTE_PROMPT`, sha 8edc9fbb) and the pass's instructions now say so; secrets and personal life are unchanged. The userevidence roster is the machine's (54 names). The pass is on and the planner runs live. The design was pre-registered and adversarially reviewed (rev 3, verdict go). It has three gates, all as before: no marker of 512aaec0a6 or 01b0bda06a reaches any work organization in two full runs, counted anywhere in the published text, plus a keyword reading; no routing loss; and published characters kept.
+
+**Stopped by the pre-registered cost rule.** The tiny test (the two targets only, one run) cost 267k tokens: 119k planner and 148k pass, nearly all cache writes. Scaled by the design's upper-bound factor (4.42), that is 1.18M per full run, above the 1.0M stop line, so the two full runs were not started. The five-hour window went 73% → 74% during the test; it was already at 73% from other sessions.
+
+**Tiny test outcomes, recorded only (they never stand in for the runs):**
+- 512aaec0a6: one part to inixiative, 1 of 4 markers published. The planner redacted 2 career and 2 investor spans; the pass added career and investor redactions of its own. Both missed the same remaining phrase, in the opener's third entry (the person's other companies).
+- 01b0bda06a: one part to inixiative and userevidence, 0 markers. The coworker remark was redacted twice, so its echo was caught.
+- No pass answer was unreadable.
+
+## Hold on detect, scored offline (post-hoc, not pre-registered; 2026-11-01)
+
+**Policy (coordinator's instruction after Aron's ruling).** When the planner or the sensitivity pass finds any span of career or job, investor or advisor, or coworker-complaint talk in a work part, the whole part stays personal and goes to review (`heldForReview`, sticky until `route review`). Secrets and personal-life spans still redact and publish. Shipped as `routing.personalSpans: hold` (default), with `redact` keeping the old behaviour.
+
+**Method.** Every recorded run was replayed through this branch's code with **zero model calls**: `--replay` feeds back the recorded planner proposals, and `--offline` feeds back the pass's recorded answers too, each matched to the part it quotes. Every run reported 0 tokens. Each run was scored twice, `--personal-spans redact` and `hold`, with markers counted anywhere in the published text (`within` dropped; the 7-name roster the runs used).
+- **Sanity:** `redact` reproduces every recorded run case for case. Two differences, both expected:
+  - treatment-b 01b0bda06a publishes 29 fewer characters, from #36's case-insensitive echo;
+  - fix-a and fix-b predate `publishedChars`.
+- **Two caveats:**
+  - The runner records proposals after the pass's redactions were merged in. For treatment and tiny runs, the replayed proposal therefore already carries the pass's findings, and replaying the pass again is idempotent.
+  - Under `hold`, a part the planner's own findings already hold is never sent to the pass. The tiny runs' hold replays made no pass call for that reason, which is also how production behaves.
+
+**Results.** fix-a/b replay the same proposals as control-a/b and score identically to them, so they're omitted.
+
+| Run (planner · pass) | 512aaec0a6 markers to a work org: redact → hold | 01b0bda06a: redact → hold | Parts held for personal-only talk (all cases) | Published characters lost vs control |
+|---|---|---|---|---|
+| control-a (#35 planner · none) | 1 → 1 | 0 → 0 | 1 (01b0bda06a, already personal in control) | 0 on every case |
+| control-b (#35 planner · none) | 4 → 4 | 1 → 1 | 0 | 0 on every case |
+| treatment-a (#35 planner · pass) | 0 → 0 | 0 → 0 | 2 (512aaec0a6, 01b0bda06a) | 512aaec0a6 100% (142,458 → 0); non-targets ≤ 0.04% (the pass's own redactions) |
+| treatment-b (#35 planner · pass) | 3 → **0** | 0 → 0 | 2 (512aaec0a6, 01b0bda06a) | 512aaec0a6 100% (149,548 → 0); 01b0bda06a 100% (69,090 → 0); 95a4acd0e0 0.7% (pass redaction); others 0 |
+| sens-tiny (#35 planner · pass, targets only) | 2 → **0** | 0 → 0 | 2 | both targets 100% |
+| personal-tiny (always-personal planner · pass, targets only) | 1 → **0** | 0 → 0 | 2 | both targets 100% (vs control-b) |
+
+**Reading.**
+- **With the pass, hold on detect brought markers reaching a work org to 0 in every run.** The three spans the pass missed in treatment-b, the two in sens-tiny and the one in personal-tiny no longer publish, because each of those parts had at least one detected span and the whole part was held.
+- **Without the pass, hold on detect changes nothing.** In control-b the #35 planner proposed no personal-only redaction in either target, so nothing was detected and the 4 + 1 markers still publish. Hold can only act on detection, which is the pass's job.
+- **The cost is whole sessions of real work.** Each target is one part, so a hold keeps all of it personal: 512aaec0a6's ~142–150k characters of template work and 01b0bda06a's ~69k of Zealot and json-rules work wait for review. Hold is only as fine-grained as the planner's split. A planner that cut the opener into its own part would hold only that.
+- **No non-target case was held in any run.** Routing of the other 9 cases is unchanged from each run's control.
+- **This is post-hoc** (designed after seeing the runs, on the same two sessions). Nothing here estimates how often the pass detects nothing in a part that holds such talk. In these runs it found something in every target part, in 4 of 4 runs.

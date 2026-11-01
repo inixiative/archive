@@ -408,6 +408,7 @@ test('token files: exactly one credential source, private regular file, read at 
       publish: 'off',
       cleanup: 'off',
       cleanupFor: {},
+      personalSpans: 'hold',
     });
   } finally {
     await instance.close();

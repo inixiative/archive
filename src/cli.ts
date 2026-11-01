@@ -38,6 +38,7 @@ import {
   removeOrganization,
   setCleanup,
   setOrganization,
+  setPersonalSpans,
   setPublish,
 } from './config';
 import { stampedRun } from './exemption';
@@ -114,6 +115,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       'claude-config-dir': { type: 'string' },
       'dry-run': { type: 'boolean', default: false },
       backfill: { type: 'boolean', default: false },
+      'no-sensitivity': { type: 'boolean', default: false },
       all: { type: 'boolean', default: false },
       roster: { type: 'string', multiple: true },
       'all-organizations': { type: 'boolean', default: false },
@@ -149,9 +151,10 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'connect --url HTTPS_URL --organization-id ID (--token-env ENV | --token-file PATH)   (a remote Archive an organization publishes to, for serve --sync)\n' +
         'connect --kind kingdom --url KINGDOM_API_URL --credential-file PATH --integration-id UUID --resource-id UUID --organization-id ID   (a hosted Archive through Kingdom)\n' +
         'organizations list | organizations set --id ID [--project ID ...] [--roster NAME ...] | organizations remove --id ID   (the projects each organization owns, and coworker names for the planner; what publishes is the parts of each session, to the organizations its validated plan gives them)\n' +
-        'route [--watch] [--concurrency 2] [--limit N] [--model claude-sonnet-5-5] [--claude-bin PATH] [--claude-config-dir DIR] [--dry-run]   (plan due sessions on the personal Claude login: parts × organizations; --watch wakes every 2 minutes)\n' +
+        'route [--watch] [--concurrency 2] [--limit N] [--model claude-sonnet-5-5] [--claude-bin PATH] [--claude-config-dir DIR] [--dry-run] [--no-sensitivity]   (plan due sessions on the personal Claude login: parts × organizations, each work part checked again by a second call unless --no-sensitivity; --watch wakes every 2 minutes)\n' +
         'route --backfill [--dry-run]   (plan every session and print the plan against what destinations hold now) | route plans [--all] | route review --id ID | route reset --id ID\n' +
         'cleanup [ORG] [off|leaked|all] [--all-organizations]   (what sync deletes at destinations, default off; with ORG, that organization only; leaked or all for every organization needs --all-organizations) | sync --dry-run   (per destination, the ids cleanup would delete now)\n' +
+        'personal-spans [hold|redact]   (career, investor or coworker talk found in a work part: hold, the default, keeps the whole part personal for route review; redact publishes it redacted)\n' +
         'publish [on|off]   (the go-live switch: off, the default, plans sessions but publishes nothing new; deletes are cleanup settings)\n' +
         'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
         "settings [--capture-tool-calls-and-results true|false] [--capture-run-sessions true|false] [--retention-days N|off]   (read, or change, this Archive's settings)\n" +
@@ -350,6 +353,13 @@ export async function runCli(args = Bun.argv.slice(2)) {
         );
       output(setCleanup(config, mode, second ? first : undefined));
     }
+    return;
+  }
+  if (command === 'personal-spans') {
+    const value = positionals[1];
+    if (value !== 'hold' && value !== 'redact')
+      output({ personalSpans: readRouting(config).personalSpans });
+    else output({ personalSpans: setPersonalSpans(config, value) });
     return;
   }
   if (command === 'publish') {
@@ -602,6 +612,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
           await runBackfill(archive, model, {
             concurrency,
             ...(v['dry-run'] ? { dryRun: true } : {}),
+            ...(v['no-sensitivity'] ? { sensitivity: false } : {}),
             ...(v.limit ? { limit: whole(v.limit, 'limit', 100_000) } : {}),
             progress: (line) => console.error(line),
           }),
@@ -627,6 +638,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
             concurrency,
             ...(v.limit ? { limit: whole(v.limit, 'limit', 100_000) } : {}),
             ...(v['dry-run'] ? { dryRun: true } : {}),
+            ...(v['no-sensitivity'] ? { sensitivity: false } : {}),
             progress: (line) => console.error(line),
           });
           if (!v.watch || report.due) output(report);

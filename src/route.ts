@@ -10,7 +10,7 @@ import {
   type SessionEvidence,
 } from './evidence';
 import type { ArchiveEntry, ArchiveSnapshot } from './index';
-import { REDACTION_REASONS, type Redaction } from './parts';
+import { PERSONAL_ONLY_REASONS, REDACTION_REASONS, type Redaction } from './parts';
 import { pool, type SuggestModel, type TokenUsage } from './suggest';
 
 /** The organization a part stays in when it is no organization's: this machine only. */
@@ -32,8 +32,9 @@ You get entries E<n> (only those not planned yet), the evidence of where each en
 Cut the new entries into parts, contiguous ranges, and give each part the organizations whose work it is:
 - Work for an organization means the session was doing that organization's work: changing its repositories, reviewing its pull requests, debugging its systems. Where files changed is strong evidence; reading or mentioning something is weak. A session started in one folder can be another organization's work.
 - A part may go to several organizations when it is truly work for each. Use "personal" for anything that is not clearly some organization's work, and whenever you are unsure.
-- Mark a personal part "sensitive": true when it is personal because of what it says: career or job plans, complaints about or judgments of coworkers, personal life, investor or advisor talk, health, money.
-- Inside a work part, prune entries irrelevant to that work, and redact spans that must not reach the organization: remarks about coworkers (see the roster), career plans, personal life, investor talk, secrets (tokens, passwords, keys). A redaction quotes the exact text from one entry, character for character, as short as covers it; it is replaced with a marker.
+- Some talk is personal whatever organization it is about, even the person's own company: career or job talk (job searches, interviews, a day job, leaving, compensation), investor or advisor talk (fundraising, investors, advisors, the person's other companies), and complaints about or disparaging remarks on coworkers (see the roster: blame, judgments, who broke or deleted what). It never reaches any organization. A part that is mostly such talk is personal; inside a work part, redact it.
+- Mark a personal part "sensitive": true when it is personal because of what it says: the talk above, personal life, health, money.
+- Inside a work part, prune entries irrelevant to that work, and redact spans that must not reach the organization: the always-personal talk above, personal life, secrets (tokens, passwords, keys). A redaction quotes the exact text from one entry, character for character, as short as covers it; it is replaced with a marker.
 - To continue the plan's last part with the first new entries, set "continues": true on your first part (same organizations).
 
 Respond with JSON only:
@@ -155,6 +156,8 @@ export function parsePlan(content: string): ProposedPlan | undefined {
 /** An entry shown to the planner: its index in the session, kind, text (clipped) and evidence. */
 export type RoutingEntry = {
   index: number;
+  /** The entry's id, so a part's entries can be found among the shown ones. */
+  id: string;
   kind: ArchiveEntry['kind'];
   text: string;
   /** Another session's content quoted here (a message, a subagent's result): it follows that session. */
@@ -336,8 +339,9 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
   let previousEnd = context.from - 1;
   let continued: PlanPart | undefined;
   const priorParts = context.prior?.parts ?? [];
-  // A redaction that doesn't match its entry holds the part holding that entry, nothing else: that
-  // part stays personal and goes to review. One outside the entries planned holds the plan.
+  // A redaction that doesn't match its entry, or one of personal-only talk in a work part (with
+  // `personalSpans: hold`), holds the part holding that entry, nothing else: that part stays
+  // personal and goes to review. One outside the entries planned holds the plan.
   const heldParts = new Map<number, string>();
   const redactions: Redaction[] = [...(context.prior?.redactions ?? [])];
   for (const r of proposal.redactions) {
@@ -354,6 +358,16 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
         : undefined;
     if (!problem) {
       redactions.push({ entryId: entry.id, text: r.text, reason: reason! });
+      // Career, investor and coworker talk in a work part: the part goes to review, whole.
+      if (context.routing.personalSpans === 'hold' && PERSONAL_ONLY_REASONS.includes(reason!)) {
+        const holder = proposal.parts.findIndex((p) => p.from <= r.entry && r.entry <= p.to);
+        const part = proposal.parts[holder];
+        if (part?.organizations.some((o) => o !== PERSONAL) && !heldParts.has(holder))
+          heldParts.set(
+            holder,
+            `it holds ${reason} talk (E${r.entry}), personal for every organization`,
+          );
+      }
       continue;
     }
     // Its text still goes wherever an echo of it appears, in every part.
@@ -484,7 +498,7 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
     heldForReview: [],
   };
   plan.sensitive = [...new Set([...priorSensitive, ...sensitiveEntries(plan, entries, false)])];
-  // A part held for a bad redaction stays personal until a person reviews the plan.
+  // A held part stays personal until a person reviews the plan.
   const held = proposal.parts.flatMap((p, i) =>
     heldParts.has(i) ? entries.slice(p.from, p.to + 1).map((e) => e.id) : [],
   );
@@ -631,12 +645,144 @@ export type RecordPlanResult = {
  * (the server validates and applies it). A failed run is recorded as a failure, which holds the
  * session; nothing publishes by default.
  */
+export const SENSITIVITY_PROMPT = `You check one part of a coding-agent session before it is published to an organization the person works for. You get the organization, its coworkers, and the part's new entries (E<n>).
+
+Return only what must not be published, quoted exactly from one entry, character for character, as short as covers it.
+
+These never reach any organization, whichever it is, even the person's own company and even when the talk is about that organization's business:
+- complaints about or disparaging remarks on coworkers: blame, judgments of them, who broke or deleted what;
+- career or job talk: job searches, interviews, leaving, a day job, compensation;
+- investor or advisor talk: fundraising, investors, advisors, the person's other companies.
+Find every such span in the part, not only the first: check each entry.
+
+Also remove:
+- personal life, health, money;
+- secrets: tokens, passwords, keys.
+
+The work itself stays. If the part is mostly such talk rather than work, hold it.
+
+Respond with JSON only:
+{"hold": false, "redactions": [{"entry": 12, "text": "exact span", "reason": "coworker|career|personal-life|investor|secret|other"}]}`;
+
+/** The stable part of a sensitivity check: the organizations and their coworkers. */
+export const sensitivityContext = (organizations: RoutingInput['organizations']) =>
+  `## Organizations\n${organizations
+    .map((o) => `- ${o.id}${o.roster.length ? `: coworkers ${o.roster.join(', ')}` : ''}`)
+    .join('\n')}`;
+
+/**
+ * A second pass over a validated proposal: for each part that would publish to an organization,
+ * a separate call reads that part's new entries, its organizations and their coworkers, and returns
+ * what those organizations must not see, or a hold. Its redactions join the planner's; a hold, an
+ * unreadable answer or a failed call makes that part personal. It only ever removes.
+ */
+async function sensitivityPass(
+  archive: RoutingArchive,
+  model: SuggestModel,
+  input: RoutingInput,
+  body: RecordPlanBody & { proposal: ProposedPlan },
+) {
+  const tokens: Required<TokenUsage> = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  const pre = await archive.recordPlan({ ...body, dryRun: true, preview: true });
+  if (pre.status !== 'valid' || !pre.parts || !pre.snapshots)
+    return { proposal: body.proposal, tokens, calls: 0, held: 0, unreadable: 0 };
+  const shown = new Map(input.entries.map((e) => [e.id, e]));
+  const proposal: ProposedPlan = {
+    ...body.proposal,
+    parts: body.proposal.parts.map((p) => ({ ...p })),
+    redactions: [...body.proposal.redactions],
+  };
+  let calls = 0;
+  let held = 0;
+  let unreadable = 0;
+  for (const [i, part] of pre.parts.entries()) {
+    const organizations = part.organizations.filter((o) => o !== PERSONAL);
+    const entries = (pre.snapshots[i]?.entries ?? []).flatMap((e) => shown.get(e.id) ?? []);
+    if (!organizations.length || !entries.length) continue;
+    const holder = proposal.parts.find(
+      (p) => p.from <= entries[0]!.index && entries[0]!.index <= p.to,
+    );
+    const hold = () => {
+      if (holder) {
+        holder.organizations = [];
+        holder.continues = false;
+      }
+    };
+    calls++;
+    let answer: { hold?: unknown; redactions?: unknown } | undefined;
+    try {
+      const result = await model.decide({
+        key: 'archive-sensitivity',
+        instructions: SENSITIVITY_PROMPT,
+        context: sensitivityContext(
+          input.organizations.filter((o) => organizations.includes(o.id)),
+        ),
+        input: [
+          `## Part for ${organizations.join(', ')}`,
+          ...entries.map((e) => `E${e.index} ${e.kind}: ${e.text}`),
+        ].join('\n'),
+      });
+      for (const field of ['input', 'output', 'cacheRead', 'cacheWrite'] as const)
+        tokens[field] += result.tokens?.[field] ?? 0;
+      const start = result.content.indexOf('{');
+      const end = result.content.lastIndexOf('}');
+      answer =
+        start >= 0 && end > start ? JSON.parse(result.content.slice(start, end + 1)) : undefined;
+    } catch {
+      answer = undefined;
+    }
+    // Anything but an explicit `hold: false` with well-formed redactions holds the part: an answer
+    // the pass can't read is a redaction it can't apply.
+    const indices = new Set(entries.map((e) => e.index));
+    const items = answer && Array.isArray(answer.redactions) ? answer.redactions : answer ? [] : [];
+    const read = items.map((r) => {
+      const redaction = (r ?? {}) as { entry?: unknown; text?: unknown; reason?: unknown };
+      const entry =
+        typeof redaction.entry === 'number'
+          ? redaction.entry
+          : typeof redaction.entry === 'string' && /^E?\d+$/.test(redaction.entry)
+            ? Number(redaction.entry.replace(/^E/, ''))
+            : undefined;
+      return entry !== undefined &&
+        indices.has(entry) &&
+        typeof redaction.text === 'string' &&
+        redaction.text
+        ? {
+            entry,
+            text: redaction.text,
+            reason: typeof redaction.reason === 'string' ? redaction.reason : 'other',
+          }
+        : undefined;
+    });
+    if (!answer || answer.hold === true) {
+      held++;
+      hold();
+      continue;
+    }
+    if (answer.hold !== false || read.some((r) => r === undefined)) {
+      unreadable++;
+      hold();
+      continue;
+    }
+    for (const r of read) if (r) proposal.redactions.push(r);
+  }
+  return { proposal, tokens, calls, held, unreadable };
+}
+
 export async function planSession(
   archive: RoutingArchive,
   model: SuggestModel,
   archiveId: string,
-  options: { dryRun?: boolean } = {},
-): Promise<RecordPlanResult & { tokens?: TokenUsage; input?: RoutingInput }> {
+  options: { dryRun?: boolean; assumeParentReach?: string[]; sensitivity?: boolean } = {},
+): Promise<
+  RecordPlanResult & {
+    tokens?: TokenUsage;
+    input?: RoutingInput;
+    calls?: number;
+    /** What the sensitivity pass did. */
+    sensitivity?: { calls: number; held: number; unreadable: number; tokens: Required<TokenUsage> };
+  }
+> {
   const key = routeKey(model.model);
   const input = await archive.routingInput({ archiveId, key });
   const base = { archiveId, digest: input.digest, through: input.through, key, by: model.model };
@@ -683,13 +829,46 @@ export async function planSession(
     );
     return { ...(await archive.recordPlan({ ...base, failure, ...options })), input };
   }
-  const proposal = parsePlan(content);
+  // The sensitivity pass is on unless turned off.
+  const { sensitivity = true, ...recordOptions } = options;
+  let proposal = parsePlan(content);
+  let calls = 1;
+  let sensitivityReport:
+    | { calls: number; held: number; unreadable: number; tokens: Required<TokenUsage> }
+    | undefined;
+  if (proposal && sensitivity) {
+    const checked = await sensitivityPass(archive, model, input, {
+      ...base,
+      proposal,
+      ...recordOptions,
+    });
+    proposal = checked.proposal;
+    calls += checked.calls;
+    sensitivityReport = {
+      calls: checked.calls,
+      held: checked.held,
+      unreadable: checked.unreadable,
+      tokens: checked.tokens,
+    };
+    tokens = {
+      input: (tokens?.input ?? 0) + checked.tokens.input,
+      output: (tokens?.output ?? 0) + checked.tokens.output,
+      cacheRead: (tokens?.cacheRead ?? 0) + checked.tokens.cacheRead,
+      cacheWrite: (tokens?.cacheWrite ?? 0) + checked.tokens.cacheWrite,
+    };
+  }
   const recorded = await archive.recordPlan(
     proposal
-      ? { ...base, proposal, ...options }
-      : { ...base, failure: 'unparseable answer', ...options },
+      ? { ...base, proposal, ...recordOptions }
+      : { ...base, failure: 'unparseable answer', ...recordOptions },
   );
-  return { ...recorded, ...(tokens ? { tokens } : {}), input };
+  return {
+    ...recorded,
+    ...(tokens ? { tokens } : {}),
+    input,
+    calls,
+    ...(sensitivityReport ? { sensitivity: sensitivityReport } : {}),
+  };
 }
 
 export type RoutingReport = {
@@ -723,6 +902,8 @@ export async function runRouting(
     concurrency?: number;
     limit?: number;
     dryRun?: boolean;
+    /** The sensitivity pass; on unless `false`. */
+    sensitivity?: boolean;
     progress?: (line: string) => void;
   } = {},
 ): Promise<RoutingReport> {
@@ -745,13 +926,11 @@ export async function runRouting(
       let result: Awaited<ReturnType<typeof planSession>>;
       try {
         for (let window = 0; ; window++) {
-          result = await planSession(
-            archive,
-            model,
-            item.archiveId,
-            options.dryRun ? { dryRun: true } : {},
-          );
-          report.calls++;
+          result = await planSession(archive, model, item.archiveId, {
+            ...(options.dryRun ? { dryRun: true } : {}),
+            ...(options.sensitivity === false ? { sensitivity: false } : {}),
+          });
+          report.calls += result.calls ?? 1;
           for (const field of ['input', 'output', 'cacheRead', 'cacheWrite'] as const)
             report.tokens[field] += result.tokens?.[field] ?? 0;
           const more = result.input && result.input.through < result.input.total - 1;
@@ -819,6 +998,10 @@ export async function runBackfill(
     dryRun?: boolean;
     concurrency?: number;
     limit?: number;
+    /** The second, sanitizing call per work part (`sensitivityPass`); on unless `false`. */
+    sensitivity?: boolean;
+    /** Plan only these archives (a tiny test); others are left unplanned. */
+    only?: ReadonlySet<string>;
     progress?: (line: string) => void;
   } = {},
 ): Promise<BackfillReport> {
@@ -872,6 +1055,7 @@ export async function runBackfill(
       return await planSession(archive, model, archiveId, {
         ...(options.dryRun ? { dryRun: true } : {}),
         ...(options.dryRun && parentReach ? { assumeParentReach: parentReach } : {}),
+        ...(options.sensitivity === false ? { sensitivity: false } : {}),
       });
     } catch (error) {
       return {
@@ -890,7 +1074,9 @@ export async function runBackfill(
         ...(options.dryRun ? { withoutParents: true } : {}),
       })
     ).filter(
-      (d) => d.reason === 'partial' || !report.rows.some((r) => r.archiveId === d.archiveId),
+      (d) =>
+        (!options.only || options.only.has(d.archiveId)) &&
+        (d.reason === 'partial' || !report.rows.some((r) => r.archiveId === d.archiveId)),
     );
     if (!due.length) break;
     report.due += due.length;

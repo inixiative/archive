@@ -53,6 +53,7 @@ test('serve --sync publishes what it receives to its destinations from the same 
         publish: 'on',
         cleanup: 'leaked',
         cleanupFor: {},
+        personalSpans: 'hold',
       }),
     );
     const reader = local.stdout.getReader();

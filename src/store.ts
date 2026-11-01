@@ -1940,6 +1940,7 @@ export class ArchiveStore {
       const foreign = context.foreignLabel.get(entry.id);
       return {
         index,
+        id: entry.id,
         kind: entry.kind,
         // Shown as stored, so a redaction quoting it matches byte for byte.
         text: clip(entry.text, max),
