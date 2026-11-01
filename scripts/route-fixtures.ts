@@ -93,6 +93,8 @@ const { values: v } = parseArgs({
      * (a control for code that changed after the run).
      */
     replay: { type: 'string' },
+    /** Write the published text of cases with sensitive markers here (private). */
+    texts: { type: 'string' },
   },
 });
 if (!v.database || !v.cases || !v.agents || !v.home)
@@ -384,6 +386,7 @@ type Score = Judgement & {
   issues?: string[];
   parts: { from: number; to: number; organizations: string[]; sensitive: boolean }[];
   redactions: number;
+  publishedChars: number;
   prunes: number;
   parent?: { status: string; reach: string[] };
   strict: Judgement;
@@ -422,6 +425,16 @@ for (const c of cases.cases.filter((c) => !only || only.has(c.label))) {
     })),
     redactions: result?.plan?.redactions.length ?? 0,
     prunes: result?.plan?.prune.length ?? 0,
+    // What publishes, in characters, each redaction marker counted as none (over-redaction).
+    publishedChars: published.reduce(
+      (n, p) =>
+        n +
+        p.snapshot.entries.reduce(
+          (m, e) => m + e.text.replace(/\[redacted: [^\]]*\]/g, '').length,
+          0,
+        ),
+      0,
+    ),
     ...(parentId ? { parent: reachOf(parentId) } : {}),
     ...judge(c, session, valid, published),
     strict: judge(c, session, valid, strict),
@@ -455,6 +468,18 @@ const output = {
 if (v.out) {
   mkdirSync(resolve(v.out, '..'), { recursive: true });
   writeFileSync(v.out, `${JSON.stringify(output, null, 2)}\n`);
+}
+// The published text of every case with sensitive markers, for reading them for meaning (private).
+if (v.texts) {
+  const texts: Record<string, { organizations: string[]; entries: string[] }[]> = {};
+  for (const c of cases.cases.filter((c) => c.expect.sensitive && (!only || only.has(c.label)))) {
+    const result = results.get(sessionOf(c).id);
+    texts[c.label] = (result?.parts ?? []).map((p, i) => ({
+      organizations: p.organizations,
+      entries: (result?.snapshots?.[i]?.entries ?? []).map((e) => e.text),
+    }));
+  }
+  writeFileSync(v.texts, `${JSON.stringify(texts, null, 2)}\n`, { mode: 0o600 });
 }
 const flags = (j: Judgement) =>
   [
