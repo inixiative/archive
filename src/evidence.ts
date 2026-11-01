@@ -2,7 +2,13 @@ import { isAbsolute, resolve } from 'node:path';
 import { z } from 'zod';
 import type { Routing } from './config';
 import { type ArchiveSnapshot, digest } from './index';
-import { projectPaths, referencesIn, toolCallAccess } from './tags';
+import {
+  PROJECT_TAG_PREFIX,
+  projectPaths,
+  referencesIn,
+  repositorySlug,
+  toolCallAccess,
+} from './tags';
 
 /**
  * The machine's projects as the collectors see them: each project's roots and worktrees (read
@@ -57,7 +63,6 @@ export type SessionEvidence = {
 const bump = (counts: Counts, key: string) => {
   counts[key] = (counts[key] ?? 0) + 1;
 };
-const slugOf = (ref: string) => ref.match(/^([\w.-]+\/[\w.-]+?)(?:[#@/].*)?$/)?.[1]?.toLowerCase();
 
 /**
  * Per kept entry of `keptIds` (the entries the stored snapshot holds), the evidence of what the
@@ -72,16 +77,7 @@ export function sessionEvidence(
   cwd?: string,
 ): SessionEvidence {
   const resolvePath = projectPaths(map.projects);
-  const roots = map.projects.flatMap(({ projectId, roots }) =>
-    roots.map((root) => ({ projectId, root: resolve(root) })),
-  );
-  const containers = new Set(
-    roots
-      .filter(({ projectId, root }) =>
-        roots.some((o) => o.projectId !== projectId && o.root.startsWith(`${root}/`)),
-      )
-      .map(({ root }) => root),
-  );
+  const { containers } = resolvePath;
   const byRepository = new Map<string, string>();
   for (const project of map.projects)
     for (const repository of project.repositories) byRepository.set(repository, project.projectId);
@@ -104,7 +100,7 @@ export function sessionEvidence(
           if (pending[field]) current[field] = { ...pending[field] };
     }
     for (const reference of referencesIn(entry.text)) {
-      const slug = reference.integration === 'github' ? slugOf(reference.ref) : undefined;
+      const slug = reference.integration === 'github' ? repositorySlug(reference.ref) : undefined;
       if (slug) add('references', slug);
     }
     if (entry.kind !== 'tool-call') continue;
@@ -206,4 +202,41 @@ export function evidencedOrganizations(
   if (startOrganization) found.add(startOrganization);
   found.delete('personal');
   return found;
+}
+
+/**
+ * The projects a session worked in: `project:<projectId>` for each project its tool calls wrote or
+ * read in (`sessionEvidence`, the one loop over a session's paths) or its working directory sits
+ * in, most first. Mentions (text written, prompts, messages, prose) never count, and naming a pure
+ * container (a root holding other projects' roots, like `~/code/inixiative`) by itself tags
+ * nothing. Routing is unaffected: tags are for search.
+ */
+export function projectTags(
+  snapshot: Pick<ArchiveSnapshot, 'entries'>,
+  projects: { projectId: string; roots: Iterable<string> }[],
+  cwd?: string,
+  limit = 20,
+): string[] {
+  const map = {
+    projects: projects.map(({ projectId, roots }) => ({
+      projectId,
+      roots: [...roots],
+      repositories: [],
+    })),
+  };
+  const evidence = sessionEvidence(snapshot, new Set(snapshot.entries.map((e) => e.id)), map, cwd);
+  const counts = new Map<string, number>();
+  const add = (projectId: string, n: number) =>
+    counts.set(projectId, (counts.get(projectId) ?? 0) + n);
+  const resolvePath = projectPaths(map.projects);
+  if (cwd && !resolvePath.containers.has(resolve(cwd)) && evidence.startProjectId)
+    add(evidence.startProjectId, 1);
+  for (const anchor of evidence.anchors)
+    for (const field of [anchor.writes, anchor.reads])
+      for (const [projectId, n] of Object.entries(field ?? {})) add(projectId, n);
+  return [...counts]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([projectId]) => `${PROJECT_TAG_PREFIX}${projectId}`)
+    .filter((tag) => tag.length <= 120);
 }

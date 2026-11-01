@@ -28,7 +28,7 @@ import {
   UNROUTED,
 } from './collector';
 import type { ProjectMap } from './evidence';
-import { provenanceReferences } from './tags';
+import { repositorySlug } from './tags';
 
 export const defaultHome = () => join(homedir(), '.local/share/archive');
 export const AGENT_LABEL_PREFIX = 'com.inixiative.archive.';
@@ -185,7 +185,7 @@ export function machineProjectMap(config: AgentsConfig): ProjectMap {
         for (const root of sorted) {
           if (!remotes.has(root)) {
             const url = git(root, 'remote', 'get-url', 'origin');
-            remotes.set(root, url ? provenanceReferences({ repository: url })[0]?.ref : undefined);
+            remotes.set(root, url?.includes('github.com') ? repositorySlug(url) : undefined);
           }
           const repository = remotes.get(root);
           if (repository) repositories.add(repository);

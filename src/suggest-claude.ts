@@ -5,6 +5,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -57,6 +58,8 @@ export async function claudeSubscription(bin = 'claude', configDir?: string | nu
 }
 
 /** Where Claude Code keeps a working directory's transcripts, as it names that folder. */
+// agent-session's ClaudePrimedSessions sweeps only its own directory, on first use, through private
+// methods; a dead run's directory has no host left to sweep it, so the folder naming is mirrored.
 const transcriptsOf = (cwd: string, configDir?: string) => {
   try {
     return join(
@@ -85,11 +88,12 @@ const RUN_DIRECTORY = /^(?:suggest|route)-[0-9a-f-]{36}$/;
  * A run's directory names its process (`.owner`); one whose process is gone, or that names none,
  * is swept. Returns the directories swept.
  */
-export function sweepDecisionRuns(parent: string, configDir?: string) {
+export function sweepDecisionRuns(parent: string, configDir?: string, role?: 'suggest' | 'route') {
   if (!existsSync(parent)) return [];
   const swept: string[] = [];
   for (const name of readdirSync(parent)) {
-    if (!RUN_DIRECTORY.test(name)) continue;
+    // A role sweeps its own runs: another role's transcripts live under its own login.
+    if (!RUN_DIRECTORY.test(name) || (role && !name.startsWith(`${role}-`))) continue;
     const dir = join(parent, name);
     let pid = 0;
     try {
@@ -136,11 +140,15 @@ export async function claudeDecisionModel(
   const parent = join(options.home, 'decision-receipts');
   mkdirSync(parent, { recursive: true, mode: 0o700 });
   chmodSync(parent, 0o700);
-  sweepDecisionRuns(parent, env.CLAUDE_CONFIG_DIR);
-  // One directory per run: a primed host sweeps its directory's transcripts on first use.
-  const cwd = join(parent, `${role}-${crypto.randomUUID()}`);
-  mkdirSync(cwd, { mode: 0o700 });
-  writeFileSync(join(cwd, OWNER), `${process.pid}\n`, { mode: 0o600 });
+  sweepDecisionRuns(parent, env.CLAUDE_CONFIG_DIR, role);
+  // One directory per run: a primed host sweeps its directory's transcripts on first use. It
+  // appears under its run name only once it names its process, so a sweep never takes a live one.
+  const id = crypto.randomUUID();
+  const cwd = join(parent, `${role}-${id}`);
+  const pending = join(parent, `.pending-${id}`);
+  mkdirSync(pending, { mode: 0o700 });
+  writeFileSync(join(pending, OWNER), `${process.pid}\n`, { mode: 0o600 });
+  renameSync(pending, cwd);
   const model = options.model ?? defaultModel;
   const sessions = new ClaudePrimedSessions({
     ...(options.bin ? { bin: options.bin } : {}),

@@ -431,7 +431,9 @@ test('decision runs that died leave nothing behind: their directories and primed
     const transcripts = join(config, 'projects', realpathSync(dead).replace(/[^a-zA-Z0-9]/g, '-'));
     mkdirSync(transcripts, { recursive: true });
     writeFileSync(join(transcripts, 'primed.jsonl'), '{}\n');
-    expect(sweepDecisionRuns(parent, config)).toEqual([dead]);
+    // A role sweeps only its own runs.
+    expect(sweepDecisionRuns(parent, config, 'suggest')).toEqual([]);
+    expect(sweepDecisionRuns(parent, config, 'route')).toEqual([dead]);
     expect(existsSync(dead) || existsSync(transcripts)).toBe(false);
     expect(existsSync(live)).toBe(true);
   } finally {

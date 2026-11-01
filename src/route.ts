@@ -10,7 +10,7 @@ import {
 } from './evidence';
 import type { ArchiveEntry } from './index';
 import { REDACTION_REASONS, type Redaction } from './parts';
-import type { SuggestModel, TokenUsage } from './suggest';
+import { pool, type SuggestModel, type TokenUsage } from './suggest';
 
 /** The organization a part stays in when it is no organization's: this machine only. */
 export const PERSONAL = 'personal';
@@ -616,10 +616,8 @@ export async function runRouting(
     tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     sessions: [],
   };
-  let next = 0;
-  const work = async () => {
-    while (next < due.length) {
-      const item = due[next++]!;
+  await pool(due, options.concurrency ?? 2, async (item) => {
+    {
       let result: Awaited<ReturnType<typeof planSession>>;
       try {
         for (let window = 0; ; window++) {
@@ -655,8 +653,7 @@ export async function runRouting(
         `${report.planned}/${report.due} planned · ${report.valid} valid · ${report.held} held`,
       );
     }
-  };
-  await Promise.all(Array.from({ length: Math.min(options.concurrency ?? 2, due.length) }, work));
+  });
   return report;
 }
 
@@ -750,14 +747,8 @@ export async function runBackfill(
       };
     }
   };
-  const pool = async (ids: string[], run: (id: string) => Promise<void>) => {
-    let next = 0;
-    await Promise.all(
-      Array.from({ length: Math.min(options.concurrency ?? 2, ids.length) }, async () => {
-        while (next < ids.length) await run(ids[next++]!);
-      }),
-    );
-  };
+  const each = (ids: string[], run: (id: string) => Promise<void>) =>
+    pool(ids, options.concurrency ?? 2, run);
   for (let pass = 0; pass < 20; pass++) {
     const due = (
       await archive.routingDue({
@@ -769,7 +760,7 @@ export async function runBackfill(
     if (!due.length) break;
     report.due += due.length;
     if (!options.dryRun) {
-      await pool(
+      await each(
         due.map((d) => d.archiveId),
         async (id) => add(id, await plan(id)),
       );
@@ -780,7 +771,7 @@ export async function runBackfill(
     for (const d of due)
       levels.set(d.depth ?? 0, [...(levels.get(d.depth ?? 0) ?? []), d.archiveId]);
     for (const depth of [...levels.keys()].sort((a, b) => a - b))
-      await pool(levels.get(depth)!, async (id) => {
+      await each(levels.get(depth)!, async (id) => {
         const input = await archive.routingInput({ archiveId: id }).catch(() => undefined);
         const parent = input?.parentArchiveId ? reach.get(input.parentArchiveId) : undefined;
         add(id, await plan(id, input?.parentArchiveId ? (parent ?? []) : undefined));

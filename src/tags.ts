@@ -99,14 +99,25 @@ export function archiveReferences(
     .slice(0, limit);
 }
 
+/**
+ * A GitHub repository as `owner/name`, lower case, from a remote or web URL (`https://github.com/…`,
+ * `git@github.com:….git`), a slug, or a reference to an item in it (`owner/name#12`,
+ * `owner/name@sha`, `owner/name/tree/branch`). The one parser for repositories.
+ */
+export const repositorySlug = (value: string) =>
+  value
+    .replace(/^(?:https?:\/\/|ssh:\/\/git@|git@)?(?:www\.)?github\.com[:/]/, '')
+    .match(/^([\w.-]+\/[\w.-]+?)(?:\.git)?(?:[/#@?].*)?$/)?.[1]
+    ?.toLowerCase();
+
 /** Recorded git context of a session, as GitHub references to its repository and branch. */
 export function provenanceReferences(context: {
   repository?: string;
   branch?: string;
 }): ArchiveReference[] {
-  const repository = context.repository
-    ?.match(/github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/)?.[1]
-    .toLowerCase();
+  const repository = context.repository?.includes('github.com')
+    ? repositorySlug(context.repository)
+    : undefined;
   if (!repository) return [];
   return [
     { integration: 'github', ref: repository },
@@ -325,11 +336,6 @@ const RUNNERS: Record<string, Set<string> | true> = {
   prisma: true,
 };
 const WRAPPERS = new Set(['sudo', 'env', 'command', 'nohup', 'time', 'exec']);
-const repositorySlug = (value: string) =>
-  value
-    .replace(/^https?:\/\/github\.com\//, '')
-    .match(/^([\w.-]+\/[\w.-]+?)(?:\.git)?(?:[/#?].*)?$/)?.[1]
-    ?.toLowerCase();
 
 /**
  * One parser, two modes: the paths a shell script accesses (path-shaped arguments, redirections,
@@ -585,46 +591,18 @@ export type ProjectPath = { projectId: string; root: string; path: string };
 /**
  * A resolver from absolute paths to the project holding each, the longest root winning:
  * worktrees can live inside their main checkout, and a container (`~/code/inixiative`) holds
- * other projects' roots. A path outside every root resolves to nothing.
+ * other projects' roots. A path outside every root resolves to nothing; the filesystem root is
+ * never a root. `containers` are the roots that hold another project's root.
  */
 export function projectPaths(
   projects: { projectId: string; roots: Iterable<string> }[],
-): (path: string) => ProjectPath | undefined {
+): ((path: string) => ProjectPath | undefined) & { containers: ReadonlySet<string> } {
   const roots = projects
     .flatMap(({ projectId, roots }) =>
       [...roots].map((root) => ({ projectId, root: resolve(root) })),
     )
     .filter(({ root }) => root !== '/')
     .sort((a, b) => b.root.length - a.root.length);
-  return (path) => {
-    const owner = roots.find(({ root }) => path === root || path.startsWith(`${root}/`));
-    return (
-      owner && { ...owner, path: path === owner.root ? '' : path.slice(owner.root.length + 1) }
-    );
-  };
-}
-
-/**
- * The projects a session worked in, from the paths its tool calls access (`toolCallPaths`) and its
- * working directory: `project:<projectId>` for each project with a root (or worktree) holding
- * one, the longest root winning. Mentions (text written, prompts, messages, prose) never count. A
- * pure container (a root holding other projects' roots, like `~/code/inixiative`) named by itself
- * tags nothing: listing the folder of every checkout is not working in any. A project's own root
- * (`git -C ~/code/zealot`), even one holding its own worktrees, counts. Routing is unaffected: a
- * session keeps its own project and is tagged with every project it touched, its own included.
- */
-export function projectTags(
-  snapshot: Pick<ArchiveSnapshot, 'entries'>,
-  projects: { projectId: string; roots: Iterable<string> }[],
-  cwd?: string,
-  limit = 20,
-): string[] {
-  const roots = projects
-    .flatMap(({ projectId, roots }) =>
-      [...roots].map((root) => ({ projectId, root: resolve(root) })),
-    )
-    .filter(({ root }) => root !== '/');
-  if (!roots.length) return [];
   const containers = new Set(
     roots
       .filter(({ projectId, root }) =>
@@ -632,19 +610,11 @@ export function projectTags(
       )
       .map(({ root }) => root),
   );
-  const resolvePath = projectPaths(projects);
-  const counts = new Map<string, number>();
-  const count = (path: string) => {
-    if (containers.has(path)) return;
-    const owner = resolvePath(path);
-    if (owner) counts.set(owner.projectId, (counts.get(owner.projectId) ?? 0) + 1);
+  const resolvePath = (path: string) => {
+    const owner = roots.find(({ root }) => path === root || path.startsWith(`${root}/`));
+    return (
+      owner && { ...owner, path: path === owner.root ? '' : path.slice(owner.root.length + 1) }
+    );
   };
-  if (cwd) count(resolve(cwd));
-  for (const entry of snapshot.entries)
-    if (entry.kind === 'tool-call') for (const path of toolCallPaths(entry.text, cwd)) count(path);
-  return [...counts]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, limit)
-    .map(([projectId]) => `${PROJECT_TAG_PREFIX}${projectId}`)
-    .filter((tag) => tag.length <= 120);
+  return Object.assign(resolvePath, { containers });
 }

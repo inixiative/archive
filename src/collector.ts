@@ -10,6 +10,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { projectTags } from './evidence';
 import { cwdRunTags, exemptRun, temporaryRoots } from './exemption';
 import { claudeSessionId } from './import';
 import { importTranscriptFile, transcriptAgentId } from './import-file';
@@ -21,7 +22,7 @@ import {
   UNROUTED,
 } from './index';
 import type { ArchiveClient } from './remote';
-import { type AtlasFileConcepts, atlasTags, projectTags, provenanceReferences } from './tags';
+import { type AtlasFileConcepts, atlasTags, provenanceReferences } from './tags';
 
 export { UNROUTED } from './index';
 
