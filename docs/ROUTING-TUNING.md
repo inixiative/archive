@@ -148,3 +148,34 @@ Two runs on the shipped charter (`v0-baseline.txt`, sha `1f99358a`), on this bra
 - The code fixes do what they target: no answer was rejected as unparseable in either run, one bad redaction no longer holds a whole plan, and an echo of a redacted remark no longer publishes.
 - The remaining failures are planner judgments: 512aaec0a6 (opener unsplit in run b), 01b0bda06a (one part to both organizations, and no redaction in run b) and 40b206fa84 (the whole session to UE or to both, never only the Zealot-worktree stretch).
 - 1d3942e03f still follows its 13k-entry parent's reach, which varies run to run.
+
+## Sensitivity pass (experiment, 2026-11-01, `exp/sensitivity-pass`; UNDER EXPERIMENT, not decided)
+
+**Change.** After the planner proposes, a second Sonnet-low call per work part reads that part's window entries, the organizations they would reach and the roster, and answers with redactions or "hold part". It can only remove: its redactions are added to the planner's, a hold makes the part personal, and an answer it can't read holds the part. The planner is held fixed. Both arms replay the recorded proposals of the `fix a` and `fix b` runs above, so only the pass varies. Controls replay the same proposals with the pass off and match `fix a` / `fix b` case for case (40b206fa84 is excluded: its transcript changed since those runs). Pre-registered design (rev 3, adversarially reviewed, verdict go) and its gates are kept privately with the experiment data.
+
+**Gates.**
+- G1: in each control observation where a marker reached a work organization, the treatment publishes no marker *and* still reaches the control's organizations; the published text is also read for the same content in other words. Three observations: (a, 512aaec0a6), (b, 512aaec0a6) and (b, 01b0bda06a).
+- G2: no paired loss on the 8 replayable non-target cases.
+- G3: published characters per non-target case ≥ 95% of the paired control.
+
+| Case | control a | treatment a | control b | treatment b |
+|---|---|---|---|---|
+| ae88b51ff2 personal | H | H | H | H |
+| 65fa49fe13 personal | H | H | P | P |
+| 512aaec0a6 split | P, 0 markers | P, 0 markers | f, 4 markers to inixiative | **f, 3 markers to inixiative** |
+| 671481a4f6 UE | P | P | P | P |
+| 95a4acd0e0 UE | P | P | P | P (99.3% chars) |
+| 382e18e4cb UE (subagent) | P | P | P | P |
+| 388f6c08c7 UE | P | P | P | P |
+| 1d3942e03f UE or UE+inixiative | f (parent → inixiative) | f (same) | P | P |
+| 6b93e47069 inixiative (subagent) | P | P | P | P |
+| 01b0bda06a UE + inixiative, redacted | f, held to personal | f, same | f, 1 marker to both | f on split only, **0 markers, reaches both** |
+
+**Result: G1 failed (2 of 3 observations met); G2 and G3 met.**
+- G1: (a, 512) still leaks none and reaches inixiative. In (b, 01b0) the pass redacts the coworker remark in both entries where it appears, nothing restates it, and the session still reaches inixiative and UE. In (b, 512) the pass redacts one career sentence and misses the rest: 3 of the 4 markers still reach inixiative. The tiny test, a separate pass call on the same proposal, left 2 of 4. Across the three pass calls on that proposal, a marker reached a work organization every time.
+- G2: no paired loss. 1d3942e03f fails in control a too (it follows its parent's reach).
+- G3: every non-target case keeps ≥ 99.3% of its control's characters. n/a where the control publishes nothing: ae88b51ff2, 65fa49fe13 in both arms, and 40b206fa84 (excluded).
+- The pass held no part and never returned an unreadable answer (21 calls). Its redactions on non-target cases were small (profanity, a frustrated remark, a giphy line).
+- Two G1 observations rest on one pass call each, so this run doesn't estimate how often the pass misses.
+
+**Cost.** Pass calls only (the planner was replayed): tiny test 2 calls, 89k tokens; treatment b 11 calls, 260k; treatment a 10 calls, 228k. Total 577k, nearly all cache writes. Five-hour window 20% → 21%, seven-day 31% → 31%.
