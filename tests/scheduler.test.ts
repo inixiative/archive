@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { agentUnits } from '../src/agents';
 import type { Routing } from '../src/config';
 import { type ArchiveEntry, archiveSnapshotSchema } from '../src/index';
-import { type RoutingArchive, runRouting } from '../src/route';
+import { type RoutingArchive, runBackfill, runRouting } from '../src/route';
 import type { SuggestModel } from '../src/suggest';
 import { freshStore } from './db';
 
@@ -63,6 +63,8 @@ test('due sessions: unplanned now; with new entries once paused or an hour (stag
     recordPlan: (b) => store.recordPlan(b, routing),
     routingDue: (b) => store.routingDue(b),
   };
+  const due = async (options: Parameters<typeof store.routingDue>[0]) =>
+    (await store.routingDue(options)).map(({ archiveId, reason }) => ({ archiveId, reason }));
   const t0 = 1_800_000_000_000;
   const { id } = await store.capture(session('a', 2), { cwd: '/w/template' });
   const { id: child } = await store.capture(
@@ -73,34 +75,30 @@ test('due sessions: unplanned now; with new entries once paused or an hour (stag
   );
   await store.capture(session('probe', 2, { tags: ['run:test'] }), { cwd: '/w/template' });
   // The subagent waits for its parent; the run is never planned.
-  expect(await store.routingDue({ now: t0, limit: 10 })).toEqual([
-    { archiveId: id, reason: 'unplanned' },
-  ]);
+  expect(await due({ now: t0, limit: 10 })).toEqual([{ archiveId: id, reason: 'unplanned' }]);
   const first = await runRouting(archive, model, { limit: 10 });
   expect(first).toMatchObject({ due: 1, valid: 1 });
-  expect(await store.routingDue({ now: Date.now(), limit: 10 })).toEqual([
+  expect(await due({ now: Date.now(), limit: 10 })).toEqual([
     { archiveId: child, reason: 'unplanned' },
   ]);
   await runRouting(archive, model);
   // Planned and unchanged: nothing is due, parts included.
-  expect(await store.routingDue({ now: Date.now() + 10 * 3_600_000, limit: 10 })).toEqual([]);
+  expect(await due({ now: Date.now() + 10 * 3_600_000, limit: 10 })).toEqual([]);
   // New entries: due once paused, or once the hour (plus its stagger) has passed.
   const grown = session('a', 4);
   grown.capturedAt = Date.now();
   await store.capture(grown, { cwd: '/w/template' });
   const plannedAt = (await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } })).at;
-  expect(await store.routingDue({ now: grown.capturedAt + 60_000, limit: 10 })).toEqual([]);
-  expect(await store.routingDue({ now: grown.capturedAt + 31 * 60_000, limit: 10 })).toEqual([
+  expect(await due({ now: grown.capturedAt + 60_000, limit: 10 })).toEqual([]);
+  expect(await due({ now: grown.capturedAt + 31 * 60_000, limit: 10 })).toEqual([
     { archiveId: id, reason: 'new entries, paused' },
   ]);
-  expect(
-    await store.routingDue({ now: plannedAt + 71 * 60_000, pausedMs: 10 * 3_600_000, limit: 10 }),
-  ).toEqual([{ archiveId: id, reason: 'new entries' }]);
+  expect(await due({ now: plannedAt + 71 * 60_000, pausedMs: 10 * 3_600_000, limit: 10 })).toEqual([
+    { archiveId: id, reason: 'new entries' },
+  ]);
   // A person's route: decision makes it due at once.
   await store.tag(child, { add: ['route:personal'] });
-  expect((await store.routingDue({ now: Date.now(), limit: 10 })).map((d) => d.reason)).toContain(
-    'decision',
-  );
+  expect((await due({ now: Date.now(), limit: 10 })).map((d) => d.reason)).toContain('decision');
   const report = await runRouting(archive, model, { limit: 10 });
   expect(report.sessions.find((s) => s.archiveId === child)?.status).toBe('valid');
   // The decision narrowed the subagent to personal: it publishes nothing.
@@ -130,4 +128,79 @@ test('the router is a unit beside the collectors when declared, with the Claude 
     '/h',
   ]);
   expect(agentUnits({ collectors: [] }, { home: '/h' })).toEqual([]);
+});
+
+test('a backfill dry run plans every session, subagents against their parent’s dry-run plan, stores nothing, and reports what changes against what destinations hold', async () => {
+  const store = await freshStore();
+  const routed: Routing = {
+    organizations: [
+      { id: 'inixiative', projects: ['template'] },
+      { id: 'userevidence', projects: ['zealot'] },
+    ],
+    destinations: [
+      {
+        kind: 'archive',
+        organizationId: 'userevidence',
+        url: 'https://ue.example/',
+        tokenEnv: 'UE_TOKEN',
+      },
+    ],
+  };
+  await store.setProjectMap({
+    projects: [
+      { projectId: 'template', roots: ['/w/template'], repositories: [] },
+      { projectId: 'zealot', roots: ['/z'], repositories: [] },
+    ],
+  });
+  const archive: RoutingArchive = {
+    routingInput: (b) => store.routingInput(b.archiveId, routed),
+    recordPlan: (b) => store.recordPlan(b, routed),
+    routingDue: (b) => store.routingDue(b),
+  };
+  // The leak: a template session UserEvidence holds whole.
+  const { id: leaked, digest } = await store.capture(session('leaked', 2), { cwd: '/w/template' });
+  await store.delivered(leaked, JSON.stringify(['https://ue.example', '/', 'standalone']), digest);
+  const { id: root } = await store.capture(session('root', 2), { cwd: '/z' });
+  const { id: child } = await store.capture(
+    session('root/agent-x', 2, {
+      lineage: { kind: 'subagent', parentSessionId: 'root', rootSessionId: 'root' },
+    }),
+    { cwd: '/z' },
+  );
+  const answers: Record<string, string[]> = {
+    leaked: ['personal'],
+    root: ['userevidence'],
+    'root/agent-x': ['userevidence'],
+  };
+  const planner: SuggestModel = {
+    model: 'claude-sonnet-5-5',
+    async decide({ input }) {
+      const title = input.match(/^title: (.+)$/m)![1]!;
+      return {
+        content: JSON.stringify({ parts: [{ from: 0, to: 1, organizations: answers[title] }] }),
+      };
+    },
+  };
+  const dry = await runBackfill(archive, planner, { dryRun: true });
+  expect(dry).toMatchObject({ dryRun: true, due: 3, valid: 3, held: 0 });
+  expect(dry.rows.find((r) => r.archiveId === leaked)).toMatchObject({
+    holds: ['userevidence'],
+    deletes: ['userevidence'],
+    adds: [],
+  });
+  expect(dry.rows.find((r) => r.archiveId === child)).toMatchObject({
+    status: 'valid',
+    adds: ['userevidence'],
+  });
+  expect(dry.moves).toEqual({ 'userevidence → personal': 1, 'nowhere → userevidence': 2 });
+  expect(await store.db.routingPlan.count()).toBe(0);
+  expect(await store.list({ exempt: 'include', parts: 'only' })).toEqual([]);
+  // Applied, parents first, pass after pass.
+  const applied = await runBackfill(archive, planner);
+  expect(applied).toMatchObject({ dryRun: false, valid: 3 });
+  expect((await store.list({ exempt: 'include', parts: 'only' })).map((p) => p.routedTo)).toEqual([
+    ['userevidence'],
+    ['userevidence'],
+  ]);
+  expect(root).toBeDefined();
 });

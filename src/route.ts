@@ -157,6 +157,8 @@ export type RoutingInput = {
   evidence: OrganizationEvidence;
   children: { description: string; spawnedAt?: number; evidence: OrganizationEvidence }[];
   parent?: { title: string; organizations: string[] };
+  /** The archive of the session that spawned this one, when it is a subagent or fork. */
+  parentArchiveId?: string;
   /** A person's ownership decisions (`route:` tag edits). */
   overrides: string[];
 };
@@ -469,7 +471,11 @@ export function quotedSessions(text: string, rootSessionId: string): string[] | 
 export interface RoutingArchive {
   routingInput(body: { archiveId: string }): Promise<RoutingInput>;
   recordPlan(body: RecordPlanBody): Promise<RecordPlanResult>;
-  routingDue(body: { limit: number }): Promise<{ archiveId: string; reason: string }[]>;
+  routingDue(body: {
+    limit: number;
+    unplanned?: boolean;
+    withoutParents?: boolean;
+  }): Promise<{ archiveId: string; reason: string; depth?: number }[]>;
 }
 export type RecordPlanBody = {
   archiveId: string;
@@ -481,6 +487,11 @@ export type RecordPlanBody = {
   proposal?: ProposedPlan;
   failure?: string;
   dryRun?: boolean;
+  /**
+   * A dry run only: where the parent's plan, itself a dry run, reaches, so a backfill can judge a
+   * subagent before anything is stored. Ignored when the plan is applied.
+   */
+  assumeParentReach?: string[];
 };
 export type RecordPlanResult = {
   status: 'valid' | 'held' | 'stale';
@@ -490,6 +501,8 @@ export type RecordPlanResult = {
   /** Parts as they now publish, by part session id, with their organizations. */
   parts?: { sessionId: string; organizations: string[]; entries: number }[];
   retired?: string[];
+  /** The organizations whose destinations hold this session or its parts now (receipts). */
+  holds?: string[];
 };
 
 /**
@@ -623,6 +636,136 @@ export async function runRouting(
     }
   };
   await Promise.all(Array.from({ length: Math.min(options.concurrency ?? 2, due.length) }, work));
+  return report;
+}
+
+/** One session of a backfill: what its destinations hold now against what its plan publishes. */
+export type BackfillRow = {
+  archiveId: string;
+  title: string;
+  status: string;
+  issues?: string[];
+  holds: string[];
+  publishes: { sessionId: string; organizations: string[]; entries: number }[];
+  /** Organizations that hold it now and would hold none of it, and ones it would newly reach. */
+  deletes: string[];
+  adds: string[];
+};
+export type BackfillReport = Omit<RoutingReport, 'sessions'> & {
+  dryRun: boolean;
+  rows: BackfillRow[];
+  /** Sessions per change, e.g. `userevidence → personal`. */
+  moves: Record<string, number>;
+};
+
+/**
+ * Plans every session that has no plan yet, parents before their subagents, and reports, per
+ * session, what its destinations hold now against what its plan publishes. A dry run stores
+ * nothing: a subagent is judged against its parent's dry-run plan. Otherwise plans apply as the
+ * scheduler's do, pass after pass, until nothing more is due.
+ */
+export async function runBackfill(
+  archive: RoutingArchive,
+  model: SuggestModel,
+  options: {
+    dryRun?: boolean;
+    concurrency?: number;
+    limit?: number;
+    progress?: (line: string) => void;
+  } = {},
+): Promise<BackfillReport> {
+  const report: BackfillReport = {
+    model: model.model,
+    dryRun: Boolean(options.dryRun),
+    due: 0,
+    planned: 0,
+    valid: 0,
+    held: 0,
+    calls: 0,
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    rows: [],
+    moves: {},
+  };
+  const reach = new Map<string, string[]>();
+  const add = (archiveId: string, result: Awaited<ReturnType<typeof planSession>>) => {
+    report.planned++;
+    report.calls++;
+    for (const field of ['input', 'output', 'cacheRead', 'cacheWrite'] as const)
+      report.tokens[field] += result.tokens?.[field] ?? 0;
+    if (result.status === 'valid') report.valid++;
+    if (result.status === 'held') report.held++;
+    const publishes = result.parts ?? [];
+    const reached = [...new Set(publishes.flatMap((p) => p.organizations))].sort();
+    reach.set(archiveId, reached);
+    const holds = result.holds ?? [];
+    const row: BackfillRow = {
+      archiveId,
+      title: (result.input?.session.title ?? '').slice(0, 120),
+      status: result.status,
+      ...(result.issues?.length ? { issues: result.issues } : {}),
+      holds,
+      publishes,
+      deletes: result.status === 'valid' ? holds.filter((o) => !reached.includes(o)) : [],
+      adds: result.status === 'valid' ? reached.filter((o) => !holds.includes(o)) : [],
+    };
+    report.rows.push(row);
+    const from = holds.length ? holds.join('+') : 'nowhere';
+    const to = result.status === 'valid' ? reached.join('+') || PERSONAL : result.status;
+    report.moves[`${from} → ${to}`] = (report.moves[`${from} → ${to}`] ?? 0) + 1;
+    options.progress?.(
+      `${report.planned}/${report.due} planned · ${report.valid} valid · ${report.held} held`,
+    );
+  };
+  const plan = async (archiveId: string, parentReach?: string[]) => {
+    try {
+      return await planSession(archive, model, archiveId, {
+        ...(options.dryRun ? { dryRun: true } : {}),
+        ...(options.dryRun && parentReach ? { assumeParentReach: parentReach } : {}),
+      });
+    } catch (error) {
+      return {
+        status: 'held' as const,
+        issues: [error instanceof Error ? error.message : String(error)],
+      };
+    }
+  };
+  const pool = async (ids: string[], run: (id: string) => Promise<void>) => {
+    let next = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(options.concurrency ?? 2, ids.length) }, async () => {
+        while (next < ids.length) await run(ids[next++]!);
+      }),
+    );
+  };
+  for (let pass = 0; pass < 20; pass++) {
+    const due = (
+      await archive.routingDue({
+        limit: options.limit ?? 100_000,
+        unplanned: true,
+        ...(options.dryRun ? { withoutParents: true } : {}),
+      })
+    ).filter((d) => !report.rows.some((r) => r.archiveId === d.archiveId));
+    if (!due.length) break;
+    report.due += due.length;
+    if (!options.dryRun) {
+      await pool(
+        due.map((d) => d.archiveId),
+        async (id) => add(id, await plan(id)),
+      );
+      continue;
+    }
+    // A dry run stores nothing, so a tree is planned level by level, parents first.
+    const levels = new Map<number, string[]>();
+    for (const d of due)
+      levels.set(d.depth ?? 0, [...(levels.get(d.depth ?? 0) ?? []), d.archiveId]);
+    for (const depth of [...levels.keys()].sort((a, b) => a - b))
+      await pool(levels.get(depth)!, async (id) => {
+        const input = await archive.routingInput({ archiveId: id }).catch(() => undefined);
+        const parent = input?.parentArchiveId ? reach.get(input.parentArchiveId) : undefined;
+        add(id, await plan(id, input?.parentArchiveId ? (parent ?? []) : undefined));
+      });
+    break;
+  }
   return report;
 }
 

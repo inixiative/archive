@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { z } from 'zod';
-import type { Routing } from './config';
+import { destinationIdentity, type Routing } from './config';
 import {
   evidenceByOrganization,
   evidencedOrganizations,
@@ -1693,6 +1693,10 @@ export class ArchiveStore {
       parentReach,
       parentIssue,
       parent,
+      parentArchiveId:
+        lineage && lineage.kind !== 'part'
+          ? this.relatedId(snapshot, lineage.parentSessionId)
+          : undefined,
       foreign,
       foreignLabel,
     };
@@ -1805,6 +1809,7 @@ export class ArchiveStore {
         evidence: c.evidence,
       })),
       ...(context.parent ? { parent: context.parent } : {}),
+      ...(context.parentArchiveId ? { parentArchiveId: context.parentArchiveId } : {}),
       overrides: context.overrideTags,
     };
   }
@@ -1850,8 +1855,13 @@ export class ArchiveStore {
       }
       return { status: 'held' as const, issues, notes };
     };
-    if (context.parentIssue) return hold([context.parentIssue]);
-    if (!body.proposal) return hold([body.failure ?? 'no plan']);
+    if (body.dryRun && body.assumeParentReach) {
+      context.parentReach = new Set(body.assumeParentReach);
+      context.parentIssue = undefined;
+    }
+    const holds = await this.heldBy(body.archiveId, routing);
+    if (context.parentIssue) return { ...(await hold([context.parentIssue])), holds };
+    if (!body.proposal) return { ...(await hold([body.failure ?? 'no plan'])), holds };
     const result = validatePlan(body.proposal, {
       entries,
       routing,
@@ -1865,7 +1875,7 @@ export class ArchiveStore {
       ...(context.parentReach ? { parentReach: context.parentReach } : {}),
       foreign: context.foreign,
     });
-    if (result.status === 'held') return hold(result.issues, result.notes);
+    if (result.status === 'held') return { ...(await hold(result.issues, result.notes)), holds };
     const published = publishedParts(
       result.plan,
       entries,
@@ -1894,7 +1904,7 @@ export class ArchiveStore {
         entries: p.snapshot.entries.length,
       })),
     };
-    if (body.dryRun) return { status: 'valid', ...outcome };
+    if (body.dryRun) return { status: 'valid', ...outcome, holds };
     const changed = JSON.stringify(prior) !== JSON.stringify(result.plan);
     const version = (row.routingPlan?.version ?? 0) + (changed ? 1 : 0);
     const fields = {
@@ -1913,7 +1923,18 @@ export class ArchiveStore {
       update: fields,
     });
     const { retired } = await this.applyParts(body.archiveId, parts);
-    return { status: 'valid', version, ...outcome, retired };
+    return { status: 'valid', version, ...outcome, retired, holds };
+  }
+  /** The organizations whose destinations hold this session or one of its parts (receipts). */
+  private async heldBy(archiveId: string, routing: Routing) {
+    const receipts = await this.db.receipt.findMany({
+      where: { OR: [{ archiveId }, { archive: { partOf: archiveId } }] },
+      select: { destination: true },
+    });
+    const byIdentity = new Map(
+      routing.destinations.map((d) => [destinationIdentity(d), d.organizationId]),
+    );
+    return [...new Set(receipts.flatMap((r) => byIdentity.get(r.destination) ?? []))].sort();
   }
   /**
    * Plans for review, most in need first: held ones, then ones with redactions or low confidence
@@ -1972,6 +1993,10 @@ export class ArchiveStore {
     intervalMs?: number;
     pausedMs?: number;
     staggerMs?: number;
+    /** Only sessions with no plan at all (a backfill). */
+    unplanned?: boolean;
+    /** Subagents too, before their parent is planned (a dry run judges them on its own plans). */
+    withoutParents?: boolean;
   }) {
     const now = input.now ?? Date.now();
     const interval = input.intervalMs ?? 60 * 60_000;
@@ -2006,7 +2031,7 @@ export class ArchiveStore {
       if (exemptRun(view.tags)) continue;
       const summary = row.summary as Summary;
       const lineage = summary.lineage;
-      if (lineage && lineage.kind !== 'part') {
+      if (lineage && lineage.kind !== 'part' && !input.withoutParents) {
         const parent = archiveKey({
           sourceId: summary.sourceId,
           source: summary.source,
@@ -2015,6 +2040,7 @@ export class ArchiveStore {
         if (!planned.has(parent)) continue;
       }
       const plan = row.routingPlan;
+      if (input.unplanned && plan) continue;
       const overrides = row.tagEdits
         .filter((e) => e.added && e.tag.startsWith(ROUTE_TAG_PREFIX))
         .map((e) => e.tag)
@@ -2045,7 +2071,9 @@ export class ArchiveStore {
       });
     }
     due.sort((a, b) => a.depth - b.depth || a.capturedAt - b.capturedAt);
-    return due.slice(0, input.limit).map(({ archiveId, reason }) => ({ archiveId, reason }));
+    return due
+      .slice(0, input.limit)
+      .map(({ archiveId, reason, depth }) => ({ archiveId, reason, depth }));
   }
   /** A person read this plan; it leaves the review queue until it changes. */
   async reviewPlan(archiveId: string, now = Date.now()) {

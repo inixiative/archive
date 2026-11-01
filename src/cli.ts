@@ -547,7 +547,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       return;
     }
     if (action) throw new Error('Unknown route command; use --help');
-    const { runRouting } = await import('./route');
+    const { runBackfill, runRouting } = await import('./route');
     const { claudeRouteModel } = await import('./suggest-claude');
     const concurrency = whole(v.concurrency!, 'concurrency', 8);
     const model = await claudeRouteModel({
@@ -557,6 +557,23 @@ export async function runCli(args = Bun.argv.slice(2)) {
       ...(v['claude-bin'] ? { bin: v['claude-bin'] } : {}),
       ...(v['claude-config-dir'] ? { configDir: resolve(v['claude-config-dir']) } : {}),
     });
+    if (v.backfill) {
+      try {
+        const agents = readAgents(agentsFile);
+        if (agents && !v['dry-run']) await archive.setProjectMap(machineProjectMap(agents));
+        output(
+          await runBackfill(archive, model, {
+            concurrency,
+            ...(v['dry-run'] ? { dryRun: true } : {}),
+            ...(v.limit ? { limit: whole(v.limit, 'limit', 100_000) } : {}),
+            progress: (line) => console.error(line),
+          }),
+        );
+      } finally {
+        await model.close();
+      }
+      return;
+    }
     let stopped = false;
     const stop = () => {
       stopped = true;
