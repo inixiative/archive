@@ -214,5 +214,12 @@ export const claudeRouteModel = (options: DecisionModelOptions) =>
   claudeDecisionModel('route', ROUTE_BASE_INSTRUCTIONS, DEFAULT_ROUTE_MODEL, {
     effort: ROUTE_EFFORT,
     configDir: null,
+    timeoutMs: ROUTE_TIMEOUT_MS,
     ...options,
   });
+
+/**
+ * Measured 2026-11-01: a full 301k-character window (~105k input tokens) answered in 7.7 s with
+ * 172 output tokens; the answer dominates, and a long plan (~8k tokens at ~50/s) takes ~170 s.
+ */
+export const ROUTE_TIMEOUT_MS = 300_000;

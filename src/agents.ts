@@ -170,10 +170,20 @@ export function machineProjects(config: AgentsConfig) {
  */
 export function machineProjectMap(config: AgentsConfig): ProjectMap {
   const roots = new Map<string, Set<string>>();
-  for (const { projectId, roots: found } of machineProjects(config)) {
-    const set = roots.get(projectId) ?? new Set<string>();
-    for (const root of found) set.add(root);
-    roots.set(projectId, set);
+  const worktrees = new Map<string, Set<string>>();
+  const add = (into: Map<string, Set<string>>, projectId: string, paths: Iterable<string>) => {
+    const set = into.get(projectId) ?? new Set<string>();
+    for (const path of paths) set.add(path);
+    into.set(projectId, set);
+  };
+  for (const collector of config.collectors.filter((c) => !c.catchAll)) {
+    const declared = collectionRoots({ ...source(collector), worktrees: false });
+    add(roots, collector.projectId, declared);
+    add(
+      worktrees,
+      collector.projectId,
+      [...collectionRoots(source(collector))].filter((root) => !declared.has(root)),
+    );
   }
   const remotes = new Map<string, string | undefined>();
   return {
@@ -190,7 +200,13 @@ export function machineProjectMap(config: AgentsConfig): ProjectMap {
           const repository = remotes.get(root);
           if (repository) repositories.add(repository);
         }
-        return { projectId, roots: sorted, repositories: [...repositories].sort() };
+        const found = [...(worktrees.get(projectId) ?? [])].filter((w) => !set.has(w)).sort();
+        return {
+          projectId,
+          roots: sorted,
+          ...(found.length ? { worktrees: found } : {}),
+          repositories: [...repositories].sort(),
+        };
       }),
   };
 }

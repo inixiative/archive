@@ -2143,7 +2143,10 @@ export class ArchiveStore {
         supersededBy: null,
         OR: [
           { routingPlan: null },
-          ...(input.unplanned ? [] : [{ routingPlan: { due: { not: null } } }]),
+          // A backfill also finishes the sessions it planned only part of.
+          ...(input.unplanned
+            ? [{ routingPlan: { due: 'partial' } }]
+            : [{ routingPlan: { due: { not: null } } }]),
           ...(input.unplanned || !input.contextKey
             ? []
             : [{ routingPlan: { contextKey: { not: input.contextKey } } }]),

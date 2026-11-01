@@ -592,13 +592,15 @@ export type RoutingReport = {
 
 /**
  * One pass of the scheduler: plans every due session (`routingDue`), at most `concurrency` at
- * once, each one run owning its session's plan. A session longer than one window is planned window
- * after window in the same pass. `limit` caps the sessions taken.
+ * once, each one run owning its session's plan. A session longer than one window plans
+ * `windowsPerPass` (1) windows a pass and stays due (`partial`), so its cost spreads across passes. `limit` caps the sessions taken.
  */
 export async function runRouting(
   archive: RoutingArchive,
   model: SuggestModel,
   options: {
+    /** Windows one session may plan in a pass; the rest wait for the next pass (`partial`). */
+    windowsPerPass?: number;
     concurrency?: number;
     limit?: number;
     dryRun?: boolean;
@@ -631,7 +633,13 @@ export async function runRouting(
           for (const field of ['input', 'output', 'cacheRead', 'cacheWrite'] as const)
             report.tokens[field] += result.tokens?.[field] ?? 0;
           const more = result.input && result.input.through < result.input.total - 1;
-          if (result.status !== 'valid' || !more || options.dryRun || window >= 50) break;
+          if (
+            result.status !== 'valid' ||
+            !more ||
+            options.dryRun ||
+            window + 1 >= (options.windowsPerPass ?? 1)
+          )
+            break;
         }
       } catch (error) {
         result = {
@@ -726,7 +734,10 @@ export async function runBackfill(
       deletes: result.status === 'valid' ? holds.filter((o) => !reached.includes(o)) : [],
       adds: result.status === 'valid' ? reached.filter((o) => !holds.includes(o)) : [],
     };
-    report.rows.push(row);
+    // A long session comes back pass after pass: its row is its latest window's.
+    const at = report.rows.findIndex((r) => r.archiveId === archiveId);
+    if (at >= 0) report.rows[at] = row;
+    else report.rows.push(row);
     const from = holds.length ? holds.join('+') : 'nowhere';
     const to = result.status === 'valid' ? reached.join('+') || PERSONAL : result.status;
     report.moves[`${from} → ${to}`] = (report.moves[`${from} → ${to}`] ?? 0) + 1;
@@ -749,14 +760,16 @@ export async function runBackfill(
   };
   const each = (ids: string[], run: (id: string) => Promise<void>) =>
     pool(ids, options.concurrency ?? 2, run);
-  for (let pass = 0; pass < 20; pass++) {
+  for (let pass = 0; pass < 500; pass++) {
     const due = (
       await archive.routingDue({
         limit: options.limit ?? 100_000,
         unplanned: true,
         ...(options.dryRun ? { withoutParents: true } : {}),
       })
-    ).filter((d) => !report.rows.some((r) => r.archiveId === d.archiveId));
+    ).filter(
+      (d) => d.reason === 'partial' || !report.rows.some((r) => r.archiveId === d.archiveId),
+    );
     if (!due.length) break;
     report.due += due.length;
     if (!options.dryRun) {

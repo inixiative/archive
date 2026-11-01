@@ -237,3 +237,32 @@ test('S4: a change to the organizations or the project map makes plans due to re
     { archiveId: id, reason: 'context', depth: 0 },
   ]);
 });
+
+test('a long session plans one window a pass and stays due; a new worktree does not change the project map’s key', async () => {
+  const store = await freshStore();
+  await store.setProjectMap(map);
+  const archive: RoutingArchive = {
+    routingInput: (b) => store.routingInput(b.archiveId, routing),
+    recordPlan: (b) => store.recordPlan(b, routing),
+    routingDue: (b) => store.routingDue(b),
+  };
+  const long = session('long', 2);
+  long.entries[0]!.text = 'first window words '.repeat(11_000);
+  long.entries[1]!.text = 'second window words '.repeat(11_000);
+  const { id } = await store.capture(long, { cwd: '/w/template' });
+  const first = await runRouting(archive, model);
+  expect(first).toMatchObject({ calls: 1, valid: 1 });
+  expect(await store.routingDue({ limit: 10 })).toEqual([
+    { archiveId: id, reason: 'partial', depth: 0 },
+  ]);
+  expect(await runRouting(archive, model)).toMatchObject({ calls: 1, valid: 1 });
+  expect(await store.routingDue({ limit: 10 })).toEqual([]);
+  const [part] = await store.list({ exempt: 'include', parts: 'only' });
+  expect(part?.entries).toBe(2);
+  // Worktrees resolve, but don't move the key evidence and plans recorded.
+  const before = await store.projectMapKey();
+  await store.setProjectMap({
+    projects: [{ ...map.projects[0]!, worktrees: ['/w/template/.worktrees/new'] }],
+  });
+  expect(await store.projectMapKey()).toBe(before);
+});

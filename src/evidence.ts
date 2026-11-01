@@ -21,6 +21,11 @@ export const projectMapSchema = z.strictObject({
       z.strictObject({
         projectId: z.string().min(1).max(256),
         roots: z.array(z.string().max(4096).refine(isAbsolute, 'Roots are absolute')).max(1000),
+        /** Worktrees found under its roots now: they resolve, but don't change the map's key. */
+        worktrees: z
+          .array(z.string().max(4096).refine(isAbsolute, 'Worktrees are absolute'))
+          .max(1000)
+          .optional(),
         repositories: z
           .array(z.string().regex(/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/))
           .max(50)
@@ -30,7 +35,22 @@ export const projectMapSchema = z.strictObject({
     .max(500),
 });
 export type ProjectMap = z.infer<typeof projectMapSchema>;
-export const projectMapKey = (map: ProjectMap) => digest(JSON.stringify(map)).slice(0, 32);
+/**
+ * The map's key, which evidence and plans record: declared roots and repositories, not the
+ * worktrees found under them, so a new worktree doesn't make every session recompute.
+ */
+export const projectMapKey = (map: ProjectMap) =>
+  digest(
+    JSON.stringify(
+      map.projects.map(({ projectId, roots, repositories }) => [projectId, roots, repositories]),
+    ),
+  ).slice(0, 32);
+/** Every directory a project's paths resolve under: its roots and its worktrees. */
+const resolvable = (map: ProjectMap) =>
+  map.projects.map(({ projectId, roots, worktrees }) => ({
+    projectId,
+    roots: [...roots, ...(worktrees ?? [])],
+  }));
 
 type Counts = Record<string, number>;
 /**
@@ -76,7 +96,7 @@ export function sessionEvidence(
   map: ProjectMap,
   cwd?: string,
 ): SessionEvidence {
-  const resolvePath = projectPaths(map.projects);
+  const resolvePath = projectPaths(resolvable(map));
   const { containers } = resolvePath;
   const byRepository = new Map<string, string>();
   for (const project of map.projects)

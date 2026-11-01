@@ -538,7 +538,7 @@ test('L3: the planner sees every character it publishes; an entry too long to sh
   expect(input.entries[0]!.text).toBe(paste);
   // An entry longer than a whole window is shown cut, so a part holding it holds.
   const huge = session('huge', [
-    { kind: 'user', text: 'x'.repeat(301_000) },
+    { kind: 'user', text: 'too long to show '.repeat(18_000) },
     call({ file_path: '/z/a.ts' }),
     { kind: 'assistant', text: 'ok' },
   ]);
