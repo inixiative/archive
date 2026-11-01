@@ -756,7 +756,15 @@ export async function planSession(
   model: SuggestModel,
   archiveId: string,
   options: { dryRun?: boolean; assumeParentReach?: string[]; sensitivity?: boolean } = {},
-): Promise<RecordPlanResult & { tokens?: TokenUsage; input?: RoutingInput; calls?: number }> {
+): Promise<
+  RecordPlanResult & {
+    tokens?: TokenUsage;
+    input?: RoutingInput;
+    calls?: number;
+    /** UNDER EXPERIMENT: what the sensitivity pass did. */
+    sensitivity?: { calls: number; held: number; unreadable: number; tokens: Required<TokenUsage> };
+  }
+> {
   const key = routeKey(model.model);
   const input = await archive.routingInput({ archiveId, key });
   const base = { archiveId, digest: input.digest, through: input.through, key, by: model.model };
