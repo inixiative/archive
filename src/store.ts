@@ -277,6 +277,29 @@ export class ArchiveStore {
         }
         const old = await tx.archive.findUnique({ where: { id } });
         const map = await this.projectMap(tx);
+        if (options.evidenceOnly) {
+          if (!old || !map || old.transcriptDigest !== transcriptDigest(incoming))
+            return {
+              id,
+              digest: old?.digest ?? digest,
+              revision: old?.revision ?? 0,
+              changed: false,
+            };
+          const stripped = settings.captureToolCallsAndResults
+            ? unlifted
+            : withoutToolActivity(unlifted, settings.integrations).snapshot;
+          const evidence = sessionEvidence(
+            unlifted,
+            new Set(stripped.entries.map((e) => e.id)),
+            map,
+            options.cwd,
+          );
+          await tx.archive.update({
+            where: { id },
+            data: { evidence: evidence as Prisma.InputJsonValue, evidenceKey: evidence.key },
+          });
+          return { id, digest: old.digest, revision: old.revision, changed: false };
+        }
         // Evidence comes from the snapshot as its writer sent it, before the strip drops tool calls.
         const evidenceOf = (kept: ArchiveSnapshot) =>
           map
@@ -2254,6 +2277,8 @@ export class ArchiveStore {
     withoutParents?: boolean;
     /** The current `routingContextKey`: a plan validated under another is due to re-validate. */
     contextKey?: string;
+    /** The planner's current charter and model (`routeKey`): a plan made under another is due. */
+    planKey?: string;
   }) {
     const now = input.now ?? Date.now();
     const interval = input.intervalMs ?? 60 * 60_000;
@@ -2272,6 +2297,9 @@ export class ArchiveStore {
           ...(input.unplanned || !input.contextKey
             ? []
             : [{ routingPlan: { contextKey: { not: input.contextKey } } }]),
+          ...(input.unplanned || !input.planKey
+            ? []
+            : [{ routingPlan: { key: { not: input.planKey } } }]),
         ],
       },
       select: {
@@ -2281,7 +2309,7 @@ export class ArchiveStore {
         capturedAt: true,
         summary: true,
         tagEdits: true,
-        routingPlan: { select: { due: true, at: true, contextKey: true } },
+        routingPlan: { select: { due: true, at: true, contextKey: true, key: true } },
       },
     });
     const parentOf = (summary: Summary) =>
@@ -2315,7 +2343,9 @@ export class ArchiveStore {
         plan?.due ??
         (plan && input.contextKey && plan.contextKey !== input.contextKey
           ? 'context'
-          : 'unplanned');
+          : plan && input.planKey && plan.key !== input.planKey
+            ? 'charter'
+            : 'unplanned');
       if (plan && reason === 'new entries') {
         const offset = Number.parseInt(digest(row.id).slice(0, 8), 16) % (stagger + 1);
         const pausedNow = now - row.capturedAt >= paused;
@@ -2450,7 +2480,16 @@ const dropRevision = (
  * digest; checked when given), `cwd` (the session's working directory, for evidence), `restore`
  * (lift this session's tombstone: the writer means to bring a deleted session back).
  */
-export type CaptureOptions = { previousDigest?: string | null; cwd?: string; restore?: boolean };
+export type CaptureOptions = {
+  previousDigest?: string | null;
+  cwd?: string;
+  restore?: boolean;
+  /**
+   * Only recompute the stored row's evidence from this snapshot, when its transcript (source,
+   * session, entries) is the row's: for a session another project holds. Nothing else changes.
+   */
+  evidenceOnly?: boolean;
+};
 
 /** A capture that lost a race or arrived out of order; the server answers 409. */
 export class ArchiveConflict extends Error {}

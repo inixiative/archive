@@ -496,6 +496,8 @@ export interface RoutingArchive {
     limit: number;
     unplanned?: boolean;
     withoutParents?: boolean;
+    /** The planner's charter and model (`routeKey`): a plan made under another is due. */
+    planKey?: string;
   }): Promise<{ archiveId: string; reason: string; depth?: number }[]>;
 }
 export type RecordPlanBody = {
@@ -540,6 +542,25 @@ export async function planSession(
   const input = await archive.routingInput({ archiveId });
   const key = routeKey(model.model);
   const base = { archiveId, digest: input.digest, through: input.through, key, by: model.model };
+  // Nothing could reach an organization: no evidence, start directory, person's decision or
+  // subagent for one. It holds as it is, and no tokens are spent on it.
+  const reaches = (evidence: OrganizationEvidence) =>
+    Object.keys(evidence).some((o) => o !== PERSONAL);
+  if (
+    !input.prior &&
+    !reaches(input.evidence) &&
+    (!input.session.startOrganization || input.session.startOrganization === PERSONAL) &&
+    !input.overrides.some((t) => t !== `${ROUTE_TAG_PREFIX}${PERSONAL}`) &&
+    !input.children.some((c) => reaches(c.evidence))
+  )
+    return {
+      ...(await archive.recordPlan({
+        ...base,
+        failure: 'no evidence for any organization',
+        ...options,
+      })),
+      input,
+    };
   if (!input.entries.length) {
     if (!input.prior) return { status: 'stale', input };
     // No new entries, yet due: a person's decision changed, so the plan is re-applied under it.
@@ -607,7 +628,10 @@ export async function runRouting(
     progress?: (line: string) => void;
   } = {},
 ): Promise<RoutingReport> {
-  const due = await archive.routingDue({ limit: options.limit ?? 500 });
+  const due = await archive.routingDue({
+    limit: options.limit ?? 500,
+    planKey: routeKey(model.model),
+  });
   const report: RoutingReport = {
     model: model.model,
     due: due.length,

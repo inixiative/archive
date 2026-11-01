@@ -769,3 +769,22 @@ test('an unclosed quoting tag is foreign to the end of the entry, never the sess
   ).toEqual(['unknown']);
   expect(quotedOrigins('<agent-message from="a7">no close', 'r')).toEqual(['unknown']);
 });
+
+test('a session with no evidence for any organization holds without a model call', async () => {
+  const { store, archive } = await setup();
+  const { id } = await store.capture(
+    session('nothing', [
+      { kind: 'user', text: 'What is a rice cooker?' },
+      { kind: 'assistant', text: 'A pot.' },
+    ]),
+    {
+      cwd: '/elsewhere',
+    },
+  );
+  const { model, seen } = scripted([]);
+  expect(await planSession(archive, model, id)).toMatchObject({
+    status: 'held',
+    issues: ['no evidence for any organization'],
+  });
+  expect(seen).toEqual([]);
+});

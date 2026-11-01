@@ -144,14 +144,14 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'export --id ID | tag --id ID [--tag TAG ...] [--untag TAG ...]\n' +
         'tags list | tags define --tag TAG [--description TEXT] | tags remove --tag TAG   (the category tags the archive offers)\n' +
         'suggest [--limit N] [--batch 8] [--concurrency 2] [--model claude-haiku-5-5] [--refresh]   (tag suggestions on the Claude subscription; test and Oracle runs are exempt)\n' +
-        "pair --kingdom KINGDOM_API_URL [--name NAME] [--organization SLUG|ID] [--library ID|NAME ...] [--yes]   (register this Archive with Kingdom, asking for sessions.write on those libraries, by default the ones its Kingdom destinations name, else the owner's; claim the review code there, then confirm the owner)\n" +
+        "pair --kingdom KINGDOM_API_URL [--name NAME] [--organization SLUG|ID] [--library ID|NAME ...] [--yes]   (register this Archive with Kingdom, asking for sessions.write and sessions.delete on those libraries, by default the ones its Kingdom destinations name, else the owner's; claim the review code there, then confirm the owner)\n" +
         'connect --url HTTPS_URL --organization-id ID (--token-env ENV | --token-file PATH)   (a remote Archive an organization publishes to, for serve --sync)\n' +
         'connect --kind kingdom --url KINGDOM_API_URL --credential-file PATH --integration-id UUID --resource-id UUID --organization-id ID   (a hosted Archive through Kingdom)\n' +
-        'organizations list | organizations set --id ID [--project ID ...] [--roster NAME ...] | organizations remove --id ID   (the projects each organization owns; a session publishes to every organization its project or a project it touched belongs to)\n' +
+        'organizations list | organizations set --id ID [--project ID ...] [--roster NAME ...] | organizations remove --id ID   (the projects each organization owns, and coworker names for the planner; what publishes is the parts of each session, to the organizations its validated plan gives them)\n' +
         'route [--watch] [--concurrency 2] [--limit N] [--model claude-sonnet-5-5] [--claude-bin PATH] [--claude-config-dir DIR] [--dry-run]   (plan due sessions on the personal Claude login: parts × organizations; --watch wakes every 2 minutes)\n' +
         'route --backfill [--dry-run]   (plan every session and print the plan against what destinations hold now) | route plans [--all] | route review --id ID | route reset --id ID\n' +
         'cleanup [ORG] [off|leaked|all] [--all-organizations]   (what sync deletes at destinations, default off; with ORG, that organization only; leaked or all for every organization needs --all-organizations) | sync --dry-run   (per destination, the ids cleanup would delete now)\n' +
-        'publish [on|off]   (the go-live switch: off, the default, plans and deletes leaked whole-session copies but publishes nothing new)\n' +
+        'publish [on|off]   (the go-live switch: off, the default, plans sessions but publishes nothing new; deletes are cleanup settings)\n' +
         'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
         "settings [--capture-tool-calls-and-results true|false] [--capture-run-sessions true|false] [--retention-days N|off]   (read, or change, this Archive's settings)\n" +
         'maintenance status | maintenance reclaim   (compaction left to do and table sizes; return freed space to the OS once compaction is done)\n' +

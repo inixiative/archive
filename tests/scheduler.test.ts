@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { agentUnits } from '../src/agents';
 import type { Routing } from '../src/config';
 import { type ArchiveEntry, archiveSnapshotSchema } from '../src/index';
-import { type RoutingArchive, runBackfill, runRouting } from '../src/route';
+import { type RoutingArchive, routeKey, runBackfill, runRouting } from '../src/route';
 import type { SuggestModel } from '../src/suggest';
 import { freshStore } from './db';
 
@@ -269,4 +269,20 @@ test('a long session plans one window a pass and stays due; a new worktree does 
     projects: [{ ...map.projects[0]!, worktrees: ['/w/template/.worktrees/new'] }],
   });
   expect(await store.projectMapKey()).toBe(before);
+});
+
+test('a new planner charter or model makes every plan due', async () => {
+  const store = await freshStore();
+  await store.setProjectMap(map);
+  const archive: RoutingArchive = {
+    routingInput: (b) => store.routingInput(b.archiveId, routing),
+    recordPlan: (b) => store.recordPlan(b, routing),
+    routingDue: (b) => store.routingDue(b),
+  };
+  const { id } = await store.capture(session('charter', 2), { cwd: '/w/template' });
+  await runRouting(archive, model);
+  expect(await store.routingDue({ limit: 10, planKey: routeKey(model.model) })).toEqual([]);
+  expect(await store.routingDue({ limit: 10, planKey: routeKey('claude-sonnet-6') })).toEqual([
+    { archiveId: id, reason: 'charter', depth: 0 },
+  ]);
 });
