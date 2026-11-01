@@ -138,6 +138,8 @@ const SEARCH_INDEX = 'chunks_text_idx';
 const TOOL_ACTIVITY_BATCH = 50;
 /** The settings row holding the host's project map (`projects/set`), for evidence at ingest. */
 const PROJECT_MAP = 'projectMap';
+/** The evidence key's prefix for evidence computed from a stored snapshot, not a transcript. */
+const STORED_EVIDENCE = 'stored:';
 /** What the routing planner reads per entry, and per request, in characters. */
 /**
  * The planner sees whole entries, as many as fit a window; one longer than a whole window is shown
@@ -287,14 +289,25 @@ export class ArchiveStore {
           settings.captureToolCallsAndResults
             ? { snapshot: unlifted, changed: 0 }
             : withoutToolActivity(unlifted, settings.integrations);
+        // The row's evidence from this transcript. Replacing evidence its stored copy gave (no tool
+        // activity) can widen what it reaches, so its plans are due again.
+        const recompute = async (row: { evidenceKey: string | null }) => {
+          await tx.archive.update({
+            where: { id },
+            data: evidenceFields(evidenceOf(stripOf().snapshot)),
+          });
+          if (!row.evidenceKey?.startsWith(STORED_EVIDENCE)) return;
+          await tx.routingPlan.updateMany({
+            where: { archiveId: id, due: null },
+            data: { due: 'evidence' },
+          });
+          await this.markRelatedDue(tx, id);
+        };
         // Only the stored row's evidence, from its own transcript; its writer's tags (a run stamp
         // included) never touch the row.
         if (options.evidenceOnly) {
           if (old && map && old.transcriptDigest === transcriptDigest(incoming))
-            await tx.archive.update({
-              where: { id },
-              data: evidenceFields(evidenceOf(stripOf().snapshot)),
-            });
+            await recompute(old);
           return {
             id,
             digest: old?.digest ?? digest,
@@ -312,11 +325,7 @@ export class ArchiveStore {
         }
         if (old?.digest === digest) {
           // The same session under a new project map: only its evidence is recomputed.
-          if (stale(old))
-            await tx.archive.update({
-              where: { id },
-              data: evidenceFields(evidenceOf(stripOf().snapshot)),
-            });
+          if (stale(old)) await recompute(old);
           return { id, digest, revision: old.revision, changed: false };
         }
         // A session deleted here stays deleted while its transcript is unchanged, however a
@@ -1302,6 +1311,7 @@ export class ArchiveStore {
         await this.compact();
         await this.removeRunSessions();
         await this.removePastToolActivity();
+        await this.fillStoredEvidence();
         if (!this.stopping) await this.ensureSearchIndex();
       } finally {
         this.maintaining = undefined;
@@ -1313,6 +1323,7 @@ export class ArchiveStore {
   async stop() {
     this.stopping = true;
     await this.maintaining;
+    await this.filling;
   }
   /**
    * Recreates the trigram index search uses when it is missing or invalid, once compaction and the
@@ -1462,7 +1473,76 @@ export class ArchiveStore {
       create: { key: PROJECT_MAP, value: map },
       update: { value: map },
     });
+    // In the background: a request waits on none of it (a router wake has 30 seconds).
+    this.fillStoredEvidence().catch((error) =>
+      console.error(
+        JSON.stringify({
+          maintenance: 'stored evidence failed',
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      ),
+    );
     return { key: projectMapKey(map) };
+  }
+  private filling?: Promise<number>;
+  /**
+   * Evidence for sessions no writer sends again (a transcript the harness cleaned up, an import,
+   * a thread captured before the map existed), from the stored snapshot: its start project and the
+   * links in its text, never the tool activity the strip dropped. Its key is `stored:<map key>`, so
+   * a transcript that does come back recomputes it from the tool calls, and a new map recomputes
+   * it here. A filled row's plan, its parent's and its subagents' are due: what they may reach
+   * changed. Runs after a map is set and with maintenance, one run at a time (a call during a run
+   * joins it). Returns the rows filled.
+   */
+  fillStoredEvidence() {
+    this.filling ??= (async () => {
+      try {
+        const map = await this.projectMap();
+        if (!map) return 0;
+        const key = `${STORED_EVIDENCE}${projectMapKey(map)}`;
+        const rows = await this.db.archive.findMany({
+          where: {
+            partOf: null,
+            supersededBy: null,
+            OR: [{ evidenceKey: null }, { evidenceKey: { startsWith: STORED_EVIDENCE, not: key } }],
+          },
+          select: { id: true, evidenceKey: true, revision: true },
+        });
+        let filled = 0;
+        for (const { id, evidenceKey, revision } of rows) {
+          if (this.stopping) break;
+          const stored = await this.db.revision.findUnique({
+            where: { archiveId_revision: { archiveId: id, revision } },
+            select: { snapshot: true },
+          });
+          if (!stored) continue;
+          const snapshot = archiveSnapshotSchema.parse(stored.snapshot);
+          const evidence = {
+            ...sessionEvidence(snapshot, new Set(snapshot.entries.map((e) => e.id)), map),
+            key,
+          };
+          await this.db.$transaction(async (tx) => {
+            await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
+            // A writer's capture since the read wins: only the row as it was read is filled.
+            const { count } = await tx.archive.updateMany({
+              where: { id, evidenceKey, revision },
+              data: { evidence: evidence as Prisma.InputJsonValue, evidenceKey: key },
+            });
+            if (!count) return;
+            filled++;
+            await tx.routingPlan.updateMany({
+              where: { archiveId: id, due: null },
+              data: { due: 'evidence' },
+            });
+            await this.markRelatedDue(tx, id);
+          });
+        }
+        return filled;
+      } finally {
+        this.filling = undefined;
+      }
+    })();
+    return this.filling;
   }
   async settings(db: Prisma.TransactionClient | PrismaClient = this.db): Promise<ArchiveSettings> {
     const row = await db.setting.findUnique({ where: { key: 'archive' } });
@@ -2531,6 +2611,7 @@ export class ArchiveStore {
     });
   }
   async close() {
+    await this.filling?.catch(() => undefined);
     await this.db.$disconnect();
   }
 }

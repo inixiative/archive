@@ -91,7 +91,7 @@ The planner doesn't wait for a session to go idle. A host scheduler wakes every 
 
 | Concern | Where |
 |---|---|
-| Evidence (write-target mode, one parser) | `src/tags.ts` `shellAccess` / `toolCallAccess`; `src/evidence.ts`; computed in `store.capture` before the strip, kept on the row (`evidence`, `evidenceKey`) |
+| Evidence (write-target mode, one parser) | `src/tags.ts` `shellAccess` / `toolCallAccess`; `src/evidence.ts`; computed in `store.capture` before the strip, kept on the row (`evidence`, `evidenceKey`). A row no writer can re-send (transcript cleaned up, import, early Foundry thread) gets evidence from its stored snapshot when the host sends its map: start project and references only, under `stored:<key>`, so a returning transcript replaces it; the fill marks its plan due (`evidence`) |
 | Project map (roots, worktrees, origin repos) | `agents.ts` `machineProjectMap` → `projects/set`; the collector sends each session's `cwd` |
 | Parts | `src/parts.ts` `partSnapshot`; `store.applyParts` / `forgetDelivery`; lineage kind `part`; columns `partOf`, `routedTo` |
 | Planner, validator | `src/route.ts` (`ROUTE_PROMPT`, `validatePlan`, `publishedParts`, `planSession`); `store.routingInput` / `recordPlan`; `RoutingPlan` table |

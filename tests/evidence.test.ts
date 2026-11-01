@@ -8,6 +8,7 @@ import {
   evidenceByOrganization,
   evidencedOrganizations,
   projectMapKey,
+  type SessionEvidence,
   sessionEvidence,
 } from '../src/evidence';
 import { type ArchiveEntry, archiveSnapshotSchema } from '../src/index';
@@ -300,4 +301,67 @@ test('formerRoots resolve a project’s old checkout paths for evidence, and mov
       },
     ]),
   ).toBeUndefined();
+});
+
+test('a session no writer can send again gets evidence from its stored snapshot, which a transcript later replaces', async () => {
+  const store = await freshStore();
+  await store.updateSettings({ captureToolCallsAndResults: false });
+  // Captured before the host sent a map, and its transcript is gone since.
+  const session = snapshot(
+    [
+      { kind: 'user', text: 'Review https://github.com/userevidence/zealot/pull/12 please' },
+      call('Edit', { file_path: '/z/a.ts' }),
+      { kind: 'tool-result', text: 'ok' },
+      { kind: 'assistant', text: 'Reviewed' },
+    ],
+    { projectId: 'template' },
+  );
+  const { id } = await store.capture(session);
+  // Its subagent, already planned: what the parent reaches moves its plan.
+  const { id: childId } = await store.capture(
+    snapshot([{ kind: 'user', text: 'Look' }], {
+      sessionId: 'evidence/agent-a',
+      lineage: { kind: 'subagent', parentSessionId: 'evidence', rootSessionId: 'evidence' },
+    }),
+  );
+  expect((await store.db.archive.findUniqueOrThrow({ where: { id } })).evidence).toBeNull();
+  const held = { status: 'held', key: 'k', by: 'm', digest: 'd', entries: 2, at: 1 };
+  await store.db.routingPlan.createMany({
+    data: [
+      { archiveId: id, ...held },
+      { archiveId: childId, ...held },
+    ],
+  });
+  const due = async (archiveId: string) =>
+    (await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId } })).due;
+
+  // Filled in the background: setting the map waits on none of it.
+  await store.setProjectMap(map);
+  await store.fillStoredEvidence();
+  let row = await store.db.archive.findUniqueOrThrow({ where: { id } });
+  // What the stored copy still shows: the project it started in and the link, never the edit.
+  expect(row.evidence).toMatchObject({
+    startProjectId: 'template',
+    anchors: [{ entryId: 'e0', references: { 'userevidence/zealot': 1 } }],
+  });
+  expect(JSON.stringify(row.evidence)).not.toContain('writes');
+  expect(row.evidenceKey).toBe(`stored:${projectMapKey(map)}`);
+  expect(await due(id)).toBe('evidence');
+  expect(await due(childId)).not.toBeNull();
+  expect(evidenceByOrganization(row.evidence as SessionEvidence, routing, map)).toMatchObject({
+    userevidence: { references: 1 },
+  });
+
+  // Filling again changes nothing.
+  await store.db.routingPlan.updateMany({ data: { due: null } });
+  expect(await store.fillStoredEvidence()).toBe(0);
+  expect(await due(id)).toBeNull();
+
+  // The transcript comes back: its tool calls replace the stored copy's evidence, and the plan is
+  // due again, since the edit may reach further.
+  await store.capture(session, { cwd: '/w/template' });
+  row = await store.db.archive.findUniqueOrThrow({ where: { id } });
+  expect(row.evidenceKey).toBe(projectMapKey(map));
+  expect(row.evidence).toMatchObject({ anchors: [{ entryId: 'e0', writes: { zealot: 1 } }] });
+  expect(await due(id)).toBe('evidence');
 });
