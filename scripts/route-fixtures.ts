@@ -88,6 +88,11 @@ const { values: v } = parseArgs({
     sensitivity: { type: 'boolean', default: false },
     /** Plan and score only these case labels (comma-separated): a tiny test. */
     only: { type: 'string' },
+    /**
+     * Re-score a recorded run with no model call: its proposals are fed back through this code
+     * (a control for code that changed after the run).
+     */
+    replay: { type: 'string' },
   },
 });
 if (!v.database || !v.cases || !v.agents || !v.home)
@@ -176,7 +181,26 @@ if (v['import-only']) {
 
 // The charter under test replaces the shipped one; everything else is the shipped path.
 const charter = v.charter ? readFileSync(v.charter, 'utf8') : ROUTE_PROMPT;
-const base = await claudeRouteModel({ home: resolve(v.home), concurrency: Number(v.concurrency) });
+const recorded = v.replay
+  ? (JSON.parse(readFileSync(v.replay, 'utf8')) as { proposals: Record<string, unknown> }).proposals
+  : undefined;
+const byTitle = new Map(sessions.map((s) => [s.snapshot.title, s.id]));
+const base: SuggestModel & { close(): Promise<void> } = recorded
+  ? {
+      model: 'replay',
+      async decide(request) {
+        if (request.key !== 'archive-route') throw new Error('A replay makes no other call');
+        const title = request.input.split('\n')[1]?.replace(/^title: /, '') ?? '';
+        const id = byTitle.get(title);
+        const proposal = id ? recorded[id] : undefined;
+        // A recorded failure replays as an answer that does not parse, which holds as it did.
+        return {
+          content: proposal && typeof proposal === 'object' ? JSON.stringify(proposal) : 'no plan',
+        };
+      },
+      async close() {},
+    }
+  : await claudeRouteModel({ home: resolve(v.home), concurrency: Number(v.concurrency) });
 /** Answers the plan parser refused, kept whole so a parse failure can be told from a bad plan. */
 const unparseable: { session: string; content: string }[] = [];
 /** Every planner answer and sanitizer answer, by the session title line, for offline re-scoring. */
