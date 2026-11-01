@@ -24,8 +24,11 @@ import {
   excludeGlob,
   type FolderFilters,
   folderGlob,
+  git,
   UNROUTED,
 } from './collector';
+import type { ProjectMap } from './evidence';
+import { repositorySlug } from './tags';
 
 export const defaultHome = () => join(homedir(), '.local/share/archive');
 export const AGENT_LABEL_PREFIX = 'com.inixiative.archive.';
@@ -88,6 +91,11 @@ export const agentsConfigSchema = z
     /** Never collected, by any collector; added to the default exclusions (decision receipts). */
     exclude: folderGlobs(excludeGlob).optional(),
     collectors: z.array(collectorAgentSchema).max(100),
+    /**
+     * The routing scheduler (`archive route --watch`), installed beside the collectors when
+     * declared: it plans sessions on the machine's personal Claude login and applies the plans.
+     */
+    router: z.strictObject({ concurrency: z.number().int().min(1).max(8).optional() }).optional(),
   })
   .refine(
     (c) => new Set(c.collectors.map((x) => x.name)).size === c.collectors.length,
@@ -125,6 +133,8 @@ export interface AgentUnitOptions {
   execPath?: string;
   /** Defaults to this package's own CLI, wherever it is installed. */
   cliPath?: string;
+  /** The Claude CLI the router runs; defaults to the one on PATH now. */
+  claudeBin?: string;
 }
 export const packageCliPath = () => fileURLToPath(new URL('./cli.ts', import.meta.url));
 
@@ -155,6 +165,53 @@ export function machineProjects(config: AgentsConfig) {
 }
 
 /**
+ * The project map the server computes evidence under (`projects/set`): every project's roots and
+ * worktrees, read now, and the GitHub repositories its checkouts' `origin` points at.
+ */
+export function machineProjectMap(config: AgentsConfig): ProjectMap {
+  const roots = new Map<string, Set<string>>();
+  const worktrees = new Map<string, Set<string>>();
+  const add = (into: Map<string, Set<string>>, projectId: string, paths: Iterable<string>) => {
+    const set = into.get(projectId) ?? new Set<string>();
+    for (const path of paths) set.add(path);
+    into.set(projectId, set);
+  };
+  for (const collector of config.collectors.filter((c) => !c.catchAll)) {
+    const declared = collectionRoots({ ...source(collector), worktrees: false });
+    add(roots, collector.projectId, declared);
+    add(
+      worktrees,
+      collector.projectId,
+      [...collectionRoots(source(collector))].filter((root) => !declared.has(root)),
+    );
+  }
+  const remotes = new Map<string, string | undefined>();
+  return {
+    projects: [...roots]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([projectId, set]) => {
+        const sorted = [...set].sort();
+        const repositories = new Set<string>();
+        for (const root of sorted) {
+          if (!remotes.has(root)) {
+            const url = git(root, 'remote', 'get-url', 'origin');
+            remotes.set(root, url?.includes('github.com') ? repositorySlug(url) : undefined);
+          }
+          const repository = remotes.get(root);
+          if (repository) repositories.add(repository);
+        }
+        const found = [...(worktrees.get(projectId) ?? [])].filter((w) => !set.has(w)).sort();
+        return {
+          projectId,
+          roots: sorted,
+          ...(found.length ? { worktrees: found } : {}),
+          repositories: [...repositories].sort(),
+        };
+      }),
+  };
+}
+
+/**
  * A named collector, the peers it is routed against, the folder filters, every project on the
  * machine (for `project:` tags) and the server, from agents.json.
  */
@@ -182,6 +239,9 @@ export function collectorPlan(config: AgentsConfig, name: string) {
 /** One supervised unit per declared agent. */
 export function agentUnits(config: AgentsConfig, options: AgentUnitOptions): AgentUnit[] {
   const home = resolve(options.home);
+  const claudeBin = config.router
+    ? (options.claudeBin ?? Bun.which('claude') ?? undefined)
+    : undefined;
   const base = [options.execPath ?? process.execPath, options.cliPath ?? packageCliPath()];
   const homeArgs = home === resolve(defaultHome()) ? [] : ['--home', home];
   const unit = (suffix: string, command: string[]): AgentUnit => {
@@ -194,7 +254,22 @@ export function agentUnits(config: AgentsConfig, options: AgentUnitOptions): Age
       stderr: join(home, 'logs', `${label}.err.log`),
     };
   };
-  return config.collectors.map((c) => unit(`collect.${c.name}`, collectorArgs(c)));
+  return [
+    ...config.collectors.map((c) => unit(`collect.${c.name}`, collectorArgs(c))),
+    ...(config.router
+      ? [
+          unit('route', [
+            'route',
+            '--watch',
+            // launchd and systemd start units with a bare PATH: the Claude CLI is named in full.
+            ...(claudeBin ? ['--claude-bin', claudeBin] : []),
+            ...(config.router.concurrency
+              ? ['--concurrency', String(config.router.concurrency)]
+              : []),
+          ]),
+        ]
+      : []),
+  ];
 }
 
 const xml = (value: string) =>
@@ -255,6 +330,7 @@ export const unitFileName = (label: string, platform: AgentPlatform) =>
 const ownedLabel = (label: string) =>
   label === `${AGENT_LABEL_PREFIX}local` ||
   label === `${AGENT_LABEL_PREFIX}sync` ||
+  label === `${AGENT_LABEL_PREFIX}route` ||
   label.startsWith(`${AGENT_LABEL_PREFIX}collect.`);
 /** Labels of Archive units present in a supervisor directory. */
 export function installedLabels(dir: string, platform: AgentPlatform) {

@@ -10,6 +10,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { projectTags } from './evidence';
 import { cwdRunTags, exemptRun, temporaryRoots } from './exemption';
 import { claudeSessionId } from './import';
 import { importTranscriptFile, transcriptAgentId } from './import-file';
@@ -21,7 +22,7 @@ import {
   UNROUTED,
 } from './index';
 import type { ArchiveClient } from './remote';
-import { type AtlasFileConcepts, atlasTags, projectTags, provenanceReferences } from './tags';
+import { type AtlasFileConcepts, atlasTags, provenanceReferences } from './tags';
 
 export { UNROUTED } from './index';
 
@@ -182,7 +183,7 @@ export function sessionMetadata(
  */
 const SPAWN_MS = 10_000;
 
-const git = (cwd: string, ...args: string[]) => {
+export const git = (cwd: string, ...args: string[]) => {
   const run = Bun.spawnSync(['git', '-C', cwd, ...args], { stderr: 'ignore', timeout: SPAWN_MS });
   return run.success ? run.stdout.toString().trim() : undefined;
 };
@@ -256,6 +257,8 @@ export function routeSession(
 
 /** Where collected sessions go: an Archive server, or a store in-process. */
 export type ArchiveWriter = Pick<ArchiveClient, 'sourceId' | 'head' | 'capture' | 'claimState'> & {
+  /** The project map the server computes evidence under: a row computed under another is re-sent. */
+  projectMapKey?: () => Promise<string | null>;
   /** Needed only by a repair, to tell a collided row from one routed elsewhere. */
   read?: (id: string) => Promise<{ snapshot: Pick<ArchiveSnapshot, 'entries'> } | undefined>;
 };
@@ -416,6 +419,7 @@ export async function collectSessions(
   const repositories = new Map<string, string | undefined>();
   const graphs = new Map<string, AtlasFileConcepts | undefined>();
   let harness: 'subscription' | 'api' | undefined | null = null;
+  const mapKey = (await archive.projectMapKey?.()) ?? null;
   for (const file of transcriptFiles(config.directory)) {
     try {
       const before = lstatSync(file);
@@ -557,10 +561,12 @@ export async function collectSessions(
         remember('failed', meta);
         continue;
       }
-      if (old?.digest === digest) result.unchanged++;
+      // Unchanged, unless its evidence predates the server's project map (a new worktree or project).
+      if (old?.digest === digest && (old.deleted || !mapKey || old.evidenceKey === mapKey))
+        result.unchanged++;
       else {
         try {
-          const captured = await archive.capture(snapshot);
+          const captured = await archive.capture(snapshot, { cwd });
           if (captured.dropped) {
             result.dropped++;
             remember('dropped', meta);

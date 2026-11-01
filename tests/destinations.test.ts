@@ -20,7 +20,7 @@ import { ArchiveClient, ArchiveRequestError } from '../src/remote';
 import { createArchiveHandler } from '../src/server';
 import { freshStore } from './db';
 import { signetKingdom } from './kingdom';
-import { routing } from './routing';
+import { routeWhole, routing } from './routing';
 
 const token = 'synthetic-archive-test-token-0000000000';
 const snapshot = (projectId: string, sessionId: string) =>
@@ -131,14 +131,31 @@ test('destination endpoints list delivery, libraries, connect and remove through
     await archive.setOrganization({ id: 'inixiative', projects: ['inixiative'] });
     await archive.setOrganization({ id: 'personal', projects: ['personal'] });
 
-    const delivered = await store.capture(snapshot('inixiative', 'delivered'));
-    const stale = await store.capture(snapshot('inixiative', 'stale'));
-    await store.capture(snapshot('inixiative', 'new'));
-    await store.capture(snapshot('personal', 'personal'));
+    // Only parts publish: each session here is routed whole by its plan.
+    const routed = async (projectId: string, sessionId: string, organization = projectId) => {
+      const { id } = await store.capture(snapshot(projectId, sessionId));
+      const part = await routeWhole(store, id, [organization]);
+      return { id, part, digest: (await store.head(part))!.storedDigest };
+    };
+    const delivered = await routed('inixiative', 'delivered');
+    const stale = await routed('inixiative', 'stale');
+    await routed('inixiative', 'new');
+    await routed('personal', 'personal');
+    // Not planned: publishes nowhere, counts nowhere.
+    await store.capture(snapshot('inixiative', 'unplanned'));
     const identity = destinationIdentity(saved);
-    await store.delivered(delivered.id, identity, delivered.digest);
-    await store.delivered(stale.id, identity, stale.digest);
+    await store.delivered(delivered.part, identity, delivered.digest);
+    await store.delivered(stale.part, identity, stale.digest);
     await store.capture({ ...snapshot('inixiative', 'stale'), title: 'Changed', capturedAt: 2 });
+    await store.capture({
+      ...snapshot('inixiative', 'stale'),
+      entries: [
+        ...snapshot('inixiative', 'stale').entries,
+        { id: 'two', kind: 'assistant', text: 'Routed', timestamp: 2, sourceRef: 'line:2' },
+      ],
+      capturedAt: 3,
+    });
+    await routeWhole(store, stale.id, ['inixiative']);
 
     expect((await archive.destinations()).destinations).toEqual([
       { ...connected, delivered: 1, pending: 2 },
@@ -168,6 +185,9 @@ test('destination endpoints list delivery, libraries, connect and remove through
     expect(readRouting(config.destinationsFile)).toEqual({
       organizations: [{ id: 'inixiative', projects: ['inixiative'] }],
       destinations: [],
+      publish: 'off',
+      cleanup: 'off',
+      cleanupFor: {},
     });
     await expect(
       archive.request('destinations/remove', { ...route, organizationId: undefined }),
@@ -195,11 +215,15 @@ test('a server without configuration has no destination endpoints', async () => 
 
 test('a failed delivery backs off, doubling per failure, and clears once delivered', async () => {
   const store = await freshStore();
-  const { id } = await store.capture(snapshot('backoff', 'backoff-1'));
+  const id = await routeWhole(store, (await store.capture(snapshot('backoff', 'backoff-1'))).id, [
+    'backoff',
+  ]);
   let accept = false;
   const server = Bun.serve({
     port: 0,
     fetch: async (request) => {
+      if (new URL(request.url).pathname.endsWith('/list'))
+        return Response.json({ data: { archives: [], nextCursor: null } });
       if (!accept) return Response.json({ error: 'Invalid archive request' }, { status: 400 });
       const { snapshot: sent } = JSON.parse(
         Buffer.from(Bun.gunzipSync(await request.arrayBuffer())).toString('utf8'),
@@ -243,8 +267,9 @@ test('a failed delivery backs off, doubling per failure, and clears once deliver
 
 test('an unreachable destination is skipped for every archive until it is due; a new revision retries at once', async () => {
   const store = await freshStore();
-  const first = await store.capture(snapshot('circuit', 'circuit-1'));
-  await store.capture(snapshot('circuit', 'circuit-2'));
+  const source = await store.capture(snapshot('circuit', 'circuit-1'));
+  const first = { id: await routeWhole(store, source.id, ['circuit']) };
+  await routeWhole(store, (await store.capture(snapshot('circuit', 'circuit-2'))).id, ['circuit']);
   process.env.ARCHIVE_BACKOFF_TEST_TOKEN = token;
   const down = [
     {
@@ -269,7 +294,9 @@ test('an unreachable destination is skipped for every archive until it is due; a
   let calls = 0;
   const server = Bun.serve({
     port: 0,
-    fetch: () => {
+    fetch: (request) => {
+      if (new URL(request.url).pathname.endsWith('/list'))
+        return Response.json({ data: { archives: [], nextCursor: null } });
       calls++;
       return Response.json({ error: 'Invalid archive request' }, { status: 400 });
     },
@@ -282,7 +309,10 @@ test('an unreachable destination is skipped for every archive until it is due; a
       )!.status;
     expect(await only()).toStartWith('failed');
     expect(await only()).toStartWith('deferred');
-    await store.capture({ ...snapshot('circuit', 'circuit-1'), title: 'Revised', capturedAt: 2 });
+    const revised = snapshot('circuit', 'circuit-1');
+    revised.entries[0]!.text = 'Revised';
+    await store.capture({ ...revised, capturedAt: 2 });
+    await routeWhole(store, source.id, ['circuit']);
     calls = 0;
     expect(await only()).toStartWith('failed');
     expect(calls).toBeGreaterThan(0);
@@ -291,7 +321,7 @@ test('an unreachable destination is skipped for every archive until it is due; a
   }
 });
 
-test('routing is per organization: a session publishes to every organization it belongs to', () => {
+test('routing is per organization: a part publishes to every organization its plan gives it, a session to none', () => {
   const dir = home();
   const file = destinationsFile(dir);
   try {
@@ -310,22 +340,20 @@ test('routing is per organization: a session publishes to every organization it 
       'another organization',
     );
     const routed = readRouting(file);
-    const urls = (session: { projectId?: string; tags: string[] }) =>
+    const urls = (session: { partOf?: string | null; routedTo?: string[] }) =>
       sessionDestinations(routed, session).map((d) => d.url);
-    // Projects are tags: a mixed session goes to both organizations.
-    expect(
-      urls({ projectId: 'inixiative', tags: ['project:template', 'project:userevidence'] }),
-    ).toEqual(['https://inixiative.example/', 'https://userevidence.example/']);
-    expect(urls({ projectId: 'userevidence', tags: ['project:tribe'] })).toEqual([
+    // Parts publish to the organizations their plan gives them, several at once.
+    expect(urls({ partOf: 'session', routedTo: ['inixiative', 'userevidence'] })).toEqual([
       'https://inixiative.example/',
       'https://userevidence.example/',
     ]);
-    expect(sessionOrganizations(routed, { projectId: 'template', tags: [] })).toEqual([
-      'inixiative',
-    ]);
-    // A project in no organization stays local; so does unrouted.
-    expect(urls({ projectId: 'scratch', tags: ['project:oracle'] })).toEqual([]);
-    expect(urls({ projectId: 'unrouted', tags: [] })).toEqual([]);
+    expect(sessionOrganizations(routed, { partOf: 'session', routedTo: ['userevidence'] })).toEqual(
+      ['userevidence'],
+    );
+    // A session itself, a part routed nowhere, or to an undeclared organization, publishes nowhere.
+    expect(urls({ partOf: null, routedTo: ['inixiative'] })).toEqual([]);
+    expect(urls({ partOf: 'session', routedTo: [] })).toEqual([]);
+    expect(urls({ partOf: 'session', routedTo: ['acme'] })).toEqual([]);
     expect(() => setOrganization(file, { id: 'x', projects: ['unrouted'] })).toThrow();
     // Removing an organization takes its destinations; its projects stay local.
     expect(removeOrganization(file, 'userevidence')).toBe(true);

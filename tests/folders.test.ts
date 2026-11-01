@@ -12,8 +12,8 @@ import {
   folderGlob,
   routeSession,
 } from '../src/collector';
+import { projectTags } from '../src/evidence';
 import { type ArchiveEntry, archiveSnapshotSchema } from '../src/index';
-import { projectTags } from '../src/tags';
 import { freshStore } from './db';
 
 test('folder globs normalize like Atlas and Gloss entries, and an empty one is refused', () => {

@@ -7,6 +7,8 @@ import {
   projectPaths,
   provenanceReferences,
   referencesIn,
+  shellAccess,
+  toolCallAccess,
 } from '../src/tags';
 
 const snapshot = (entries: Pick<ArchiveEntry, 'kind' | 'text'>[]) =>
@@ -126,4 +128,77 @@ test('a path resolves to the project holding it, the longest root winning', () =
   expect(resolvePath('/w/kingdom/src/a.ts')?.projectId).toBe('kingdom');
   expect(resolvePath('/w/CLAUDE.md')).toEqual({ projectId: 'code', root: '/w', path: 'CLAUDE.md' });
   expect(resolvePath('/elsewhere/a.ts')).toBeUndefined();
+});
+
+test('write mode: redirects, sed -i, cp/mv targets, path verbs, git and gh, never reads or descriptor duplications', () => {
+  const w = (script: string, cwd = '/w/a') => shellAccess(script, cwd);
+  expect(w('echo hi > out.txt 2>&1; cat < in.txt >> /w/b/log').writes).toEqual([
+    '/w/a/out.txt',
+    '/w/b/log',
+  ]);
+  expect(w('cat < in.txt').writes).toEqual([]);
+  expect(w('ls >/dev/null 2>&1 && grep x f >& err.log').writes).toEqual(['/w/a/err.log']);
+  expect(w("cat > /w/c/r.md <<'EOF'\n/w/z/x\nEOF").writes).toEqual(['/w/c/r.md']);
+  expect(w("sed -i '' 's/a/b/' x.ts y.ts").writes).toEqual(['/w/a/x.ts', '/w/a/y.ts']);
+  expect(w('sed -n 1,5p x.ts').writes).toEqual([]);
+  expect(w('sed -i -e s/a/b/ z.ts').writes).toEqual(['/w/a/z.ts']);
+  expect(w('cp -r src /w/b/dst && mv a.txt b.txt').writes).toEqual(['/w/b/dst', '/w/a/b.txt']);
+  expect(w('rsync -a src host:dst').writes).toEqual([]);
+  expect(w('mkdir -p d/e && touch f && rm -rf g').writes).toEqual(['/w/a/d/e', '/w/a/f', '/w/a/g']);
+  expect(w('git -C /w/b commit -m x; git status; git checkout main').writes).toEqual(['/w/b']);
+  expect(w('git checkout -b feat').writes).toEqual(['/w/a']);
+  expect(w('cd /w/c && git push && FOO=1 bun run test').writes).toEqual(['/w/c', '/w/c']);
+  expect(w('git --work-tree=/w/d add .').writes).toEqual(['/w/d']);
+  expect(w('git worktree add /w/a/.worktrees/x -b x').writes).toEqual([
+    '/w/a/.worktrees/x',
+    '/w/a',
+  ]);
+  expect(w('git worktree list').writes).toEqual([]);
+  for (const repo of [
+    '-R UserEvidence/zealot',
+    '--repo userevidence/zealot',
+    '--repo=userevidence/zealot',
+  ])
+    expect(w(`gh pr create ${repo} --title x`)).toMatchObject({
+      writes: [],
+      repositories: ['userevidence/zealot'],
+    });
+  expect(w('gh pr comment 5 --body hi').writes).toEqual(['/w/a']);
+  expect(w('gh pr view 5 --repo a/b').repositories).toEqual([]);
+  expect(w('gh api repos/inixiative/archive/issues -f title=x').repositories).toEqual([
+    'inixiative/archive',
+  ]);
+  expect(w('gh api repos/inixiative/archive/pulls').repositories).toEqual([]);
+});
+
+test('write mode per tool call: file tools, Codex patches, exec cells with their own workdir, Foundry tool entries', () => {
+  const claude = (name: string, input: object) => JSON.stringify({ name, input });
+  expect(toolCallAccess(claude('Edit', { file_path: 'x.ts' }), '/w/a').writes).toEqual([
+    '/w/a/x.ts',
+  ]);
+  expect(toolCallAccess(claude('Read', { file_path: 'x.ts' }), '/w/a')).toMatchObject({
+    paths: ['/w/a/x.ts'],
+    writes: [],
+  });
+  expect(
+    toolCallAccess(JSON.stringify({ tool: 'Write', input: { file_path: '/w/f/y.ts' } })).writes,
+  ).toEqual(['/w/f/y.ts']);
+  const cell = [
+    'const r = await tools.exec_command({cmd:"git commit -am x", "workdir":"/w/z"});',
+    'text(await tools.apply_patch("*** Begin Patch\\n*** Update File: /w/z/a.ts\\n@@\\n-x\\n+y\\n*** End Patch"));',
+    'text(await tools.exec_command({cmd:"cat src/b.ts"}));',
+  ].join('\n');
+  const access = toolCallAccess(JSON.stringify({ name: 'exec', arguments: cell }), '/w/a');
+  expect(access.writes).toEqual(['/w/z', '/w/z/a.ts']);
+  expect(access.paths).toContain('/w/a/src/b.ts');
+  expect(access.paths).toContain('/w/z');
+  expect(
+    toolCallAccess(
+      JSON.stringify({
+        name: 'apply_patch',
+        arguments: '*** Begin Patch\n*** Add File: n.ts\n+x\n*** End Patch',
+      }),
+      '/w/a',
+    ).writes,
+  ).toEqual(['/w/a/n.ts']);
 });

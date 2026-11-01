@@ -11,7 +11,7 @@ import { createArchiveHandler } from '../src/server';
 import type { ArchiveStore } from '../src/store';
 import { TOOL_ACTIVITY_OMISSION } from '../src/tool-activity';
 import { freshStore } from './db';
-import { routing } from './routing';
+import { routeWhole, routing } from './routing';
 
 const token = 'synthetic-archive-test-token-0000000000';
 const entry = (id: string, kind: ArchiveSnapshot['entries'][number]['kind'], text: string) => ({
@@ -119,15 +119,17 @@ test('a publish whose queued revision was compacted before sending queues the cu
   const remote = await freshStore('remote');
   process.env.ARCHIVE_COMPACTION_TEST_TOKEN = token;
   try {
-    const first = await store.capture(session(turns.slice(0, 1)));
+    const source = await store.capture(session(turns.slice(0, 1)));
+    const first = { id: await routeWhole(store, source.id, ['inixiative']) };
     const destination: ArchiveDestination = {
       kind: 'archive',
       organizationId: 'inixiative',
       url: 'http://localhost:4412/',
       tokenEnv: 'ARCHIVE_COMPACTION_TEST_TOKEN',
     };
-    // The race: the outbox row names revision 1 after a capture already compacted it.
-    await store.capture(session(turns.slice(0, 2), 2));
+    // The race: the outbox row names revision 1 after a re-plan already compacted it.
+    await store.capture(session([turns[0]!, turns[3]!], 2));
+    await routeWhole(store, source.id, ['inixiative']);
     await store.db.outbox.create({
       data: { archiveId: first.id, destination: destinationIdentity(destination), revision: 1 },
     });
@@ -185,7 +187,7 @@ test('with tool capture off, ingest stores no tool calls or results, and an unch
   expect(await chunkKinds(store, data.id)).toEqual(['assistant', 'user']);
 });
 
-test('archives with different tool settings publish to each other and then stay unchanged', async () => {
+test('a part never carries tool activity, whatever either Archive keeps, and stays unchanged once delivered', async () => {
   const local = await freshStore();
   const remote = await freshStore('remote');
   process.env.ARCHIVE_COMPACTION_TEST_TOKEN = token;
@@ -201,21 +203,25 @@ test('archives with different tool settings publish to each other and then stay 
       handler(new Request(url, options))) as unknown as typeof fetch;
   };
   try {
-    // Local keeps tool activity, the destination does not.
-    await remote.updateSettings({ captureToolCallsAndResults: false });
-    const first = await local.capture(session(turns));
+    // Local keeps tool activity; what publishes is a part, which never carries it.
+    await remote.updateSettings({ captureToolCallsAndResults: true });
+    const source = await local.capture(session(turns));
+    expect(await chunkKinds(local, source.id)).toEqual([
+      'assistant',
+      'tool-call',
+      'tool-result',
+      'user',
+    ]);
+    const first = { id: await routeWhole(local, source.id, ['inixiative']) };
     expect(
       await publishArchive(local, first.id, destination, routing([destination]), transport(remote)),
-    ).toEqual({
-      unchanged: false,
-    });
+    ).toEqual({ unchanged: false });
     expect(await chunkKinds(remote, first.id)).toEqual(['assistant', 'user']);
     expect(
       await publishArchive(local, first.id, destination, routing([destination]), transport(remote)),
-    ).toEqual({
-      unchanged: true,
-    });
+    ).toEqual({ unchanged: true });
     await local.capture(session([...turns, entry('a2', 'assistant', 'Done')], 2));
+    await routeWhole(local, source.id, ['inixiative']);
     await publishArchive(local, first.id, destination, routing([destination]), transport(remote));
     expect((await remote.read(first.id))?.snapshot.entries.map((e) => e.id)).toEqual([
       'u1',
@@ -224,40 +230,10 @@ test('archives with different tool settings publish to each other and then stay 
     ]);
     expect(
       await local.delivery(
-        (await local.list({ exempt: 'include' })).map((a) => a.id),
+        (await local.list({ exempt: 'include', parts: 'include' })).map((a) => a.id),
         destinationIdentity(destination),
       ),
-    ).toEqual({
-      delivered: 1,
-      pending: 0,
-    });
-
-    // The other way round: a filtered local Archive publishes what it stored.
-    await local.updateSettings({ captureToolCallsAndResults: false });
-    await remote.updateSettings({ captureToolCallsAndResults: true });
-    const second = await local.capture({ ...session(turns, 3), sessionId: 'second' });
-    await publishArchive(local, second.id, destination, routing([destination]), transport(remote));
-    expect(await chunkKinds(remote, second.id)).toEqual(['assistant', 'user']);
-    expect(
-      await publishArchive(
-        local,
-        second.id,
-        destination,
-        routing([destination]),
-        transport(remote),
-      ),
-    ).toEqual({
-      unchanged: true,
-    });
-    expect(
-      await local.delivery(
-        (await local.list({ exempt: 'include' })).map((a) => a.id),
-        destinationIdentity(destination),
-      ),
-    ).toEqual({
-      delivered: 2,
-      pending: 0,
-    });
+    ).toEqual({ delivered: 1, pending: 1 });
   } finally {
     delete process.env.ARCHIVE_COMPACTION_TEST_TOKEN;
   }
