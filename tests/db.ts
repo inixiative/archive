@@ -58,6 +58,16 @@ const open = new Map<string, ArchiveStore>();
 export async function freshStore(name: TestDatabase = 'main') {
   // A new store each time: a store caches the source id the truncate below deletes.
   await open.get(name)?.close();
+  // A test that timed out can leave a transaction open, and the truncate below would wait on it:
+  // every later test would time out behind the first. Whatever is still connected is ended first,
+  // from a connection of its own, before this store opens any.
+  const admin = new Bun.SQL(testDatabaseUrl(name));
+  try {
+    await admin`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+      WHERE datname = current_database() AND pid <> pg_backend_pid()`;
+  } finally {
+    await admin.close();
+  }
   const store = new ArchiveStore(testDatabaseUrl(name));
   open.set(name, store);
   await store.db.$executeRawUnsafe(
