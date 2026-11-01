@@ -179,3 +179,14 @@ Two runs on the shipped charter (`v0-baseline.txt`, sha `1f99358a`), on this bra
 - Two G1 observations rest on one pass call each, so this run doesn't estimate how often the pass misses.
 
 **Cost.** Pass calls only (the planner was replayed): tiny test 2 calls, 89k tokens; treatment b 11 calls, 260k; treatment a 10 calls, 228k. Total 577k, nearly all cache writes. Five-hour window 20% → 21%, seven-day 31% → 31%.
+
+## Always-personal categories (experiment, 2026-11-01; stopped at the tiny test)
+
+**Change.** Aron's ruling: career or job talk, investor or advisor talk, and complaints about or disparaging remarks on coworkers are personal for every organization, inixiative included. Both the planner charter (`ROUTE_PROMPT`, sha 8edc9fbb) and the pass's instructions now say so; secrets and personal life are unchanged. The userevidence roster is the machine's (54 names). The pass is on and the planner runs live. The design was pre-registered and adversarially reviewed (rev 3, verdict go). It has three gates, all as before: no marker of 512aaec0a6 or 01b0bda06a reaches any work organization in two full runs, counted anywhere in the published text, plus a keyword reading; no routing loss; and published characters kept.
+
+**Stopped by the pre-registered cost rule.** The tiny test (the two targets only, one run) cost 267k tokens: 119k planner and 148k pass, nearly all cache writes. Scaled by the design's upper-bound factor (4.42), that is 1.18M per full run, above the 1.0M stop line, so the two full runs were not started. The five-hour window went 73% → 74% during the test; it was already at 73% from other sessions.
+
+**Tiny test outcomes, recorded only (they never stand in for the runs):**
+- 512aaec0a6: one part to inixiative, 1 of 4 markers published. The planner redacted 2 career and 2 investor spans; the pass added career and investor redactions of its own. Both missed the same remaining phrase, in the opener's third entry (the person's other companies).
+- 01b0bda06a: one part to inixiative and userevidence, 0 markers. The coworker remark was redacted twice, so its echo was caught.
+- No pass answer was unreadable.
