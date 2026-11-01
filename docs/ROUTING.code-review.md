@@ -223,3 +223,62 @@ Aron should accept this gap explicitly: older genuine UE sessions disappear from
 3. **R4:** Aron accepts that UE loses older genuine work, or a reviewed UE re-publish follows.
 4. **R1:** clip check on continuations. Must be fixed before `publish on`.
 5. The quote-detection regression; the `publishArchive` guard; `.pending-*` directories.
+
+---
+
+## Final gate (2026-11-01, commits `e001cf9`, `26d5b8d`, `3132d4d`)
+
+**Verdict: MERGE.** Nothing blocks shipping with `publish off` and `cleanup off`. Before setting `cleanup userevidence leaked`, fix G1 or accept it on the record, and do G2.
+
+Ground truth: `3132d4d`. `bun run typecheck` passes. `bun run lint` reports 0 errors and 207 warnings. `bun test` passed 165 of 165 against a throwaway `pgvector:pg17` on random port 39151, never 6132. Probes are in `probe/gate.test.ts` (six tests) and the migration rehearsal in `mig/`, both in the session scratchpad. The probes run real `syncArchives` against in-process destination Archives, a counting proxy and the Kingdom fake. Nothing live was touched, and no secrets were printed.
+
+### (1) Publish off and cleanup off: nothing is sent and nothing is deleted
+- **Probe:** the local store held a leaked whole copy (with receipts at a direct UE Archive and at a Kingdom library), a planned part routed to both, a session deleted here that held a copy, and a retention prune. `syncArchives` and `sync --dry-run` both returned `[]`. The counting proxy in front of UE saw **0 requests**. Kingdom executed **no** operation: no write, no delete and no `documents.read` listing. `publishArchive` called directly threw "Publishing is off" (`client.ts:133`).
+- **Why it holds:** with publish off, the publish list is empty. With cleanup off, the cleanup loop skips the destination before any listing or delete (`client.ts:332`). A missing `publish`, `cleanup` or `cleanupFor` key defaults to off, so the first sync after the upgrade, before any command has written the keys, is off and off.
+- **Retention and `delete`** only push the destinations onto the tombstone's `pending`, with no network call. Those deletes stay queued.
+- **`repair` and `collect`** write only to the local Archive. **`agents install`** adds the router only when it is declared. **Re-pairing** (`pair`) talks to Kingdom's pairing flow, not to a library. A config writer that drops the keys can only fall back to off.
+- **Operational:** run `archive publish off` and `archive cleanup off` once after the upgrade, so `destinations.json` carries the keys explicitly. 0.24.0's `routingSchema` is strict and would refuse those keys. If the keys are missing and the machine is ever rolled back to 0.24.0, that version would go back to publishing every touched-project session whole.
+
+### (2) `cleanupFor: { userevidence: 'leaked' }`
+- **Probe:** UE held:
+  - our whole copy with a receipt;
+  - our whole copy with **no** receipt (found only through UE's listing);
+  - a copy written by **another** sourceId.
+
+  inixiative held our whole copy with a receipt. The dry run listed exactly the two copies of ours at UE. Sync deleted those two. **UE still holds the other Archive's copy, and inixiative still holds ours** (inixiative's cleanup is off).
+- **R2:** a whole copy whose session was deleted here, and one whose session was pruned, were queued while cleanup was off (2 pending, nothing sent). Under `leaked` both were deleted at UE, and pending dropped to 0.
+- **Candidates:** only this Archive's own ids. They come from receipts, tombstone `pending`, and the direct listing filtered on `sourceId`; through Kingdom, only ids this store knows. Those ids are `archiveKey`s that include this sourceId, so another Archive's copies can't be targets. Deletes are capped at 100 per destination per pass.
+- **G1, should fix: a genuine UE copy a plan keeps is deleted as soon as its session grows.** `copiesToKeep` keeps a whole copy only while the plan's digest equals the row's current digest (`store.ts:900`).
+  **Probe:** a UE review session with a valid whole-UE plan; sync keeps its copy. One more capture, then sync → **deleted**, before the scheduler re-plans it (up to about an hour, or after a 30-minute pause). With publish off, nothing re-sends it. Every UE session that is active when `leaked` is turned on, or later, loses its whole copy for good.
+  Fix: keep the copy while the receipt's digest is a revision the plan covered (its entries run up to `throughEntryId`), or skip whole rows whose plan is due `new entries` until they are re-planned.
+- **G2, do before `leaked`: decide what kept copies carry.** A kept whole copy is whatever was sent under the old rule:
+  - the whole session's Atlas tags, references, goals and runs (S6 scoped these for parts, not for kept whole copies);
+  - possibly tool calls and results, if `captureToolCallsAndResults` was on when it was sent.
+
+  The plan validated the stripped entries only. Either confirm tool capture was off for every copy sent to UE, or narrow "kept" to copies whose receipt digest matches a stripped revision.
+- **Footgun:** `archive cleanup leaked` without an organization sets the default for every organization, inixiative included. Use `archive cleanup userevidence leaked`, and check `archive sync --dry-run` before the first real sync.
+- **R4 still applies.** Under `leaked`, deleted genuine UE work comes back only as parts with publish on. Rows without evidence need a person's `route:userevidence`.
+
+### (3) Migrations on existing data
+Rehearsal: I applied origin/main's seven migrations to a fresh database and seeded it with **1,500 archives**, **158 receipts** and **50 tombstones** in the old shape. Then I applied the branch's seven migrations (`20261101120000` through `20261101180000`, all after main's last, `20261018180000`).
+- **Results:** all applied. Every archive got `routedTo = '{}'`, `partOf` NULL and `evidence` NULL. All 158 receipts are intact. Every tombstone got `pending = '{}'`. The `partOf` FK is gone after `150000` (it is added in `130000` and dropped in `150000`). `prisma migrate diff` against `schema.prisma` returned an empty migration, so there is no drift.
+- **Locking:** every change is a nullable or defaulted column, one index or a new table. On about 1,200 rows the locks are milliseconds.
+- **Deploy notes:**
+  - the server applies migrations on start (`cli.ts` `migrate`), so the new image migrates the live database the first time it runs;
+  - rolling back to 0.24.0 after that leaves extra columns, which 0.24.0 ignores, but see the downgrade note in (1);
+  - evidence stays NULL until each row is re-captured, which is R4's gap for transcripts that are gone.
+
+### (4) Earlier findings
+- **R1:** fixed. A continuing UE part holding a clipped entry now **holds** (probe); the clip check runs on `continued` too (`route.ts:355`).
+- **R2:** fixed. Probe above: pending deletes survive the local delete and the prune, and complete under cleanup.
+- **Quote regression:** fixed. An unclosed `<cross-session-message …>` and an unclosed `<agent-message …>` both return `unknown`.
+- Also confirmed:
+  - the `publishArchive` guard;
+  - the `.pending-*` sweep;
+  - R3 reconciliation (the copy with no receipt was found through UE's listing).
+- **Parallel machinery:** none new. Reconciliation uses the destination's existing `list` and Kingdom's `documents.read`; `copiesToKeep` reuses `sessionOrganizations`, `storedPlanSchema` and `plannedSession`; pending deletes live on the existing tombstone.
+
+### Ranked before `cleanup userevidence leaked`
+1. **G1:** fix the digest-staleness rule, or accept that active UE sessions lose their whole copy.
+2. **G2:** confirm whether any copy at UE was sent with tool activity, and decide what kept whole copies may carry.
+3. Pin `publish off` and `cleanup off` in `destinations.json` (rollback safety), use the per-organization form, and dry-run first.
