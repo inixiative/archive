@@ -412,3 +412,33 @@ Ground truth: `d42dc27`. `bun run typecheck` passes. `bun run lint` reports 0 er
 - Roster names match case-insensitively again (`parts.ts`). The clause still fires only for `coworker` redactions, and that is what keeps "grant" from taking work text. The P2 test now asserts the accepted narrowing: a coworker redaction of a name also removes work clauses that share it, in any case.
 - The probe's two cases are tests: a mis-cased and an exactly quoted coworker redaction, each with the lowercase neighbour echo. No "vlad" publishes in either.
 - `reviewPlan` clears only `heldForReview`, in place (`jsonb_set`), with `reviewedAt` in the same statement, under the session's advisory lock. It never writes the plan back. Tested against a racing re-plan.
+
+---
+
+## PR #37 review (2026-11-01, merged as `0b4d310`)
+
+**Verdict: not publish-on-ready. Block on Q1. Q2 and Q3 should be fixed first.** Every live failure mode of the pass fails closed, and `--offline` makes no live call. The gaps are about plans and holds that outlive the mode or the pass.
+
+Ground truth: main at `0b4d310`. `bun run typecheck` passes. `bun run lint` reports 0 errors. `bun test` passed 189 of 189 against a throwaway Postgres on random port 25841, never 6132. The probe is `probe/pr37.test.ts` in the session scratchpad. It runs real `planSession` and `recordPlan` against the store, with a scripted model.
+
+### (1) Can a part with a detected personal-only span publish?
+- **Q1, blocking: a plan recorded before hold mode keeps publishing its personal-only part.** Hold-on-detect only looks at the **new proposal's** redactions (`route.ts:347, 362`). Prior parts carry their redactions verbatim, and re-validation narrows them by evidence only.
+  - **Probe:** a plan made under `personalSpans: redact` puts a UE part through with `fixed; [redacted: coworker]`. After switching to `hold` and running another delta, that part is **still routed to UE**.
+  - That covers every plan made before #37 (any backfill already run) and every switch from `redact` to `hold`. `personalSpans` is not in `routingContextKey`, so the switch doesn't even make those plans due.
+  - Fix: in hold mode, re-hold any part, prior ones included, that holds a personal-only redaction, on every record and re-apply. Put `personalSpans` in `routingContextKey`.
+- **Continuation:** no leak. A part held for personal-only talk can't continue (`!held`). The pass checks the new entries of a continuing part and holds that part.
+- **Rebuild:** a rebuild re-runs the planner and the pass. Planner- or pass-detected personal-only spans become `heldForReview`, which is sticky across rebuilds. **But see Q2:** a part the pass held by answer (`hold: true`, unreadable or failed) is not sticky.
+- **`route review`** only clears `heldForReview`. The held parts stay personal in the plan; nothing publishes until a later rebuild or reset re-plans them, through the pass again.
+- **`redact` switch:** it publishes redacted text, by design. It defaults to `hold`, and a config writer that drops the key lands on `hold`.
+- **Pass answer matched to the wrong part:** no leak. A pass redaction must name an entry in **that** part's shown entries, or the answer counts as unreadable and that part is held. The server attaches each redaction to the part holding its entry.
+
+### (2) Pass failures fail closed (probe)
+A throw or timeout, an unparseable answer, `hold: true`, an answer without `hold: false`, and a redaction naming an entry outside the part all leave the part **unrouted**. A clean answer publishes. A detected coworker span holds the part, with all 4 entries in `heldForReview`.
+- **Q2, should fix: a pass hold isn't sticky.** It sets the part's organizations to `[]` client-side, so it is plain personal: not `heldForReview`, not `sensitive`. It reaches the review queue only by accident (default confidence 0.5 < 0.6). A rebuild or reset run with `--no-sensitivity`, or by an older router, can route it. Send pass holds as held parts (sticky `heldForReview`), not as an empty organization list.
+- **Q3, should fix: the server can't tell whether the pass ran.** The pass runs client-side in `planSession`. `recordPlan` accepts any proposal, whether from `--no-sensitivity`, an older router CLI, or any token holder, and publishes its parts once publish is on. Record the sensitivity key on the plan, and with publish on, publish only parts whose plan was checked.
+- **Minor:**
+  - If the preview isn't valid or lacks snapshots, the pass returns the proposal **unchecked** (`route.ts:687`). Today's server always returns snapshots, so this isn't reachable, but it should throw instead.
+  - `hold()` does nothing when no proposal part holds the first shown entry (`route.ts:705`). This isn't reachable through the current preview either, but it should fail closed too.
+
+### (3) `--offline` replay makes no live call
+`scripts/route-fixtures.ts` refuses `--offline` without `--replay`, and builds the live `claudeRouteModel` only when not offline. In offline mode, planner calls answer from the recorded proposals and pass calls from the recorded answers. A pass call with no recorded answer that fits throws, and the part holds. The runner also refuses any database except `127.0.0.1`, and port 6132. Nothing else in the script calls out. Confirmed by reading the code; I didn't run a replay (it needs the private cases file).

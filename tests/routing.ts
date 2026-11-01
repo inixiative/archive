@@ -1,5 +1,6 @@
 import type { ArchiveDestination, Routing } from '../src/config';
 import { partSnapshot } from '../src/parts';
+import { sensitivityKey } from '../src/route';
 import type { ArchiveStore } from '../src/store';
 
 /**
@@ -37,5 +38,40 @@ export async function routeWhole(store: ArchiveStore, id: string, organizations:
     [],
   );
   const { kept } = await store.applyParts(id, [{ snapshot: part, organizations }]);
+  // The plan behind it, checked by the sensitivity pass, as a planner run would record it.
+  const plan = {
+    parts: [
+      {
+        firstEntryId: ids[0]!,
+        lastEntryId: ids.at(-1)!,
+        organizations,
+        sensitive: false,
+        confidence: 1,
+        rationale: 'test',
+      },
+    ],
+    prune: [],
+    redactions: [],
+    rationale: 'test',
+    throughEntryId: ids.at(-1)!,
+    sensitive: [],
+    heldForReview: [],
+    checked: sensitivityKey('test'),
+  };
+  const row = await store.db.archive.findUniqueOrThrow({ where: { id }, select: { digest: true } });
+  const fields = {
+    status: 'valid',
+    plan,
+    key: 'test',
+    by: 'test',
+    digest: row.digest,
+    entries: ids.length,
+    at: Date.now(),
+  };
+  await store.db.routingPlan.upsert({
+    where: { archiveId: id },
+    create: { archiveId: id, ...fields },
+    update: fields,
+  });
   return kept[0]!;
 }

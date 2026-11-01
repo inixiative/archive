@@ -340,6 +340,13 @@ test('agents CLI edits agents.json declaratively', async () => {
   await cli('remove-collector', '--name', 'claude');
   expect(readAgents(file)).toMatchObject({ collectors: [{ name: 'codex.archive' }] });
   await expect(cli('server')).rejects.toThrow('--url');
+  // The router's per-wake cap is written for the unit to pass on as `route --watch --limit`.
+  await cli('router', '--limit', '40', '--concurrency', '3');
+  expect(readAgents(file)?.router).toEqual({ concurrency: 3, limit: 40 });
+  await cli('router');
+  expect(readAgents(file)?.router).toEqual({});
+  await cli('router', 'off');
+  expect(readAgents(file)?.router).toBeUndefined();
   await expect(runCli(['agents', 'install', '--home', temp()])).rejects.toThrow('agents.json');
 });
 

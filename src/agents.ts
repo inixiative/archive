@@ -100,7 +100,13 @@ export const agentsConfigSchema = z
      * The routing scheduler (`archive route --watch`), installed beside the collectors when
      * declared: it plans sessions on the machine's personal Claude login and applies the plans.
      */
-    router: z.strictObject({ concurrency: z.number().int().min(1).max(8).optional() }).optional(),
+    router: z
+      .strictObject({
+        concurrency: z.number().int().min(1).max(8).optional(),
+        /** Sessions one wake plans at most (`route --watch --limit`); the rest wait for the next. */
+        limit: z.number().int().min(1).max(10_000).optional(),
+      })
+      .optional(),
   })
   .refine(
     (c) => new Set(c.collectors.map((x) => x.name)).size === c.collectors.length,
@@ -250,6 +256,12 @@ export function collectorPlan(config: AgentsConfig, name: string) {
 }
 
 /** One supervised unit per declared agent. */
+/**
+ * Sessions the router plans per wake by default. About 22k tokens a session with the sensitivity
+ * pass on (measured 2026-11-01), so a wake stays near 0.7M.
+ */
+export const ROUTER_WAKE_LIMIT = 30;
+
 export function agentUnits(config: AgentsConfig, options: AgentUnitOptions): AgentUnit[] {
   const home = resolve(options.home);
   const claudeBin = config.router
@@ -279,6 +291,9 @@ export function agentUnits(config: AgentsConfig, options: AgentUnitOptions): Age
             ...(config.router.concurrency
               ? ['--concurrency', String(config.router.concurrency)]
               : []),
+            // A large due set (a backfill's worth) is spread across wakes, not planned in one burst.
+            '--limit',
+            String(config.router.limit ?? ROUTER_WAKE_LIMIT),
           ]),
         ]
       : []),
