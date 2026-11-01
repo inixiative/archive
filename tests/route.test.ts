@@ -251,7 +251,7 @@ test('an opener that is personal and sensitive stays here; the template work aft
 test('work for UserEvidence publishes there with the coworker lines redacted; the json-rules part goes to inixiative (01b0bda06a)', async () => {
   const { store, archive } = await setup();
   const s = session('mixed', [
-    { kind: 'user', text: 'Review Zealot PR 4590' },
+    { kind: 'user', text: 'Review Zealot PR 4590  \nplease' },
     call({ command: 'gh pr review 4590 --repo userevidence/zealot --approve' }, 'Bash'),
     { kind: 'assistant', text: 'Reviewed.' },
     { kind: 'user', text: 'ugh, vlad deleted a bunch of my work again' },
@@ -264,6 +264,10 @@ test('work for UserEvidence publishes there with the coworker lines redacted; th
     { kind: 'assistant', text: 'Fixed in json-rules' },
   ]);
   const { id } = await store.capture(s, { cwd: '/z' });
+  // The planner sees entries as stored, so what it quotes matches byte for byte.
+  expect((await store.routingInput(id, routing)).entries[0]!.text).toBe(
+    'Review Zealot PR 4590  \nplease',
+  );
   const { model } = scripted([
     plan(
       [

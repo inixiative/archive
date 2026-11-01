@@ -499,7 +499,7 @@ export type RecordPlanResult = {
   issues?: string[];
   notes?: string[];
   /** Parts as they now publish, by part session id, with their organizations. */
-  parts?: { sessionId: string; organizations: string[]; entries: number }[];
+  parts?: { sessionId: string; organizations: string[]; entries: number; redacted?: number }[];
   retired?: string[];
   /** The organizations whose destinations hold this session or its parts now (receipts). */
   holds?: string[];
@@ -646,7 +646,7 @@ export type BackfillRow = {
   status: string;
   issues?: string[];
   holds: string[];
-  publishes: { sessionId: string; organizations: string[]; entries: number }[];
+  publishes: { sessionId: string; organizations: string[]; entries: number; redacted?: number }[];
   /** Organizations that hold it now and would hold none of it, and ones it would newly reach. */
   deletes: string[];
   adds: string[];

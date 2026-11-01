@@ -1721,7 +1721,8 @@ export class ArchiveStore {
       return {
         index,
         kind: entry.kind,
-        text: clip(entry.text.replace(/\s+\n/g, '\n'), max),
+        // Shown as stored, so a redaction quoting it matches byte for byte.
+        text: clip(entry.text, max),
         ...(foreign ? { foreign } : {}),
         ...(own && Object.keys(own).length ? { evidence: own } : {}),
       };
@@ -1902,6 +1903,7 @@ export class ArchiveStore {
         sessionId: p.snapshot.sessionId,
         organizations: p.organizations,
         entries: p.snapshot.entries.length,
+        redacted: p.snapshot.entries.filter((e) => e.text.includes('[redacted: ')).length,
       })),
     };
     if (body.dryRun) return { status: 'valid', ...outcome, holds };
