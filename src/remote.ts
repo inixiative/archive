@@ -143,7 +143,7 @@ export class ArchiveClient {
    * Captures a snapshot as the next revision, retrying when another writer got there first. `cwd`
    * is the session's working directory, for the evidence the server computes at ingest.
    */
-  async capture(input: unknown, context: { cwd?: string } = {}) {
+  async capture(input: unknown, context: { cwd?: string; evidenceOnly?: boolean } = {}) {
     const snapshot = archiveSnapshotSchema.parse(input);
     const id = archiveKey(snapshot);
     for (let attempt = 0; ; attempt++) {
@@ -160,6 +160,7 @@ export class ArchiveClient {
           snapshot,
           previousDigest: head?.digest ?? null,
           ...(context.cwd ? { cwd: context.cwd } : {}),
+          ...(context.evidenceOnly ? { evidenceOnly: true } : {}),
         });
       } catch (error) {
         const conflict =
@@ -247,11 +248,16 @@ export class ArchiveClient {
     return this.request<ArchiveSettings>('settings/read');
   }
   /** What the routing planner reads for one session (the delta since its plan, with context). */
-  routingInput(body: { archiveId: string }) {
+  routingInput(body: { archiveId: string; key?: string }) {
     return this.request<RoutingInput>('routing/input', body, { timeoutMs: 120_000 });
   }
   /** Sessions due for a routing plan, in the order to plan them. */
-  async routingDue(body: { limit: number; unplanned?: boolean; withoutParents?: boolean }) {
+  async routingDue(body: {
+    limit: number;
+    unplanned?: boolean;
+    withoutParents?: boolean;
+    planKey?: string;
+  }) {
     return (
       await this.request<{ due: { archiveId: string; reason: string; depth?: number }[] }>(
         'routing/due',

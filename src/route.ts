@@ -5,6 +5,7 @@ import {
   evidenceByOrganization,
   evidencedOrganizations,
   type OrganizationEvidence,
+  organizationsWithEvidence,
   type ProjectMap,
   type SessionEvidence,
 } from './evidence';
@@ -48,6 +49,23 @@ export const routeKey = (model: string) =>
     .digest('hex')
     .slice(0, 32);
 
+/**
+ * The organizations a range may go to: what its own evidence allows, what the subagents spawned in
+ * it have evidence for, and what a person decided. The one predicate validation and the planner's
+ * no-evidence check share.
+ */
+export function allowedOrganizations(
+  evidenced: Iterable<string>,
+  children: Iterable<Iterable<string>>,
+  decided: Iterable<string>,
+) {
+  const allowed = new Set(evidenced);
+  for (const child of children) for (const o of child) allowed.add(o);
+  for (const o of decided) allowed.add(o);
+  allowed.delete(PERSONAL);
+  return allowed;
+}
+
 /** A part of a stored plan, by entry id. Personal parts are kept: `sensitive` ones are sticky. */
 export const planPartSchema = z.strictObject({
   firstEntryId: z.string().min(1).max(256),
@@ -74,6 +92,11 @@ export const storedPlanSchema = z.strictObject({
   rationale: z.string().max(1_000),
   /** The last entry the plan covers; later entries are not planned yet and publish nowhere. */
   throughEntryId: z.string().min(1).max(256),
+  /**
+   * Entries kept personal as sensitive by this plan or any plan before it, rebuilds included:
+   * sticky, they never publish, and a work part over one holds.
+   */
+  sensitive: z.array(z.string().min(1).max(256)).max(50_000).default([]),
 });
 export type PlanPart = z.infer<typeof planPartSchema>;
 export type StoredPlan = z.infer<typeof storedPlanSchema>;
@@ -247,6 +270,8 @@ export type ValidationContext = {
   through: number;
   /** Entries the planner was shown cut: none may publish. */
   clipped?: ReadonlySet<string>;
+  /** Sensitive entries of plans this one replaces (a rebuild's governing plan): sticky. */
+  sensitive?: ReadonlySet<string>;
   /** A person's `route:` decisions: evidence for those organizations, or everything personal. */
   overrides: { organizations: ReadonlySet<string>; personal: boolean };
   children: ChildEvidence[];
@@ -282,13 +307,18 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
   /** Organizations a range's own evidence, the subagents it spawned, or a person allow. */
   const allowedFor = (range: Pick<ArchiveEntry, 'id'>[]) => {
     const ids = new Set(range.map((e) => e.id));
-    const allowed = evidencedOrganizations(context.evidence, context.routing, context.map, ids);
-    for (const child of context.children)
-      if (child.spawnEntryId && ids.has(child.spawnEntryId))
-        for (const o of child.organizations) allowed.add(o);
-    for (const o of context.overrides.organizations) allowed.add(o);
-    return allowed;
+    return allowedOrganizations(
+      evidencedOrganizations(context.evidence, context.routing, context.map, ids),
+      context.children
+        .filter((child) => child.spawnEntryId && ids.has(child.spawnEntryId))
+        .map((child) => child.organizations),
+      context.overrides.organizations,
+    );
   };
+  const stickySensitive = new Set([
+    ...(context.sensitive ?? []),
+    ...sensitiveEntries(context.prior, entries),
+  ]);
   const parts: PlanPart[] = [];
   let previousEnd = context.from - 1;
   let continued: PlanPart | undefined;
@@ -320,6 +350,14 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
       confidence: part.confidence ?? 0.5,
       rationale: (part.why ?? '').slice(0, 500),
     };
+    // Sensitive entries from any plan generation never go to work: a work part over one holds.
+    if (stored.organizations.some((o) => o !== PERSONAL)) {
+      const over = entries.slice(part.from, part.to + 1).filter((e) => stickySensitive.has(e.id));
+      if (over.length)
+        issues.push(
+          `${label} covers entries kept personal as sensitive (${over.map((e) => e.id).join(', ')})`,
+        );
+    }
     const last = priorParts.at(-1);
     // A continuation starts at the first new entry, or it would take in entries no part named.
     if (i === 0 && part.continues && part.from !== context.from)
@@ -401,7 +439,9 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
     redactions: dedupe(redactions, (r) => JSON.stringify([r.entryId, r.text])),
     rationale: (proposal.rationale || context.prior?.rationale || '').slice(0, 1_000),
     throughEntryId: idAt(context.through)!,
+    sensitive: [],
   };
+  plan.sensitive = [...new Set([...stickySensitive, ...sensitiveEntries(plan, entries)])];
   return { status: 'valid', plan, notes };
 }
 
@@ -461,7 +501,7 @@ export function sensitiveEntries(
   plan: StoredPlan | undefined,
   entries: Pick<ArchiveEntry, 'id'>[],
 ) {
-  const ids = new Set<string>();
+  const ids = new Set<string>(plan?.sensitive ?? []);
   if (!plan) return ids;
   const index = new Map(entries.map((e, i) => [e.id, i]));
   for (const part of plan.parts) {
@@ -490,12 +530,14 @@ export function planReach(plan: StoredPlan, entries: Pick<ArchiveEntry, 'id'>[],
 
 /** The archive the planner reads from and records to. */
 export interface RoutingArchive {
-  routingInput(body: { archiveId: string }): Promise<RoutingInput>;
+  routingInput(body: { archiveId: string; key?: string }): Promise<RoutingInput>;
   recordPlan(body: RecordPlanBody): Promise<RecordPlanResult>;
   routingDue(body: {
     limit: number;
     unplanned?: boolean;
     withoutParents?: boolean;
+    /** The planner's charter and model (`routeKey`): a plan made under another is due. */
+    planKey?: string;
   }): Promise<{ archiveId: string; reason: string; depth?: number }[]>;
 }
 export type RecordPlanBody = {
@@ -543,9 +585,28 @@ export async function planSession(
   archiveId: string,
   options: { dryRun?: boolean } = {},
 ): Promise<RecordPlanResult & { tokens?: TokenUsage; input?: RoutingInput }> {
-  const input = await archive.routingInput({ archiveId });
   const key = routeKey(model.model);
+  const input = await archive.routingInput({ archiveId, key });
   const base = { archiveId, digest: input.digest, through: input.through, key, by: model.model };
+  // Nothing could reach an organization: no evidence, start directory, person's decision or
+  // subagent for one. It holds as it is, and no tokens are spent on it.
+  // The validator's own predicate, over the whole session.
+  const reach = allowedOrganizations(
+    organizationsWithEvidence(input.evidence, input.session.startOrganization),
+    input.children.map((child) => organizationsWithEvidence(child.evidence)),
+    input.overrides
+      .map((tag) => tag.slice(ROUTE_TAG_PREFIX.length))
+      .filter((o) => input.organizations.some((known) => known.id === o)),
+  );
+  if (!input.prior && !reach.size)
+    return {
+      ...(await archive.recordPlan({
+        ...base,
+        failure: 'no evidence for any organization',
+        ...options,
+      })),
+      input,
+    };
   if (!input.entries.length) {
     if (!input.prior) return { status: 'stale', input };
     // No new entries, yet due: a person's decision changed, so the plan is re-applied under it.
@@ -613,7 +674,10 @@ export async function runRouting(
     progress?: (line: string) => void;
   } = {},
 ): Promise<RoutingReport> {
-  const due = await archive.routingDue({ limit: options.limit ?? 500 });
+  const due = await archive.routingDue({
+    limit: options.limit ?? 500,
+    planKey: routeKey(model.model),
+  });
   const report: RoutingReport = {
     model: model.model,
     due: due.length,

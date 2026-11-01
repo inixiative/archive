@@ -85,6 +85,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       id: { type: 'string' },
       query: { type: 'string', default: '' },
       'project-root': { type: 'string', multiple: true },
+      'former-root': { type: 'string', multiple: true },
       worktrees: { type: 'boolean', default: false },
       subdirectories: { type: 'boolean', default: false },
       'catch-all': { type: 'boolean', default: false },
@@ -115,6 +116,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       backfill: { type: 'boolean', default: false },
       all: { type: 'boolean', default: false },
       roster: { type: 'string', multiple: true },
+      'all-organizations': { type: 'boolean', default: false },
       name: { type: 'string' },
       hostname: { type: 'string', default: '127.0.0.1' },
       watch: { type: 'boolean', default: false },
@@ -143,18 +145,18 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'export --id ID | tag --id ID [--tag TAG ...] [--untag TAG ...]\n' +
         'tags list | tags define --tag TAG [--description TEXT] | tags remove --tag TAG   (the category tags the archive offers)\n' +
         'suggest [--limit N] [--batch 8] [--concurrency 2] [--model claude-haiku-5-5] [--refresh]   (tag suggestions on the Claude subscription; test and Oracle runs are exempt)\n' +
-        "pair --kingdom KINGDOM_API_URL [--name NAME] [--organization SLUG|ID] [--library ID|NAME ...] [--yes]   (register this Archive with Kingdom, asking for sessions.write on those libraries, by default the ones its Kingdom destinations name, else the owner's; claim the review code there, then confirm the owner)\n" +
+        "pair --kingdom KINGDOM_API_URL [--name NAME] [--organization SLUG|ID] [--library ID|NAME ...] [--yes]   (register this Archive with Kingdom, asking for sessions.write and sessions.delete on those libraries, by default the ones its Kingdom destinations name, else the owner's; claim the review code there, then confirm the owner)\n" +
         'connect --url HTTPS_URL --organization-id ID (--token-env ENV | --token-file PATH)   (a remote Archive an organization publishes to, for serve --sync)\n' +
         'connect --kind kingdom --url KINGDOM_API_URL --credential-file PATH --integration-id UUID --resource-id UUID --organization-id ID   (a hosted Archive through Kingdom)\n' +
-        'organizations list | organizations set --id ID [--project ID ...] [--roster NAME ...] | organizations remove --id ID   (the projects each organization owns; a session publishes to every organization its project or a project it touched belongs to)\n' +
+        'organizations list | organizations set --id ID [--project ID ...] [--roster NAME ...] | organizations remove --id ID   (the projects each organization owns, and coworker names for the planner; what publishes is the parts of each session, to the organizations its validated plan gives them)\n' +
         'route [--watch] [--concurrency 2] [--limit N] [--model claude-sonnet-5-5] [--claude-bin PATH] [--claude-config-dir DIR] [--dry-run]   (plan due sessions on the personal Claude login: parts × organizations; --watch wakes every 2 minutes)\n' +
         'route --backfill [--dry-run]   (plan every session and print the plan against what destinations hold now) | route plans [--all] | route review --id ID | route reset --id ID\n' +
-        'cleanup [ORG] [off|leaked|all]   (what sync deletes at destinations, default off; with ORG, that organization only) | sync --dry-run   (per destination, the ids cleanup would delete now)\n' +
-        'publish [on|off]   (the go-live switch: off, the default, plans and deletes leaked whole-session copies but publishes nothing new)\n' +
+        'cleanup [ORG] [off|leaked|all] [--all-organizations]   (what sync deletes at destinations, default off; with ORG, that organization only; leaked or all for every organization needs --all-organizations) | sync --dry-run   (per destination, the ids cleanup would delete now)\n' +
+        'publish [on|off]   (the go-live switch: off, the default, plans sessions but publishes nothing new; deletes are cleanup settings)\n' +
         'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
         "settings [--capture-tool-calls-and-results true|false] [--capture-run-sessions true|false] [--retention-days N|off]   (read, or change, this Archive's settings)\n" +
         'maintenance status | maintenance reclaim   (compaction left to do and table sizes; return freed space to the OS once compaction is done)\n' +
-        'agents add-collector --name N --source codex|claude-code (--project-id ID --project-root DIR [--project-root ...] [--worktrees] [--subdirectories] | --catch-all) [--directory HISTORY] [--atlas]\n' +
+        'agents add-collector --name N --source codex|claude-code (--project-id ID --project-root DIR [--project-root ...] [--worktrees] [--subdirectories] [--former-root DIR ...] | --catch-all) [--directory HISTORY] [--atlas]   (former roots: where the checkouts used to live, for evidence only)\n' +
         'agents router [--concurrency N] | agents router off   (install the routing scheduler beside the collectors)\n' +
         'agents remove-collector --name N | folders [--include GLOB ...] [--exclude GLOB ...] | server --url URL | install | uninstall | status\n' +
         `Data commands talk to the Archive server at --url (default ${DEFAULT_URL}) with the token in --token-file (default <home>/server.token) or ARCHIVE_TOKEN.\n`,
@@ -340,7 +342,14 @@ export async function runCli(args = Bun.argv.slice(2)) {
     if (mode !== 'off' && mode !== 'leaked' && mode !== 'all') {
       const routing = readRouting(config);
       output({ cleanup: routing.cleanup, cleanupFor: routing.cleanupFor });
-    } else output(setCleanup(config, mode, second ? first : undefined));
+    } else {
+      // Deleting at every organization's destinations is asked for by name, never by default.
+      if (!second && mode !== 'off' && !v['all-organizations'])
+        throw new Error(
+          `cleanup ${mode} without an organization applies to every organization: name one (cleanup ORG ${mode}) or pass --all-organizations`,
+        );
+      output(setCleanup(config, mode, second ? first : undefined));
+    }
     return;
   }
   if (command === 'publish') {
@@ -388,6 +397,9 @@ export async function runCli(args = Bun.argv.slice(2)) {
             directory: resolve(v.directory ?? defaultHistoryDirectory(source)),
             projectId: catchAll ? UNROUTED : v['project-id']!,
             projectRoots: catchAll ? [] : v['project-root']!.map((root) => resolve(root)),
+            ...(v['former-root']?.length
+              ? { formerRoots: v['former-root'].map((root) => resolve(root)) }
+              : {}),
             ...(v.worktrees ? { worktrees: true } : {}),
             ...(v.subdirectories ? { subdirectories: true } : {}),
             ...(catchAll ? { catchAll: true } : {}),

@@ -116,6 +116,21 @@ export function folderAllowed(cwd: string, filters: FolderFilters) {
 const temporary = (cwd: string) =>
   temporaryRoots().some((root) => cwd === root || cwd.startsWith(`${root}/`));
 
+/**
+ * The transcripts a collector reads: its history directory's, and for Codex the rollouts Codex
+ * moved to `archived_sessions` beside `sessions`, which are sessions all the same.
+ */
+export function historyFiles(config: Pick<CollectionSource, 'directory' | 'source'>) {
+  const directory = resolve(config.directory);
+  const archived = join(dirname(directory), 'archived_sessions');
+  return [
+    ...transcriptFiles(directory),
+    ...(config.source === 'codex' && directory.endsWith('/sessions') && existsSync(archived)
+      ? transcriptFiles(archived)
+      : []),
+  ];
+}
+
 /** Every transcript (`.jsonl`) under a directory, in order, without following links. */
 export function transcriptFiles(directory: string): string[] {
   const result: string[] = [];
@@ -420,7 +435,7 @@ export async function collectSessions(
   const graphs = new Map<string, AtlasFileConcepts | undefined>();
   let harness: 'subscription' | 'api' | undefined | null = null;
   const mapKey = (await archive.projectMapKey?.()) ?? null;
-  for (const file of transcriptFiles(config.directory)) {
+  for (const file of historyFiles(config)) {
     try {
       const before = lstatSync(file);
       const known = cache.get(file);
@@ -545,6 +560,10 @@ export async function collectSessions(
       const moved =
         old && !old.deleted && old.projectId !== config.projectId && old.projectId !== UNROUTED;
       if (moved && !(options.repair && (await collided(archive, id, snapshot)))) {
+        // Held by its project, but its evidence predates the map: the same transcript under that
+        // project is sent again, which recomputes the evidence and changes nothing else.
+        if (mapKey && old.evidenceKey !== mapKey)
+          await archive.capture(snapshot, { cwd, evidenceOnly: true });
         result.held++;
         result.heldBy.push({ file, projectId: old.projectId! });
         remember('held', meta);

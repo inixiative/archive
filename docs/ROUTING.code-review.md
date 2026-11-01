@@ -282,3 +282,89 @@ Rehearsal: I applied origin/main's seven migrations to a fresh database and seed
 1. **G1:** fix the digest-staleness rule, or accept that active UE sessions lose their whole copy.
 2. **G2:** confirm whether any copy at UE was sent with tool activity, and decide what kept whole copies may carry.
 3. Pin `publish off` and `cleanup off` in `destinations.json` (rollback safety), use the per-organization form, and dry-run first.
+
+---
+
+## PR #33 gate (2026-11-01, `fix/cleanup-keep-guards`, `e100a50..3bcde77`)
+
+**Verdict: BLOCK on B1. B2 is small and should go in the same PR.** G1/G2, the `--all-organizations` guard, Codex `archived_sessions`, the no-evidence hold, `formerRoots` and both migrations pass.
+
+Ground truth: `3bcde77`. `bun run typecheck` passes. `bun run lint` reports 0 errors and 213 warnings. `bun test` passed 171 of 171 against a throwaway `pgvector:pg17` on random port 27729, never 6132. Probes are in `probe/pr33.test.ts` (five tests) and the migration rehearsal in `mig33/`, both in the session scratchpad. They call `ArchiveStore.capture` / `routingInput` / `recordPlan` and `syncArchives` against an in-process destination Archive. Nothing live was touched, and no secrets were printed.
+
+### B1, blocking: a rebuild drops the replaced plan's sticky sensitive decisions on the next delta (proven)
+`store.ts:2119-2136` merges the governing plan's prunes and redactions into the rebuilt plan. The governing plan's **sensitive personal parts** are honored only through the swap's `sticky` set. They are never stored in the new plan. The next delta builds `sticky` from the new plan alone, so those entries are no longer excluded.
+
+**Probe:**
+1. Plan A: E0–E1 ("I am interviewing elsewhere", "career advice") is sensitive personal; E2–E3 go to UE.
+2. Plan B (new key) re-plans E0–E3 as one UE part. At the swap, the UE part correctly holds only E2–E3.
+3. The session grows, and the B delta continues the part. The **UE part now holds the career entries**.
+
+The plan also records `wholeTo: ['userevidence']` with a whole digest. So with publish on, career talk publishes to UE. With publish off and `cleanup userevidence leaked`, a UE copy of that revision would count as reviewed and be **kept**.
+
+Fix: on the swap, carry the governing plan's sensitive entries into the stored plan, either as sticky prunes or as sensitive personal parts the rebuilt parts can't cover. Better, have `validatePlan` hold any rebuilt part that overlaps a governing sensitive range. Add a test for exactly this three-step sequence.
+
+### B2, should fix in this PR: an evidence-only capture can delete the row (proven)
+The run-drop check runs **before** the `evidenceOnly` branch (`store.ts:272` vs `:280`). A non-owning collector's snapshot carries that collector's own `config.tags`. If those tags include a run stamp and `captureRunSessions` is off, the evidence-only capture takes the drop path. That runs `deleteMany` on the stored row, with no tombstone and no `pending`, and its receipts cascade away.
+
+**Probe:** a stored session with a receipt, then `capture({...s, tags:['run:oracle']}, {evidenceOnly:true})`. It returns `dropped: run:oracle`, the row is gone and the receipts are 0. Any destination copy is now orphaned, which is R2 again.
+
+Before this PR a held session wasn't sent at all, so this is new. Fix: take the `evidenceOnly` branch before the drop check (it only needs `old` and `map`), or ignore the incoming tags in that mode.
+
+Pre-existing, for the record: that drop path (`deleteMany` with no tombstone and no pending deletes) orphans copies whenever a session newly gains a run stamp. Route it through `delete()`.
+
+### (1) The evidence-only capture otherwise changes only evidence (proven)
+Another project's collector re-sent the same transcript with a different `projectId`, different tags and its own `cwd`. `digest`, `storedDigest`, `revision`, `projectId`, `summary` and receipts were all unchanged; only `evidence` changed (`startProjectId` undefined → `zealot`). A different transcript is a no-op. It writes no revision, no outbox row, no receipt and no tombstone, and it doesn't mark the plan due.
+- Caveat: the incoming `cwd` sets `startProjectId`, which counts as evidence for every part (L5). The collector sends the transcript's own `cwd`, so that's fine. Any other token holder can set it at will, but that is trusted-writer territory.
+
+### (2) Rebuild
+- **Mid-rebuild it publishes and deletes nothing new.** A window short of the last is stored aside (`rebuild`, due `charter`, `parts: []`), and the governing plan's parts, `wholeTo` and `wholeDigests` stay as they were. A held window clears `rebuild`, and the governing plan stands. The swap happens only at the last entry.
+- **Sticky prunes and redactions** carry over (merged). **Sensitive personal decisions** carry over only for the swap itself (B1).
+- **A person's decision mid-rebuild is deferred.** A `route:personal` change during a multi-window rebuild is applied to a stored-aside window; the governing parts and `wholeTo` keep publishing, or keep a UE copy kept, until the rebuild reaches the last entry, one window per 2-minute pass. My two-window probe swapped at once (the decision landed). Three windows or more defers it by minutes. Low, but a person's `route:personal` should apply to the governing plan immediately.
+- **No-evidence shortcut.** For a rebuild with no evidence, `input.prior` is undefined, so it is recorded held under the **new** key while the old plan governs. That is safe; it just means "held" can describe a session whose old-charter parts still route.
+
+### (3) G1/G2 keep exactly the reviewed copies (proven)
+`wholeTo` is set only when the plan covers the last entry, has no redactions, and publishes one part holding every entry. That rules out prunes, sticky exclusions and foreign exclusions. `wholeDigests` holds the stripped digests of those reviewed revisions, reset whenever `wholeTo` changes. `copiesToKeep` keeps a whole copy only when the digest the destination holds (its listing, else the receipt) is one of them.
+
+**Probe** under `cleanupFor userevidence leaked` with publish off:
+- a whole-reviewed copy is **kept**, and **still kept** after the session grows (G1 fixed);
+- a copy sent with tool activity, which the plan reviewed only stripped, is **deleted** (G2);
+- a copy whose plan has a redaction is **deleted**.
+
+Owed receipts (digest `''`) and Kingdom copies without a listing digest fall back to the receipt digest and fail closed. Kept copies still carry whole-session tags and references; the plan reviewed those, since they are in the stripped snapshot. **Except B1**, nothing broader is kept.
+
+### (4) Migrations on live-shaped data
+Rehearsal: main's migrations at `e100a50`, then 1,500 archives, 1,172 valid `routing_plans` and 158 receipts, then the PR's `190000_routing_whole` and `200000_routing_rebuild`.
+- **Results:** both applied. Every plan has `wholeTo = '{}'`, `wholeDigests = '{}'` and `rebuild` NULL, and its `plan` is intact. Receipts are intact. `prisma migrate diff` returned an empty migration. All changes are defaulted or nullable columns, so the locks are milliseconds.
+- **Consequence, operational:** an existing plan keeps **no** whole copy until it is re-recorded. This PR changes the `projectMapKey` formula (`formerRoots` is added), so every `contextKey` changes. Every plan then becomes due `context` and is re-applied with no model call, which fills `wholeTo` from the current revision. Every row's `evidenceKey` goes stale too, so the collector re-sends every session once.
+  - **Order:** upgrade → `archive collect` → one `route` pass → `sync --dry-run` → `cleanup userevidence leaked`. Setting `leaked` earlier deletes every genuine UE whole copy.
+  - A UE copy of a revision older than the one re-applied (the session grew after the leak) is deleted. That is conservative.
+
+### (5) Parallel machinery
+None of substance:
+- `historyFiles` wraps `transcriptFiles`.
+- `formerRoots` rides the existing resolvable-roots path.
+- `evidenceOnly` is a mode of `capture`, built on `sessionEvidence`.
+- `rebuild` is a JSON slot on the existing `RoutingPlan`.
+- `wholeDigests` reuses `snapshotDigest`.
+
+Two small duplications. The `evidenceOnly` branch re-implements the `stripOf` / `evidenceOf` closures defined a few lines below it; moving the branch after them also fixes B2. `planSession`'s no-evidence test (`route.ts:540-559`) restates `validatePlan`'s `allowedFor` (evidence, start organization, overrides, subagents) on the client, which is a drift risk. Exposing one shared predicate would fix it.
+
+### Ranked
+1. **B1:** rebuild loses sticky sensitive decisions after the swap. A leak with publish on; a wrongful keep under `leaked`. Blocking.
+2. **B2:** an evidence-only capture can delete the row through the run-drop path. Fix in this PR.
+3. **Operational:** don't set `leaked` before a router pass has re-applied the plans, or genuine UE whole copies are deleted.
+4. **Deferred decision:** a person's `route:personal` waits for a multi-window rebuild to finish. Low.
+
+---
+
+## PR #33 re-gate (2026-11-01, `4d15438`)
+
+**Verdict: MERGE.** B1 and B2 are fixed, and nothing in the new code widens routing.
+
+Ground truth: `4d15438`. `bun run typecheck` passes. `bun run lint` reports 0 errors and 216 warnings. `bun test` passed 174 of 174 against a throwaway Postgres on random port 24979, never 6132. I re-ran four probes from `probe/pr33.test.ts`: (1a), (1b), (2a) and (3).
+
+- **B1, fixed (probe 2a).** Plan B re-plans E0–E3 as one UE part over A's sensitive E0–E1, and that proposal now **holds** ("covers entries kept personal as sensitive"). Plan A keeps governing. After the session grows, the next delta's UE part holds `fix zealot bug, fixed, more zealot, done`, with no career entries, and `wholeTo` is `[]`. `StoredPlan.sensitive` accumulates across plan generations, rebuilds included; `sensitiveEntries` reads it; and any work part over a sticky entry holds. The fix fails closed.
+- **B2, fixed (probe 1b).** An evidence-only capture whose tags carry `run:oracle`, with `captureRunSessions` off, keeps the row (revision 1, 1 receipt). The `evidenceOnly` branch now runs before the drop check and reuses `evidenceOf` / `stripOf`. The drop path itself now goes through `deleteIn`, so a dropped session is tombstoned with its pending deletes queued. That also closes the pre-existing orphan path. Probe (1a) is unchanged: only evidence moves.
+- **G1/G2 still hold (probe 3).** The reviewed copy is kept, and still kept after the session grows. The tool-activity copy and the redacted copy are deleted.
+- **`allowedOrganizations` doesn't widen.** It computes the same set the old inline code did (range evidence plus start organization, subagents spawned in the range, a person's `route:` organizations, never personal). `validatePlan` calls it per range, exactly as before. `planSession` calls it over the whole session, which is broader, but only to skip the model call. A broader set can only send a session to the model instead of holding it, never publish more.
+- **The mid-rebuild decision doesn't widen.** I didn't probe this one; this is from reading the code. A `route:` change during a rebuild re-applies the decision to the governing plan under the governing plan's key, and `rebuild` is kept so the rebuild resumes afterwards. Any new entries in that pass are validated the usual way against the governing plan. A held attempt clears `rebuild`, so the rebuild starts again; that is safe.
