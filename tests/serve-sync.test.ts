@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { connectDestination, destinationsFile, kingdomDirectory } from '../src/config';
+import { connectDestination, destinationsFile, kingdomDirectory, readRouting } from '../src/config';
 import { archiveSnapshotSchema } from '../src/index';
 import { startArchiveServer } from '../src/server';
 import { freshStore, MIGRATED_DATABASE, testDatabaseUrl } from './db';
@@ -54,11 +54,13 @@ test('serve --sync publishes what it receives to its destinations from the same 
       printed += new TextDecoder().decode(chunk.value);
     }
     const url = JSON.parse(printed).listening as string;
+    const sessionId = `synced-${crypto.randomUUID()}`;
     const snapshot = archiveSnapshotSchema.parse({
       schemaVersion: 1,
       sourceId: '1ae3ac76-faa8-4498-8072-425ab35f453c',
       source: 'codex',
-      sessionId: 'synced',
+      // The migrated database outlives a run: a session of its own each time.
+      sessionId,
       title: 'Synced',
       projectId: 'inixiative',
       tags: [],
@@ -66,15 +68,35 @@ test('serve --sync publishes what it receives to its destinations from the same 
       coverage: { reasoning: 'unavailable', completeness: 'recorded', omissions: [] },
       entries: [{ id: 'e', kind: 'user', text: 'hello', timestamp: 1, sourceRef: 'line:1' }],
     });
-    const ingested = await fetch(new URL('api/v1/archive/ingest', url), {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}` },
-      body: JSON.stringify({ snapshot, previousDigest: null }),
+    const post = async (action: string, body: unknown) => {
+      const response = await fetch(new URL(`api/v1/archive/${action}`, url), {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}` },
+        body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(200);
+      return ((await response.json()) as { data: Record<string, unknown> }).data;
+    };
+    await post('projects/set', { projects: [{ projectId: 'inixiative', roots: ['/w'] }] });
+    const ingested = await post('ingest', { snapshot, previousDigest: null, cwd: '/w' });
+    // Nothing publishes until the session is planned: the plan goes through the same server.
+    const input = await post('routing/input', { archiveId: ingested.id });
+    const recorded = await post('routing/record', {
+      archiveId: ingested.id,
+      digest: input.digest,
+      through: input.through,
+      key: 'k',
+      by: 'test',
+      proposal: { parts: [{ from: 0, to: 0, organizations: ['inixiative'] }] },
     });
-    expect(ingested.status).toBe(200);
+    expect(recorded.status).toBe('valid');
     const deadline = Date.now() + 40_000;
-    while (!(await hosted.store.list()).length && Date.now() < deadline) await Bun.sleep(250);
-    expect((await hosted.store.list()).map((a) => a.title)).toEqual(['Synced']);
+    const published = async () =>
+      (await hosted.store.list()).map((a) => a.sessionId).includes(`${sessionId}#part-e`);
+    while (!(await published()) && Date.now() < deadline) await Bun.sleep(250);
+    expect(await published()).toBe(true);
+    // The session itself never publishes, only its part.
+    expect((await hosted.store.list()).map((a) => a.sessionId)).not.toContain(sessionId);
   } finally {
     local.kill('SIGTERM');
     await local.exited;
@@ -125,6 +147,9 @@ test('routes and sync run against the Archive server of the home, without DATABA
     expect(await cli('organizations set --id inixiative --project inixiative')).toEqual([
       { id: 'inixiative', projects: ['inixiative'] },
     ]);
+    await local.store.setProjectMap({
+      projects: [{ projectId: 'inixiative', roots: ['/w'], repositories: [] }],
+    });
     const captured = await local.store.capture(
       archiveSnapshotSchema.parse({
         schemaVersion: 1,
@@ -138,21 +163,42 @@ test('routes and sync run against the Archive server of the home, without DATABA
         coverage: { reasoning: 'unavailable', completeness: 'recorded', omissions: [] },
         entries: [{ id: 'e', kind: 'user', text: 'hello', timestamp: 1, sourceRef: 'line:1' }],
       }),
+      { cwd: '/w' },
     );
-    expect(await cli('routes')).toMatchObject([
+    const planned = await local.store.recordPlan(
       {
-        id: captured.id,
-        projectId: 'inixiative',
-        organizations: ['inixiative'],
-        destinations: [
-          { kind: 'archive', organizationId: 'inixiative', url: hosted.server.url.href },
-        ],
+        archiveId: captured.id,
+        digest: captured.digest,
+        through: 0,
+        key: 'k',
+        by: 'test',
+        proposal: {
+          parts: [{ from: 0, to: 0, organizations: ['inixiative'] }],
+          prune: [],
+          redactions: [],
+          rationale: '',
+        },
       },
-    ]);
+      readRouting(destinationsFile(home)),
+    );
+    expect(planned.status).toBe('valid');
+    const routes = (await cli('routes')) as { id: string; partOf: string | null }[];
+    const part = routes.find((r) => r.partOf === captured.id)!;
+    expect(routes.find((r) => r.id === captured.id)).toMatchObject({
+      organizations: [],
+      destinations: [],
+    });
+    expect(part).toMatchObject({
+      projectId: 'inixiative',
+      organizations: ['inixiative'],
+      destinations: [
+        { kind: 'archive', organizationId: 'inixiative', url: hosted.server.url.href },
+      ],
+    });
     expect(await cli('sync')).toEqual([
-      { id: captured.id, destination: hosted.server.url.href, status: 'published' },
+      { id: part.id, destination: hosted.server.url.href, status: 'published' },
     ]);
-    expect((await hosted.store.list()).map((a) => a.title)).toEqual(['Routed']);
+    expect((await hosted.store.list()).map((a) => a.sessionId)).toEqual(['routed#part-e']);
   } finally {
     await local.close();
     await hosted.close();

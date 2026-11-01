@@ -313,7 +313,7 @@ export function createArchiveHandler(
       if (config && path === '/api/v1/archive/destinations/list') {
         const { organizationId } = destinationListSchema.parse(body);
         const routing = readRouting(config.destinationsFile);
-        const archives = await store.list({ exempt: 'include' });
+        const archives = await store.list({ exempt: 'include', parts: 'include' });
         const destinations = [];
         for (const destination of routing.destinations)
           if (!organizationId || destination.organizationId === organizationId) {

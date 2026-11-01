@@ -8,6 +8,7 @@ import { publishArchive, routingPreview, searchRemotes, syncArchives } from '../
 import {
   type ArchiveDestination,
   connectDestination,
+  destinationIdentity,
   destinationsFile,
   readRouting,
 } from '../src/config';
@@ -17,7 +18,7 @@ import { createArchiveHandler, startArchiveServer } from '../src/server';
 import { ArchiveStore } from '../src/store';
 import { freshStore, testDatabaseUrl } from './db';
 import { signetKingdom } from './kingdom';
-import { routing } from './routing';
+import { routeWhole, routing } from './routing';
 
 const captureResponse = z.object({
   data: z.object({ id: z.string(), digest: z.string(), revision: z.number() }),
@@ -147,8 +148,11 @@ test('three organizations stay isolated; projects no organization owns remain lo
   }
   process.env.ARCHIVE_ROUTING_TEST_TOKEN = token;
   try {
-    for (const projectId of ['personal', 'inixiative', 'userevidence', 'unknown'])
-      await local.capture(snapshot(projectId, projectId));
+    // Each session is planned to its own organization; one no plan routes stays here.
+    for (const projectId of ['personal', 'inixiative', 'userevidence', 'unknown']) {
+      const { id } = await local.capture(snapshot(projectId, projectId));
+      if (projectId !== 'unknown') await routeWhole(local, id, [projectId]);
+    }
     const destinations: ArchiveDestination[] = instances.map(({ projectId, instance }) => ({
       organizationId: projectId,
       kind: 'archive',
@@ -156,8 +160,11 @@ test('three organizations stay isolated; projects no organization owns remain lo
       tokenEnv: 'ARCHIVE_ROUTING_TEST_TOKEN',
     }));
     const routes = await routingPreview(local, routing(destinations));
+    expect(routes.filter((r) => r.destinations.length).map((r) => r.partOf)).toHaveLength(3);
     expect(routes.find((r) => r.projectId === 'unknown')?.destinations).toHaveLength(0);
-    expect(routes.find((r) => r.projectId === 'inixiative')?.destinations).toHaveLength(1);
+    expect(routes.find((r) => r.projectId === 'inixiative' && r.partOf)?.destinations).toHaveLength(
+      1,
+    );
     expect((await syncArchives(local, routing(destinations))).map((r) => r.status)).toEqual([
       'published',
       'published',
@@ -185,7 +192,8 @@ test('lost acknowledgement replays old revision before new content after client 
     tokenEnv: 'ARCHIVE_RESTART_TEST_TOKEN',
   };
   try {
-    const first = await local.capture(snapshot());
+    const source = await local.capture(snapshot());
+    const first = { id: await routeWhole(local, source.id, ['inixiative']) };
     let handler = createArchiveHandler(remote, token);
     const lost = (async (url: any, options: any) => {
       await handler(new Request(url, options));
@@ -194,7 +202,10 @@ test('lost acknowledgement replays old revision before new content after client 
     await expect(
       publishArchive(local, first.id, destination, routing([destination]), lost),
     ).rejects.toThrow('lost ack');
-    await local.capture({ ...snapshot(), title: 'Second', capturedAt: 2 });
+    const second = snapshot();
+    second.entries[0]!.text = 'Second';
+    await local.capture({ ...second, capturedAt: 2 });
+    await routeWhole(local, source.id, ['inixiative']);
     local = new ArchiveStore(testDatabaseUrl('main'));
     remote = new ArchiveStore(testDatabaseUrl('remote'));
     handler = createArchiveHandler(remote, token);
@@ -205,7 +216,7 @@ test('lost acknowledgement replays old revision before new content after client 
     expect((await remote.read(first.id))?.revision).toBe(2);
     // The replayed first revision reached the remote before the second, which compacted it.
     expect(remote.read(first.id, 1)).rejects.toThrow('was compacted');
-    expect((await remote.read(first.id))?.snapshot.title).toBe('Second');
+    expect((await remote.read(first.id))?.snapshot.entries[0]?.text).toBe('Second');
     // Delivered, the local revision the outbox held back is compacted too.
     expect(local.read(first.id, 1)).rejects.toThrow('was compacted');
   } finally {
@@ -284,7 +295,20 @@ test('hosted tag filtering matches exact explicit tags, not transcript mentions'
 
 test('Kingdom destinations write and search through the paired Signet', async () => {
   const local = await freshStore();
-  const id = (await local.capture(snapshot())).id;
+  const source = (await local.capture(snapshot())).id;
+  const id = await routeWhole(local, source, ['inixiative']);
+  await local.db.routingPlan.create({
+    data: {
+      archiveId: source,
+      status: 'valid',
+      plan: {},
+      key: 'k',
+      by: 'm',
+      digest: 'd',
+      entries: 1,
+      at: 1,
+    },
+  });
   const directory = mkdtempSync(join(tmpdir(), 'archive-kingdom-'));
   chmodSync(directory, 0o700);
   const integrationId = crypto.randomUUID();
@@ -294,7 +318,9 @@ test('Kingdom destinations write and search through the paired Signet', async ()
     execute: async (body) =>
       body.operation === 'documents.search'
         ? { documents: [] }
-        : { id, digest: (await local.read(id))!.digest, revision: 1, changed: true },
+        : body.operation === 'sessions.delete'
+          ? { archiveId: id, deleted: true }
+          : { id, digest: (await local.read(id))!.digest, revision: 1, changed: true },
   });
   const { origin, signetId, executed } = kingdom;
   const credentialFile = await kingdom.hold(directory);
@@ -318,13 +344,30 @@ test('Kingdom destinations write and search through the paired Signet', async ()
       operation: 'sessions.write',
       input: { resourceId, previousDigest: null },
     });
-    expect(executed[0].input.snapshot?.sessionId).toBe('one');
+    expect(executed[0].input.snapshot?.sessionId).toBe('one#part-one');
+    // Kingdom's sessions.write takes the snapshot and previous digest only.
+    expect(Object.keys(executed[0].input).sort()).toEqual([
+      'limit',
+      'previousDigest',
+      'resourceId',
+      'snapshot',
+    ]);
     expect(await publishArchive(local, id, destination, routing([destination]))).toEqual({
       unchanged: true,
     });
-    expect((await routingPreview(local, routing([destination])))[0].destinations).toEqual([
-      { kind: 'kingdom', organizationId: 'inixiative', url: origin, integrationId },
+    expect(
+      (await routingPreview(local, routing([destination]))).find((r) => r.id === id)?.destinations,
+    ).toEqual([{ kind: 'kingdom', organizationId: 'inixiative', url: origin, integrationId }]);
+    // A re-plan that no longer routes the part takes it back through sessions.delete.
+    await local.applyParts(source, []);
+    expect(await syncArchives(local, routing([destination]))).toEqual([
+      { id, destination: origin, status: 'deleted' },
     ]);
+    expect(executed.at(-1)).toMatchObject({
+      operation: 'sessions.delete',
+      input: { resourceId, documentId: id },
+    });
+    expect(await local.listing(id)).toBeUndefined();
     const [remote] = await searchRemotes([destination], 'anything');
     expect(remote).toMatchObject({ data: { documents: [] } });
     expect(executed.at(-1)).toMatchObject({ operation: 'documents.search' });
@@ -334,7 +377,7 @@ test('Kingdom destinations write and search through the paired Signet', async ()
   }
 });
 
-test('one archive per organization: a session that touched both organizations publishes to both', async () => {
+test('parts publish to every organization their plan gives them; a re-plan deletes what it drops and restores what it brings back; a planned leak is deleted', async () => {
   const local = await freshStore();
   const instances: {
     projectId: string;
@@ -353,21 +396,6 @@ test('one archive per organization: a session that touched both organizations pu
   }
   process.env.ARCHIVE_ORGANIZATION_TEST_TOKEN = token;
   try {
-    const tagged = (projectId: string, sessionId: string, tags: string[]) => ({
-      ...snapshot(projectId, sessionId),
-      tags,
-    });
-    // Orchestrator work on Zealot, inixiative-only work across repos, a Zealot session that
-    // touched inixiative code, Zealot-only work, and a project no organization owns.
-    await local.capture(
-      tagged('inixiative', 'mixed', ['project:inixiative', 'project:userevidence']),
-    );
-    await local.capture(tagged('inixiative', 'repos', ['project:template', 'project:kingdom']));
-    await local.capture(
-      tagged('userevidence', 'ue-mixed', ['project:userevidence', 'project:tribe']),
-    );
-    await local.capture(tagged('userevidence', 'ue-own', ['project:userevidence']));
-    await local.capture(tagged('scratch', 'local-only', ['project:oracle']));
     const destinations: ArchiveDestination[] = instances.map(({ projectId, instance }) => ({
       kind: 'archive',
       organizationId: projectId,
@@ -378,31 +406,71 @@ test('one archive per organization: a session that touched both organizations pu
       inixiative: ['inixiative', 'template', 'kingdom', 'tribe'],
       userevidence: ['userevidence'],
     });
+    const ue = instances[1]!.instance.store;
+    // A session published whole to UserEvidence before routing was planned (the leak), whose plan
+    // now keeps it personal; one work for both; one for UserEvidence; one not planned yet.
+    const leaked = await local.capture(snapshot('inixiative', 'leaked'));
+    const leakedCopy = (await local.read(leaked.id))!;
+    await ue.capture(leakedCopy.snapshot, { previousDigest: null });
+    await local.delivered(leaked.id, destinationIdentity(destinations[1]!), leakedCopy.digest);
+    await local.db.routingPlan.create({
+      data: {
+        archiveId: leaked.id,
+        status: 'valid',
+        plan: {},
+        key: 'k',
+        by: 'm',
+        digest: 'd',
+        entries: 1,
+        at: 1,
+      },
+    });
+    const mixed = await local.capture(snapshot('inixiative', 'mixed'));
+    const mixedPart = await routeWhole(local, mixed.id, ['inixiative', 'userevidence']);
+    await routeWhole(local, (await local.capture(snapshot('userevidence', 'ue-own'))).id, [
+      'userevidence',
+    ]);
+    const unplanned = await local.capture(snapshot('inixiative', 'unplanned'));
+    // Its copy published before routing was planned waits for its plan: neither sent nor deleted.
+    await local.delivered(unplanned.id, destinationIdentity(destinations[1]!), unplanned.digest);
     const routes = await routingPreview(local, routed);
-    const organizations = (sessionId: string) =>
-      routes.find((r) => r.id === archiveKey(snapshot(r.projectId ?? '', sessionId)))
-        ?.organizations;
-    expect(organizations('mixed')).toEqual(['inixiative', 'userevidence']);
-    expect(organizations('repos')).toEqual(['inixiative']);
-    expect(organizations('ue-mixed')).toEqual(['inixiative', 'userevidence']);
-    expect(organizations('local-only')).toEqual([]);
-    expect((await syncArchives(local, routed)).every((r) => r.status === 'published')).toBe(true);
+    expect(routes.find((r) => r.id === mixedPart)?.organizations).toEqual([
+      'inixiative',
+      'userevidence',
+    ]);
+    expect(routes.find((r) => r.id === unplanned.id)?.organizations).toEqual([]);
+    const statuses = async () =>
+      (await syncArchives(local, routed))
+        .map(
+          (r) =>
+            `${r.status}:${r.destination === destinations[0]!.url ? 'inixiative' : 'userevidence'}`,
+        )
+        .sort();
+    expect(await statuses()).toEqual([
+      'deleted:userevidence',
+      'published:inixiative',
+      'published:userevidence',
+      'published:userevidence',
+    ]);
     const held = (i: number) =>
       instances[i]!.instance.store.list({ exempt: 'include' }).then((l) =>
-        l.map((a) => `${a.sessionId}:${a.projectId}`).sort(),
+        l.map((a) => a.sessionId).sort(),
       );
-    // Each copy keeps its own project; projects are tags, not folders.
-    expect(await held(0)).toEqual([
-      'mixed:inixiative',
-      'repos:inixiative',
-      'ue-mixed:userevidence',
-    ]);
-    expect(await held(1)).toEqual([
-      'mixed:inixiative',
-      'ue-mixed:userevidence',
-      'ue-own:userevidence',
-    ]);
+    expect(await held(0)).toEqual(['mixed#part-one']);
+    expect(await held(1)).toEqual(['mixed#part-one', 'ue-own#part-one']);
     expect((await syncArchives(local, routed)).every((r) => r.status === 'unchanged')).toBe(true);
+    // A re-plan moves the mixed part to inixiative only: UserEvidence's copy is deleted.
+    await routeWhole(local, mixed.id, ['inixiative']);
+    expect(await statuses()).toEqual([
+      'deleted:userevidence',
+      'unchanged:inixiative',
+      'unchanged:userevidence',
+    ]);
+    expect(await held(1)).toEqual(['ue-own#part-one']);
+    // Routed there again, it is restored, not swallowed by the destination's tombstone.
+    await routeWhole(local, mixed.id, ['inixiative', 'userevidence']);
+    expect(await statuses()).toContain('published:userevidence');
+    expect(await held(1)).toEqual(['mixed#part-one', 'ue-own#part-one']);
   } finally {
     delete process.env.ARCHIVE_ORGANIZATION_TEST_TOKEN;
     for (const { instance } of instances) await instance.close();

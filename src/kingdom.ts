@@ -30,7 +30,7 @@ export async function writableLibraries(credentialFile: string) {
 }
 
 /**
- * What a pair asks Kingdom for: `sessions.write` on the libraries named (a UUID is a resource id,
+ * What a pair asks Kingdom for: `sessions.write` and `sessions.delete` on the libraries named (a UUID is a resource id,
  * anything else a library name), else on the libraries this Archive's Kingdom destinations already
  * name, else on the owner's Archive libraries; and the owner, when an organization is named.
  */
@@ -40,7 +40,8 @@ export function pairingRequest(input: {
   libraries?: string[];
   destinations: ArchiveDestination[];
 }): { owner?: RequestedOwner; resources: RequestedResource[] } {
-  const operations = ['sessions.write'];
+  // Deleting is how a re-plan takes back a part it no longer routes there.
+  const operations = ['sessions.write', 'sessions.delete'];
   const named = (input.libraries ?? []).map((library) =>
     z.uuid().safeParse(library).success
       ? { resourceId: library, operations }

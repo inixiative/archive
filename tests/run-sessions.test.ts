@@ -9,7 +9,7 @@ import { RUN_INFERRED, RUN_TAGS, stampedRun, stampRunDirectory } from '../src/ex
 import { archiveSnapshotSchema } from '../src/index';
 import { createArchiveHandler } from '../src/server';
 import { freshStore } from './db';
-import { routing } from './routing';
+import { routeWhole, routing } from './routing';
 
 const token = 'synthetic-archive-test-token-0000000000';
 const session = (sessionId: string, tags: string[] = [], projectId = 'inixiative') =>
@@ -154,7 +154,12 @@ test('a destination that does not keep run sessions acknowledges them, so they a
   process.env.ARCHIVE_RUN_SESSIONS_TEST_TOKEN = token;
   try {
     await remote.updateSettings({ captureRunSessions: false });
-    const { id } = await store.capture(session('synced-run', [RUN_TAGS.test]));
+    // Runs are never planned; a part a person routed still carries the run tag it was cut with.
+    const id = await routeWhole(
+      store,
+      (await store.capture(session('synced-run', [RUN_TAGS.test]))).id,
+      ['inixiative'],
+    );
     const destination: ArchiveDestination = {
       kind: 'archive',
       organizationId: 'inixiative',
@@ -291,6 +296,7 @@ test('a session a person rescued from a run tag is stored without it, so an "off
     await store.capture({ ...session('rescued', [RUN_TAGS.test]), capturedAt: 2 });
     expect((await store.read(id))!.snapshot.tags).toEqual([]);
     expect((await store.list()).map((a) => a.sessionId)).toEqual(['rescued']);
+    const part = await routeWhole(store, id, ['inixiative']);
     const destination: ArchiveDestination = {
       kind: 'archive',
       organizationId: 'inixiative',
@@ -300,13 +306,15 @@ test('a session a person rescued from a run tag is stored without it, so an "off
     const handler = createArchiveHandler(remote, token);
     const transport = ((url: string, options: RequestInit) =>
       handler(new Request(url, options))) as unknown as typeof fetch;
-    expect(await publishArchive(store, id, destination, routing([destination]), transport)).toEqual(
-      { unchanged: false },
-    );
-    expect((await remote.list()).map((a) => a.sessionId)).toEqual(['rescued']);
-    expect(await publishArchive(store, id, destination, routing([destination]), transport)).toEqual(
-      { unchanged: true },
-    );
+    expect(
+      await publishArchive(store, part, destination, routing([destination]), transport),
+    ).toEqual({ unchanged: false });
+    expect((await remote.list()).map((a) => a.sessionId)).toEqual([
+      `rescued#part-${(await store.read(id))!.snapshot.entries[0]!.id}`,
+    ]);
+    expect(
+      await publishArchive(store, part, destination, routing([destination]), transport),
+    ).toEqual({ unchanged: true });
   } finally {
     delete process.env.ARCHIVE_RUN_SESSIONS_TEST_TOKEN;
   }

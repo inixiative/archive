@@ -38,7 +38,8 @@ export type RoutingPreview = (Pick<
   ArchiveListing,
   'id' | 'projectId' | 'tags' | 'suggestedTags'
 > & {
-  /** The organizations the session belongs to: its own project's and each touched project's. */
+  /** A part's session; the organizations it publishes to (a session itself: none). */
+  partOf: string | null;
   organizations: string[];
   destinations: RoutedDestination[];
 })[];

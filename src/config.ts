@@ -14,7 +14,6 @@ import {
 import { dirname, isAbsolute, join } from 'node:path';
 import { z } from 'zod';
 import { UNROUTED } from './index';
-import { PROJECT_TAG_PREFIX } from './tags';
 
 const projectId = z
   .string()
@@ -66,9 +65,9 @@ export const organizationSchema = z.strictObject({
 });
 /**
  * Where sessions publish: one archive per organization, not per project. Each project belongs to
- * an organization, and each organization has its destinations. A session publishes to the
- * destinations of every organization its own project, or a project it touched (`project:` tags),
- * belongs to. Projects in no organization stay on this machine.
+ * an organization, and each organization has its destinations. What publishes is a session's
+ * parts, to the organizations its validated routing plan gives them (`routedTo`); the session
+ * itself, and one not planned or held, publishes nowhere. `project:` tags are for search only.
  */
 export const routingSchema = z
   .strictObject({
@@ -126,27 +125,21 @@ export function readRouting(file: string): Routing {
     : noRouting();
 }
 
-/** The organizations a session belongs to: its own project's and each touched project's. */
-export function sessionOrganizations(
-  routing: Routing,
-  session: { projectId?: string | null; tags: readonly string[] },
-): string[] {
-  const projects = new Set([
-    ...(session.projectId ? [session.projectId] : []),
-    ...session.tags.flatMap((tag) =>
-      tag.startsWith(PROJECT_TAG_PREFIX) ? [tag.slice(PROJECT_TAG_PREFIX.length)] : [],
-    ),
-  ]);
-  return routing.organizations
-    .filter((o) => o.projects.some((p) => projects.has(p)))
-    .map((o) => o.id);
+/** What routing reads of an archive: a part, and its plan's organizations. */
+export type RoutedArchive = { partOf?: string | null; routedTo?: readonly string[] };
+
+/**
+ * The organizations an archive publishes to: a part's, from its session's validated plan, among
+ * those the routing declares. A session (not a part) publishes to none.
+ */
+export function sessionOrganizations(routing: Routing, session: RoutedArchive): string[] {
+  if (!session.partOf) return [];
+  const routed = new Set(session.routedTo ?? []);
+  return routing.organizations.filter((o) => routed.has(o.id)).map((o) => o.id);
 }
 
-/** The destinations a session publishes to: those of every organization it belongs to. */
-export const sessionDestinations = (
-  routing: Routing,
-  session: { projectId?: string | null; tags: readonly string[] },
-) => {
+/** The destinations an archive publishes to: those of every organization it is routed to. */
+export const sessionDestinations = (routing: Routing, session: RoutedArchive) => {
   const organizations = sessionOrganizations(routing, session);
   return routing.destinations.filter((d) => organizations.includes(d.organizationId));
 };

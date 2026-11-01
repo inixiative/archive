@@ -33,6 +33,7 @@ export type PartSpec = {
   projects: ReadonlySet<string>;
 };
 
+const TOOL_KINDS = new Set<string>(['tool-call', 'tool-result']);
 const flat = (text: string) => text.replace(/\s+/g, ' ').trim();
 
 /**
@@ -52,14 +53,14 @@ export function partSnapshot(
       (current, r) => (r.text ? current.replaceAll(r.text, redactionMarker(r.reason)) : current),
       text,
     );
+  // Tool activity never publishes in a part, whatever the stored copy keeps.
   const entries: ArchiveEntry[] = source.entries
-    .filter((entry) => keep.has(entry.id))
+    .filter((entry) => keep.has(entry.id) && !TOOL_KINDS.has(entry.kind))
     .map((entry) => ({ ...entry, text: redact(entry.text) }));
   const range = source.entries.map((e) => e.id);
   const span = range.indexOf(part.lastEntryId) - range.indexOf(part.firstEntryId) + 1;
-  const redacted = source.entries.filter(
-    (entry) => keep.has(entry.id) && redact(entry.text) !== entry.text,
-  ).length;
+  const original = new Map(source.entries.map((e) => [e.id, e.text]));
+  const redacted = entries.filter((entry) => entry.text !== original.get(entry.id)).length;
   const first = entries.find((e) => e.kind === 'user' || e.kind === 'event');
   const root =
     source.lineage?.rootSessionId ??

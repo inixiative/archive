@@ -812,7 +812,14 @@ export class ArchiveStore {
       select: {
         archiveId: true,
         destination: true,
-        archive: { select: { partOf: true, routedTo: true, supersededBy: true } },
+        archive: {
+          select: {
+            partOf: true,
+            routedTo: true,
+            supersededBy: true,
+            routingPlan: { select: { plan: true } },
+          },
+        },
       },
     });
   }

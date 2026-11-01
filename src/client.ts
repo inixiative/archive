@@ -9,6 +9,7 @@ import {
   sessionDestinations,
   sessionOrganizations,
 } from './config';
+import type { ArchiveSnapshot } from './index';
 import { ArchiveRequestError, type RoutingPreview, refusalDetail, type SyncResult } from './remote';
 import { type ArchiveStore, RevisionCompacted } from './store';
 
@@ -60,7 +61,7 @@ const kingdomSignet = async (destination: KingdomDestination) => {
 /** Runs one Archive operation on the destination's library through the paired Signet. */
 export async function kingdomArchiveOperation(
   destination: KingdomDestination,
-  operation: 'sessions.write' | 'documents.search',
+  operation: 'sessions.write' | 'sessions.delete' | 'documents.search',
   input: Record<string, unknown>,
 ) {
   const { result } = await (await kingdomSignet(destination)).execute(
@@ -74,18 +75,50 @@ export async function kingdomArchiveOperation(
   return result;
 }
 
+/**
+ * Sends one revision. A part is re-added on purpose (`restore`: a re-plan that dropped it and
+ * routes it again), so a direct destination lifts its tombstone. Kingdom's `sessions.write` takes
+ * only the snapshot and previous digest, so a part re-added there after a delete stays deleted
+ * until it changes.
+ */
 const ingest = async (
   destination: ArchiveDestination,
-  body: { snapshot: unknown; previousDigest: string | null },
+  body: { snapshot: ArchiveSnapshot; previousDigest: string | null },
   transport: typeof fetch,
 ) =>
   (destination.kind === 'archive'
-    ? (await archiveRequest(destination, 'ingest', body, transport)).data
+    ? (
+        await archiveRequest(
+          destination,
+          'ingest',
+          { ...body, ...(body.snapshot.lineage?.kind === 'part' ? { restore: true } : {}) },
+          transport,
+        )
+      ).data
     : await kingdomArchiveOperation(destination, 'sessions.write', body)) as Ingested | undefined;
 
 /**
- * Publishes one archive to one destination of an organization it belongs to (its own project's,
- * or a touched project's; `sessionOrganizations`).
+ * Deletes an archive at a destination that holds it: the direct Archive's `delete`, or Kingdom's
+ * `sessions.delete` through the paired Signet. Already gone counts as deleted.
+ */
+export async function deleteRemote(
+  destination: ArchiveDestination,
+  archiveId: string,
+  transport: typeof fetch = fetch,
+) {
+  try {
+    if (destination.kind === 'archive')
+      await archiveRequest(destination, 'delete', { archiveId }, transport);
+    else await kingdomArchiveOperation(destination, 'sessions.delete', { documentId: archiveId });
+  } catch (error) {
+    if ((error as { status?: unknown } | null)?.status === 404) return;
+    throw error;
+  }
+}
+
+/**
+ * Publishes one archive to one destination of an organization it is routed to: a part, to an
+ * organization its session's validated plan gives it (`sessionOrganizations`).
  */
 export async function publishArchive(
   store: ArchiveStore,
@@ -141,9 +174,10 @@ export async function routingPreview(
   store: ArchiveStore,
   routing: Routing,
 ): Promise<RoutingPreview> {
-  return (await store.list({ exempt: 'include' })).map((archive) => ({
+  return (await store.list({ exempt: 'include', parts: 'include' })).map((archive) => ({
     id: archive.id,
     projectId: archive.projectId,
+    partOf: archive.partOf,
     tags: archive.tags,
     suggestedTags: archive.suggestedTags,
     organizations: sessionOrganizations(routing, archive),
@@ -183,7 +217,7 @@ export async function syncArchives(
     Math.min(BACKOFF_BASE_MS * 2 ** (failures - 1), BACKOFF_MAX_MS);
   // A route that was removed never delivers: release the revisions its outbox rows hold.
   await store.releaseOutbox(routing.destinations.map(destinationIdentity));
-  const archives = await store.list({ exempt: 'include' });
+  const archives = await store.list({ exempt: 'include', parts: 'include' });
   for (const archive of archives)
     for (const destination of sessionDestinations(routing, archive)) {
       const identity = destinationIdentity(destination);
@@ -231,6 +265,37 @@ export async function syncArchives(
         });
       }
     }
+  // What a destination holds that routing no longer sends there goes: a part a re-plan dropped or
+  // moved, a superseded part, or a session that was published whole before it was planned.
+  const configured = new Map(routing.destinations.map((d) => [destinationIdentity(d), d]));
+  for (const held of await store.deliveries()) {
+    const destination = configured.get(held.destination);
+    // A removed route keeps its receipts: nothing is sent there to delete.
+    if (!destination) continue;
+    const row = held.archive;
+    const routed =
+      !row.supersededBy && sessionOrganizations(routing, row).includes(destination.organizationId);
+    // An unplanned or held session's earlier copies wait for its plan.
+    if (routed || (!row.partOf && !row.routingPlan?.plan)) continue;
+    const key = JSON.stringify(['delete', held.archiveId, held.destination]);
+    seen.add(key);
+    const waiting = backoff?.get(key);
+    if (waiting && now() < waiting.until) continue;
+    try {
+      await deleteRemote(destination, held.archiveId);
+      await store.forgetDelivery(held.archiveId, held.destination);
+      backoff?.delete(key);
+      results.push({ id: held.archiveId, destination: destination.url, status: 'deleted' });
+    } catch (error) {
+      const failures = (waiting?.failures ?? 0) + 1;
+      backoff?.set(key, { failures, until: now() + delay(failures) });
+      results.push({
+        id: held.archiveId,
+        destination: destination.url,
+        status: `failed; delete retried later: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  }
   // Archives that were deleted, or routes that were removed, leave no entries behind.
   for (const key of backoff?.keys() ?? []) if (!seen.has(key)) backoff?.delete(key);
   return results;
