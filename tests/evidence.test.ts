@@ -317,13 +317,27 @@ test('a session no writer can send again gets evidence from its stored snapshot,
     { projectId: 'template' },
   );
   const { id } = await store.capture(session);
+  // Its subagent, already planned: what the parent reaches moves its plan.
+  const { id: childId } = await store.capture(
+    snapshot([{ kind: 'user', text: 'Look' }], {
+      sessionId: 'evidence/agent-a',
+      lineage: { kind: 'subagent', parentSessionId: 'evidence', rootSessionId: 'evidence' },
+    }),
+  );
   expect((await store.db.archive.findUniqueOrThrow({ where: { id } })).evidence).toBeNull();
-  // Held for lack of evidence: the fill makes it due.
-  await store.db.routingPlan.create({
-    data: { archiveId: id, status: 'held', key: 'k', by: 'm', digest: 'd', entries: 2, at: 1 },
+  const held = { status: 'held', key: 'k', by: 'm', digest: 'd', entries: 2, at: 1 };
+  await store.db.routingPlan.createMany({
+    data: [
+      { archiveId: id, ...held },
+      { archiveId: childId, ...held },
+    ],
   });
+  const due = async (archiveId: string) =>
+    (await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId } })).due;
 
+  // Filled in the background: setting the map waits on none of it.
   await store.setProjectMap(map);
+  await store.fillStoredEvidence();
   let row = await store.db.archive.findUniqueOrThrow({ where: { id } });
   // What the stored copy still shows: the project it started in and the link, never the edit.
   expect(row.evidence).toMatchObject({
@@ -332,23 +346,22 @@ test('a session no writer can send again gets evidence from its stored snapshot,
   });
   expect(JSON.stringify(row.evidence)).not.toContain('writes');
   expect(row.evidenceKey).toBe(`stored:${projectMapKey(map)}`);
-  expect((await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } })).due).toBe(
-    'evidence',
-  );
+  expect(await due(id)).toBe('evidence');
+  expect(await due(childId)).not.toBeNull();
   expect(evidenceByOrganization(row.evidence as SessionEvidence, routing, map)).toMatchObject({
     userevidence: { references: 1 },
   });
 
-  // Sending the map again changes nothing.
-  await store.db.routingPlan.update({ where: { archiveId: id }, data: { due: null } });
-  await store.setProjectMap(map);
-  expect(
-    (await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } })).due,
-  ).toBeNull();
+  // Filling again changes nothing.
+  await store.db.routingPlan.updateMany({ data: { due: null } });
+  expect(await store.fillStoredEvidence()).toBe(0);
+  expect(await due(id)).toBeNull();
 
-  // The transcript comes back: its tool calls replace the stored copy's evidence.
+  // The transcript comes back: its tool calls replace the stored copy's evidence, and the plan is
+  // due again, since the edit may reach further.
   await store.capture(session, { cwd: '/w/template' });
   row = await store.db.archive.findUniqueOrThrow({ where: { id } });
   expect(row.evidenceKey).toBe(projectMapKey(map));
   expect(row.evidence).toMatchObject({ anchors: [{ entryId: 'e0', writes: { zealot: 1 } }] });
+  expect(await due(id)).toBe('evidence');
 });
