@@ -1,4 +1,5 @@
 import { timingSafeEqual } from 'node:crypto';
+import { isAbsolute } from 'node:path';
 import { z } from 'zod';
 import { routingPreview, syncArchives } from './client';
 import {
@@ -13,8 +14,10 @@ import {
   sessionOrganizations,
   setOrganization,
 } from './config';
+import { projectMapKey, projectMapSchema } from './evidence';
 import { archiveReferenceSchema, archiveSnapshotSchema, selectChunks } from './index';
 import { KingdomGrantMissing, pairedDestination, pairedLibraries } from './kingdom';
+import { proposedPlanSchema } from './route';
 import { CLAIM_SOURCES } from './schemas';
 import {
   ArchiveConflict,
@@ -33,6 +36,10 @@ const ingestSchema = z.strictObject({
     .string()
     .regex(/^[a-f0-9]{64}$/)
     .nullable(),
+  /** The session's working directory, for evidence; never stored in the snapshot. */
+  cwd: z.string().max(4096).refine(isAbsolute).optional(),
+  /** The writer brings a session deleted here back on purpose (a part a re-plan restored). */
+  restore: z.boolean().optional(),
 });
 const archiveId = z.string().regex(/^[a-f0-9]{64}$/);
 const filterFields = {
@@ -46,6 +53,7 @@ const filterFields = {
   provider: z.string().min(1).max(64).optional(),
   accessPath: z.enum(['subscription', 'api', 'unknown']).optional(),
   exempt: z.enum(['exclude', 'include', 'only']).optional(),
+  parts: z.enum(['exclude', 'include', 'only']).optional(),
   suggestedTag: z.string().min(1).max(120).optional(),
   limit: z.number().int().min(1).max(100).default(20),
   beforeId: archiveId.optional(),
@@ -69,6 +77,28 @@ const suggestionQueueSchema = z.strictObject({
   refresh: z.boolean().optional(),
 });
 const suggestionRecordSchema = z.strictObject({ results: z.array(z.unknown()).max(500) });
+const routingInputSchema = z.strictObject({ archiveId });
+const recordPlanSchema = z.strictObject({
+  archiveId,
+  digest: z.string().regex(/^[a-f0-9]{64}$/),
+  through: z.number().int().nonnegative(),
+  key: z.string().min(1).max(128),
+  by: z.string().min(1).max(200),
+  proposal: proposedPlanSchema.optional(),
+  failure: z.string().max(500).optional(),
+  dryRun: z.boolean().optional(),
+  assumeParentReach: z.array(z.string().min(1).max(64)).max(50).optional(),
+});
+const routingDueSchema = z.strictObject({
+  limit: z.number().int().min(1).max(100_000).default(500),
+  now: z.number().optional(),
+  unplanned: z.boolean().optional(),
+  withoutParents: z.boolean().optional(),
+});
+const routingPlansSchema = z.strictObject({
+  all: z.boolean().optional(),
+  limit: z.number().int().min(1).max(500).default(50),
+});
 const tagListSchema = z.strictObject({ actorId: z.string().min(1).max(256).optional() });
 const claimSession = z.strictObject({
   source: z.enum(CLAIM_SOURCES),
@@ -150,8 +180,21 @@ export function createArchiveHandler(
         return json({ data: { sourceId: await store.sourceId(), protocol: 2 } });
       }
       if (path === '/api/v1/archive/ingest') {
-        const { snapshot, previousDigest } = ingestSchema.parse(body);
-        return json({ data: await store.capture(snapshot, { previousDigest }) });
+        const { snapshot, previousDigest, cwd, restore } = ingestSchema.parse(body);
+        return json({
+          data: await store.capture(snapshot, {
+            previousDigest,
+            ...(cwd ? { cwd } : {}),
+            ...(restore ? { restore } : {}),
+          }),
+        });
+      }
+      if (path === '/api/v1/archive/projects/set')
+        return json({ data: await store.setProjectMap(projectMapSchema.parse(body)) });
+      if (path === '/api/v1/archive/projects/read') {
+        z.strictObject({}).parse(body);
+        const map = await store.projectMap();
+        return json({ data: map ? { key: projectMapKey(map), ...map } : { key: null } });
       }
       if (path === '/api/v1/archive/head') {
         const head = await store.head(readSchema.pick({ archiveId: true }).parse(body).archiveId);
@@ -273,7 +316,7 @@ export function createArchiveHandler(
       if (config && path === '/api/v1/archive/destinations/list') {
         const { organizationId } = destinationListSchema.parse(body);
         const routing = readRouting(config.destinationsFile);
-        const archives = await store.list({ exempt: 'include' });
+        const archives = await store.list({ exempt: 'include', parts: 'include' });
         const destinations = [];
         for (const destination of routing.destinations)
           if (!organizationId || destination.organizationId === organizationId) {
@@ -290,6 +333,41 @@ export function createArchiveHandler(
           }
         return json({ data: { destinations } });
       }
+      if (config && path === '/api/v1/archive/routing/input')
+        return json({
+          data: await store.routingInput(
+            routingInputSchema.parse(body).archiveId,
+            readRouting(config.destinationsFile),
+          ),
+        });
+      if (config && path === '/api/v1/archive/routing/record')
+        return json({
+          data: await store.recordPlan(
+            recordPlanSchema.parse(body),
+            readRouting(config.destinationsFile),
+          ),
+        });
+      if (path === '/api/v1/archive/routing/due') {
+        const input = routingDueSchema.parse(body);
+        const contextKey = config
+          ? await store.routingContextKey(readRouting(config.destinationsFile))
+          : undefined;
+        return json({
+          data: {
+            due: await store.routingDue({ ...input, ...(contextKey ? { contextKey } : {}) }),
+          },
+        });
+      }
+      if (path === '/api/v1/archive/routing/plans')
+        return json({ data: { plans: await store.routingPlans(routingPlansSchema.parse(body)) } });
+      if (path === '/api/v1/archive/routing/review')
+        return json({
+          data: { reviewed: await store.reviewPlan(routingInputSchema.parse(body).archiveId) },
+        });
+      if (path === '/api/v1/archive/routing/reset')
+        return json({
+          data: { reset: await store.resetPlan(routingInputSchema.parse(body).archiveId) },
+        });
       if (config && path === '/api/v1/archive/organizations/list') {
         z.strictObject({}).parse(body);
         return json({
@@ -311,8 +389,12 @@ export function createArchiveHandler(
         return json({ data: await routingPreview(store, readRouting(config.destinationsFile)) });
       }
       if (config && path === '/api/v1/archive/destinations/sync') {
-        z.strictObject({}).parse(body);
-        return json({ data: await syncArchives(store, readRouting(config.destinationsFile)) });
+        const { dryRun } = z.strictObject({ dryRun: z.boolean().optional() }).parse(body);
+        return json({
+          data: await syncArchives(store, readRouting(config.destinationsFile), {
+            ...(dryRun ? { dryRun } : {}),
+          }),
+        });
       }
       if (config && path === '/api/v1/archive/destinations/libraries') {
         z.strictObject({}).parse(body);

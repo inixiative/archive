@@ -176,7 +176,13 @@ test('pair registers the Archive, waits for the claim, confirms the owner and co
     ]);
     expect(kingdom.state.requests[0]).toMatchObject({
       owner: { ownerModel: 'Organization', organization: 'acme' },
-      resources: [{ resourceKind: 'archiveLibrary', operations: ['sessions.write'], lens: {} }],
+      resources: [
+        {
+          resourceKind: 'archiveLibrary',
+          operations: ['sessions.write', 'sessions.delete'],
+          lens: {},
+        },
+      ],
     });
     expect(owners).toEqual(['Acme']);
     expect(paired.libraries).toEqual([
@@ -229,7 +235,7 @@ test('pair asks for the named libraries, else the ones its Kingdom destinations 
       resourceId: crypto.randomUUID(),
     },
   ];
-  const operations = ['sessions.write'];
+  const operations = ['sessions.write', 'sessions.delete'];
   expect(pairingRequest({ kingdom, destinations })).toEqual({
     resources: [{ resourceId: configured, operations }],
   });

@@ -1,18 +1,45 @@
 import { randomUUID } from 'node:crypto';
-import { type Prisma, PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { z } from 'zod';
+import { cleanupFor, destinationIdentity, type Routing, sessionOrganizations } from './config';
+import {
+  evidenceByOrganization,
+  evidencedOrganizations,
+  type ProjectMap,
+  projectMapKey,
+  projectMapSchema,
+  type SessionEvidence,
+  sessionEvidence,
+} from './evidence';
 import { droppableRun, exemptRun, identityRunTags, RUN_TAGS } from './exemption';
+import { quotedOrigins } from './import';
 import {
   type ArchiveChunk,
   type ArchiveSnapshot,
   archiveKey,
   archiveSnapshotSchema,
   chunkArchive,
+  digest,
   selectChunks,
   snapshotDigest,
   transcriptDigest,
   UNROUTED,
 } from './index';
+import { partSnapshot } from './parts';
+import {
+  PERSONAL,
+  planReach,
+  publishedParts,
+  type RecordPlanBody,
+  type RecordPlanResult,
+  ROUTE_TAG_PREFIX,
+  type RoutingEntry,
+  type RoutingInput,
+  type StoredPlan,
+  sensitiveEntries,
+  storedPlanSchema,
+  validatePlan,
+} from './route';
 import {
   type ArchiveFilter,
   type ArchiveSettings,
@@ -107,6 +134,14 @@ const COMPACTION_BATCH = 100;
 /** The trigram index on chunk text (prisma/schema.prisma) that search uses. */
 const SEARCH_INDEX = 'chunks_text_idx';
 const TOOL_ACTIVITY_BATCH = 50;
+/** The settings row holding the host's project map (`projects/set`), for evidence at ingest. */
+const PROJECT_MAP = 'projectMap';
+/** What the routing planner reads per entry, and per request, in characters. */
+/**
+ * The planner sees whole entries, as many as fit a window; one longer than a whole window is shown
+ * cut, and a part holding it holds (`ValidationContext.clipped`).
+ */
+export const ROUTE_WINDOW_CHARS = 300_000;
 /** Advisory lock key: captures hold it shared, a settings change exclusively. */
 const SETTINGS_LOCK = 0x41524348;
 
@@ -145,6 +180,8 @@ type ArchiveRow = {
   summary: Prisma.JsonValue;
   tagEdits: { tag: string; added: boolean }[];
   suggestion: { digest: string; by: string; tags: string[] } | null;
+  partOf?: string | null;
+  routedTo?: string[];
 };
 /**
  * Tags are the base tags with this archive's edits applied. Suggestions are the tagger's, minus
@@ -178,7 +215,17 @@ const listing = (row: ArchiveRow, filter: ArchiveFilter) => {
   )
     return [];
   return [
-    { id: row.id, revision: row.revision, digest: row.digest, ...summary, tags, suggestedTags },
+    {
+      id: row.id,
+      revision: row.revision,
+      digest: row.digest,
+      ...summary,
+      tags,
+      suggestedTags,
+      /** The session a part was cut from, and the organizations it publishes to. */
+      partOf: row.partOf ?? null,
+      routedTo: row.routedTo ?? [],
+    },
   ];
 };
 export type ArchiveListing = ReturnType<typeof listing>[number];
@@ -206,10 +253,12 @@ export class ArchiveStore {
    * snapshot as its writer sent it, so a writer's unchanged session stays unchanged; the stored
    * snapshot (and `storedDigest`) leave out tool activity when the setting says so.
    */
-  async capture(input: unknown, expected?: { previousDigest: string | null }) {
+  async capture(input: unknown, options: CaptureOptions = {}) {
     const incoming = archiveSnapshotSchema.parse(input);
     const id = archiveKey(incoming);
     const digest = snapshotDigest(incoming);
+    const expected =
+      options.previousDigest === undefined ? undefined : { previousDigest: options.previousDigest };
     return this.db.$transaction(
       async (tx) => {
         // Serializes concurrent captures of one session.
@@ -227,13 +276,39 @@ export class ArchiveStore {
           return { id, digest, revision: 0, changed: false, dropped: RUN_TAGS[run] };
         }
         const old = await tx.archive.findUnique({ where: { id } });
-        if (old?.digest === digest) return { id, digest, revision: old.revision, changed: false };
+        const map = await this.projectMap(tx);
+        // Evidence comes from the snapshot as its writer sent it, before the strip drops tool calls.
+        const evidenceOf = (kept: ArchiveSnapshot) =>
+          map
+            ? sessionEvidence(unlifted, new Set(kept.entries.map((e) => e.id)), map, options.cwd)
+            : null;
+        const evidenceFields = (evidence: SessionEvidence | null) => ({
+          evidence: (evidence ?? undefined) as Prisma.InputJsonValue | undefined,
+          evidenceKey: evidence?.key ?? null,
+        });
+        const stale = (row: { evidenceKey: string | null }) =>
+          map !== undefined && row.evidenceKey !== projectMapKey(map);
+        const stripOf = () =>
+          settings.captureToolCallsAndResults
+            ? { snapshot: unlifted, changed: 0 }
+            : withoutToolActivity(unlifted, settings.integrations);
+        if (old?.digest === digest) {
+          // The same session under a new project map: only its evidence is recomputed.
+          if (stale(old))
+            await tx.archive.update({
+              where: { id },
+              data: evidenceFields(evidenceOf(stripOf().snapshot)),
+            });
+          return { id, digest, revision: old.revision, changed: false };
+        }
         // A session deleted here stays deleted while its transcript is unchanged, however a
         // collector tags it; the tombstone takes the writer's digest so `head` matches it.
         const transcript = transcriptDigest(incoming);
         const tombstone = old ? null : await tx.archiveTombstone.findUnique({ where: { id } });
         if (
           tombstone &&
+          // Only a part is restored on purpose (a re-plan routed it there again).
+          !(options.restore && incoming.lineage?.kind === 'part') &&
           (tombstone.digest === digest || tombstone.transcriptDigest === transcript)
         ) {
           if (tombstone.digest !== digest)
@@ -246,9 +321,9 @@ export class ArchiveStore {
           throw new ArchiveConflict('Revision conflict');
         if (old && old.capturedAt > incoming.capturedAt) throw new ArchiveConflict('Stale capture');
         if (tombstone) await tx.archiveTombstone.delete({ where: { id } });
-        const stripped = settings.captureToolCallsAndResults
-          ? { snapshot: unlifted, changed: 0 }
-          : withoutToolActivity(unlifted, settings.integrations);
+        // A session that comes back still owes its old copies' deletes: they return as receipts.
+        const owed = tombstone?.pending ?? [];
+        const stripped = stripOf();
         const { snapshot } = stripped;
         const changed = stripped.changed || unlifted !== incoming;
         const storedDigest = changed ? snapshotDigest(snapshot) : digest;
@@ -256,7 +331,12 @@ export class ArchiveStore {
         if (old?.storedDigest === storedDigest) {
           await tx.archive.update({
             where: { id },
-            data: { digest, transcriptDigest: transcript, capturedAt: snapshot.capturedAt },
+            data: {
+              digest,
+              transcriptDigest: transcript,
+              capturedAt: snapshot.capturedAt,
+              ...evidenceFields(evidenceOf(snapshot)),
+            },
           });
           return { id, digest, revision: old.revision, changed: false };
         }
@@ -282,27 +362,26 @@ export class ArchiveStore {
           accessPath: snapshot.runtime?.accessPath ?? null,
           capturedAt: snapshot.capturedAt,
           summary: summarize(snapshot, settings) as Prisma.InputJsonValue,
+          ...evidenceFields(evidenceOf(snapshot)),
         };
-        await tx.archive.upsert({ where: { id }, create: { id, ...fields }, update: fields });
-        await tx.revision.create({
-          data: {
-            archiveId: id,
-            revision,
-            digest: storedDigest,
-            snapshot: snapshot as Prisma.InputJsonValue,
-          },
-        });
-        const chunks = chunkArchive(snapshot);
-        for (let offset = 0; offset < chunks.length; offset += 1000)
-          await tx.chunk.createMany({
-            data: chunks.slice(offset, offset + 1000).map(({ encoding: _, ...chunk }, i) => ({
+        await writeRevision(tx, id, snapshot, fields, old?.revision);
+        if (owed.length)
+          await tx.receipt.createMany({
+            data: [...new Set(owed)].map((destination) => ({
               archiveId: id,
-              revision,
-              position: offset + i,
-              ...chunk,
+              destination,
+              digest: '',
             })),
+            skipDuplicates: true,
           });
-        if (old) await dropRevision(tx, id, old.revision);
+        // New content makes its plan due (the scheduler decides when).
+        await tx.routingPlan.updateMany({
+          where: { archiveId: id, due: null },
+          data: { due: 'new entries' },
+        });
+        // A superseded session's parts are superseded with it, so they never publish.
+        if (supersededBy && supersededBy !== old?.supersededBy)
+          await tx.archive.updateMany({ where: { partOf: id }, data: { supersededBy } });
         return { id, digest, revision, changed: true };
         // A 64 MB session writes tens of thousands of chunks.
       },
@@ -323,6 +402,7 @@ export class ArchiveStore {
         revision: true,
         projectId: true,
         supersededBy: true,
+        evidenceKey: true,
       },
     });
     if (row) return row;
@@ -335,6 +415,7 @@ export class ArchiveStore {
           revision: 0,
           projectId: tombstone.projectId,
           supersededBy: null,
+          evidenceKey: null,
           deleted: true as const,
         }
       : undefined;
@@ -401,6 +482,11 @@ export class ArchiveStore {
           ...(filter.actorId ? { actorId: filter.actorId } : {}),
           ...(filter.provider ? { provider: filter.provider } : {}),
           ...(filter.accessPath ? { accessPath: filter.accessPath } : {}),
+          ...(filter.parts === 'include'
+            ? {}
+            : filter.parts === 'only'
+              ? { partOf: { not: null } }
+              : { partOf: null }),
           ...(cursor === undefined ? {} : { seq: { lt: cursor } }),
         },
         include: { tagEdits: true, suggestion: { select: { digest: true, by: true, tags: true } } },
@@ -492,6 +578,9 @@ export class ArchiveStore {
       for (const tag of remove) await set(tag, false);
       // A lifted run tag leaves the stored copy too, so what syncs onward is not a run.
       if (remove.some((tag) => RUN_TAG_VALUES.includes(tag))) await this.storeLifted(tx, id);
+      // A person's routing decision makes the plan due at once.
+      if ([...add, ...remove].some((tag) => tag.startsWith(ROUTE_TAG_PREFIX)))
+        await tx.routingPlan.updateMany({ where: { archiveId: id }, data: { due: 'decision' } });
       const edits = await tx.tagEdit.findMany({ where: { archiveId: id } });
       const removed = new Set(edits.filter((e) => !e.added).map((e) => e.tag));
       const tags = [
@@ -626,7 +715,9 @@ export class ArchiveStore {
         select: { id: true },
       });
       await tx.archive.updateMany({
-        where: { id: { in: raw.map((a) => a.id) } },
+        where: {
+          OR: [{ id: { in: raw.map((a) => a.id) } }, { partOf: { in: raw.map((a) => a.id) } }],
+        },
         data: { supersededBy: input.archiveId },
       });
       return { fulfilledBy: input.archiveId, superseded: raw.map((a) => a.id) };
@@ -668,13 +759,224 @@ export class ArchiveStore {
       orderBy: { sessionId: 'desc' },
     });
   }
+  /**
+   * Makes a session's parts what its plan says: each part stored as its own row (`partOf` the
+   * session, routed to its organizations, superseded with the session), and each part the plan
+   * no longer has retired: deleted here, or, while a destination still holds it, kept routed
+   * nowhere until sync deletes it there (`forgetDelivery`). Returns the part ids kept and retired.
+   */
+  async applyParts(
+    archiveId: string,
+    parts: { snapshot: ArchiveSnapshot; organizations: string[] }[],
+  ) {
+    return this.db.$transaction(
+      async (tx) => {
+        // The lock a capture of the session takes: plans and captures of one session serialize.
+        await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${archiveId}))`;
+        return this.applyPartsIn(tx, archiveId, parts);
+      },
+      { timeout: 120_000, maxWait: 30_000 },
+    );
+  }
+  private async applyPartsIn(
+    tx: Prisma.TransactionClient,
+    archiveId: string,
+    parts: { snapshot: ArchiveSnapshot; organizations: string[] }[],
+  ) {
+    const source = await tx.archive.findUnique({
+      where: { id: archiveId },
+      select: { supersededBy: true, partOf: true },
+    });
+    if (!source || source.partOf) throw new Error('Archive unavailable');
+    const settings = await this.settings(tx);
+    const kept: string[] = [];
+    for (const part of parts) {
+      const id = archiveKey(part.snapshot);
+      // A part a person deleted here is never cut again.
+      if (await tx.archiveTombstone.findUnique({ where: { id } })) continue;
+      const old = await tx.archive.findUnique({
+        where: { id },
+        select: { partOf: true, revision: true, storedDigest: true },
+      });
+      if (old && old.partOf === null)
+        throw new ArchiveConflict(`A session another writer sent holds part id ${id}`);
+      const fields = {
+        partOf: archiveId,
+        routedTo: [...new Set(part.organizations)].sort(),
+        supersededBy: source.supersededBy,
+      };
+      const storedDigest = snapshotDigest(part.snapshot);
+      if (old?.storedDigest === storedDigest)
+        await tx.archive.update({ where: { id }, data: fields });
+      else
+        await writeRevision(
+          tx,
+          id,
+          part.snapshot,
+          {
+            ...fields,
+            digest: storedDigest,
+            storedDigest,
+            transcriptDigest: transcriptDigest(part.snapshot),
+            revision: (old?.revision ?? 0) + 1,
+            source: part.snapshot.source,
+            projectId: part.snapshot.projectId ?? null,
+            actorId: part.snapshot.actor?.id ?? null,
+            provider: part.snapshot.runtime?.provider ?? null,
+            accessPath: part.snapshot.runtime?.accessPath ?? null,
+            capturedAt: part.snapshot.capturedAt,
+            summary: summarize(part.snapshot, settings) as Prisma.InputJsonValue,
+          },
+          old?.revision,
+        );
+      kept.push(id);
+    }
+    const retired = await tx.archive.findMany({
+      where: { partOf: archiveId, id: { notIn: kept } },
+      select: { id: true, receipts: { select: { destination: true } } },
+    });
+    for (const part of retired)
+      if (part.receipts.length)
+        await tx.archive.update({ where: { id: part.id }, data: { routedTo: [] } });
+      else await tx.archive.deleteMany({ where: { id: part.id } });
+    return { kept, retired: retired.map((r) => r.id) };
+  }
+  /**
+   * A destination no longer holds this archive (sync deleted it there): its receipt and queued
+   * revision go, and a retired part no destination holds any more is deleted here.
+   */
+  async forgetDelivery(id: string, destination: string) {
+    await this.db.$transaction(async (tx) => {
+      await tx.receipt.deleteMany({ where: { archiveId: id, destination } });
+      await tx.outbox.deleteMany({ where: { archiveId: id, destination } });
+      const tombstone = await tx.archiveTombstone.findUnique({
+        where: { id },
+        select: { pending: true },
+      });
+      if (tombstone?.pending.includes(destination))
+        await tx.archiveTombstone.update({
+          where: { id },
+          data: { pending: tombstone.pending.filter((d) => d !== destination) },
+        });
+    });
+    await this.db.archive.deleteMany({
+      where: { id, partOf: { not: null }, routedTo: { isEmpty: true }, receipts: { none: {} } },
+    });
+  }
+  /**
+   * Which of these copies a destination of `organizationId` may keep; every other id this Archive
+   * knows (`ids` are this Archive's own) goes:
+   * - a part, while its plan routes it there and it isn't superseded;
+   * - a whole session, only with publishing off, `cleanup: leaked`, and a current valid plan that
+   *   sends the whole session there unredacted and unpruned (its one part holds every entry);
+   * - an id with no row here (deleted, or never kept): never.
+   */
+  async copiesToKeep(ids: string[], organizationId: string, routing: Routing) {
+    const keep = new Set<string>();
+    const rows = await this.db.archive.findMany({
+      where: { id: { in: ids } },
+      select: {
+        id: true,
+        digest: true,
+        partOf: true,
+        routedTo: true,
+        supersededBy: true,
+        routingPlan: { select: { plan: true, digest: true, due: true } },
+      },
+    });
+    for (const row of rows) {
+      if (row.partOf) {
+        if (!row.supersededBy && sessionOrganizations(routing, row).includes(organizationId))
+          keep.add(row.id);
+        continue;
+      }
+      if (
+        routing.publish === 'on' ||
+        cleanupFor(routing, organizationId) !== 'leaked' ||
+        row.supersededBy
+      )
+        continue;
+      const plan = row.routingPlan?.plan ? storedPlanSchema.parse(row.routingPlan.plan) : undefined;
+      if (!plan || row.routingPlan?.digest !== row.digest || row.routingPlan.due === 'partial')
+        continue;
+      const work = plan.parts.filter((p) => p.organizations.some((o) => o !== PERSONAL));
+      if (
+        work.length !== 1 ||
+        !work[0]!.organizations.includes(organizationId) ||
+        plan.prune.length ||
+        plan.redactions.length
+      )
+        continue;
+      const parts = await this.db.archive.findMany({
+        where: { partOf: row.id },
+        select: { routedTo: true, summary: true },
+      });
+      const session = await this.plannedSession(row.id);
+      if (
+        parts.length === 1 &&
+        parts[0]!.routedTo.includes(organizationId) &&
+        session &&
+        (parts[0]!.summary as Summary).entries === session.snapshot.entries.length
+      )
+        keep.add(row.id);
+    }
+    return keep;
+  }
+  /** Copies deleted here that a destination still holds: each tombstone's pending deletes. */
+  async pendingDeletes() {
+    const rows = await this.db.archiveTombstone.findMany({
+      where: { NOT: { pending: { isEmpty: true } } },
+      select: { id: true, pending: true },
+    });
+    return rows.flatMap((row) =>
+      [...new Set(row.pending)].map((destination) => ({ archiveId: row.id, destination })),
+    );
+  }
+  /** The ids among these this Archive knows: rows and tombstones. */
+  async knownIds(ids: string[]) {
+    const [rows, tombstones] = await Promise.all([
+      this.db.archive.findMany({ where: { id: { in: ids } }, select: { id: true } }),
+      this.db.archiveTombstone.findMany({ where: { id: { in: ids } }, select: { id: true } }),
+    ]);
+    return new Set([...rows, ...tombstones].map((r) => r.id));
+  }
+  /** Every receipt: which destinations hold which archives, with what routing those rows now have. */
+  async deliveries() {
+    return this.db.receipt.findMany({
+      select: {
+        archiveId: true,
+        destination: true,
+        archive: {
+          select: {
+            partOf: true,
+            routedTo: true,
+            supersededBy: true,
+            routingPlan: { select: { plan: true } },
+          },
+        },
+      },
+    });
+  }
   /** Deletes a session and leaves its tombstone (`head`), so it is not imported again unchanged. */
+  /**
+   * Deletes a session and leaves its tombstone (`head`), so it is not imported again unchanged.
+   * Its parts are retired first: one a destination holds stays, routed nowhere, until sync has
+   * deleted its copies there. Deleting a part retires it the same way, and it is never cut again:
+   * its tombstone keeps `applyParts` from restoring it, and its entries become a sticky prune of
+   * its session's plan.
+   */
   async delete(id: string) {
     return this.db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
       const archive = await tx.archive.findUnique({
         where: { id },
-        select: { digest: true, transcriptDigest: true, projectId: true },
+        select: {
+          digest: true,
+          transcriptDigest: true,
+          projectId: true,
+          partOf: true,
+          revision: true,
+        },
       });
       if (!archive) return false;
       const tombstone = {
@@ -687,6 +989,47 @@ export class ArchiveStore {
         create: { id, ...tombstone },
         update: { ...tombstone, deletedAt: new Date() },
       });
+      const retire = async (partIds: string[]) => {
+        const parts = await tx.archive.findMany({
+          where: { id: { in: partIds } },
+          select: { id: true, receipts: { select: { destination: true } } },
+        });
+        for (const part of parts)
+          if (part.receipts.length)
+            await tx.archive.update({ where: { id: part.id }, data: { routedTo: [] } });
+          else await tx.archive.delete({ where: { id: part.id } });
+      };
+      if (archive.partOf) {
+        const plan = await tx.routingPlan.findUnique({ where: { archiveId: archive.partOf } });
+        const revision = await tx.revision.findUnique({
+          where: { archiveId_revision: { archiveId: id, revision: archive.revision } },
+          select: { snapshot: true },
+        });
+        if (plan?.plan && revision) {
+          const stored = storedPlanSchema.parse(plan.plan);
+          const entries = archiveSnapshotSchema.parse(revision.snapshot).entries;
+          stored.prune.push(
+            ...entries.map((e) => ({ entryId: e.id, reason: 'deleted by a person' })),
+          );
+          await tx.routingPlan.update({
+            where: { archiveId: archive.partOf },
+            data: { plan: stored as Prisma.InputJsonValue },
+          });
+        }
+        await retire([id]);
+        return true;
+      }
+      const parts = await tx.archive.findMany({ where: { partOf: id }, select: { id: true } });
+      await retire(parts.map((p) => p.id));
+      // Its own copies' receipts go with the row; the tombstone keeps them until sync confirms.
+      const held = await tx.receipt.findMany({
+        where: { archiveId: id },
+        select: { destination: true },
+      });
+      await tx.archiveTombstone.update({
+        where: { id },
+        data: { pending: { push: held.map((r) => r.destination) } },
+      });
       await tx.archive.delete({ where: { id } });
       return true;
     });
@@ -696,7 +1039,8 @@ export class ArchiveStore {
     const { retentionDays } = await this.settings();
     if (retentionDays === null) return [];
     const expired = await this.db.archive.findMany({
-      where: { capturedAt: { lt: now - retentionDays * 86_400_000 } },
+      // A part goes with its session.
+      where: { capturedAt: { lt: now - retentionDays * 86_400_000 }, partOf: null },
       select: { id: true },
     });
     const deleted: string[] = [];
@@ -1082,6 +1426,25 @@ export class ArchiveStore {
       await this.ensureSearchIndex(true);
     }
   }
+  /** The host's project map, which evidence is computed under; undefined until a host sends one. */
+  async projectMap(db: Prisma.TransactionClient | PrismaClient = this.db) {
+    const row = await db.setting.findUnique({ where: { key: PROJECT_MAP } });
+    return row ? projectMapSchema.parse(row.value) : undefined;
+  }
+  async projectMapKey() {
+    const map = await this.projectMap();
+    return map ? projectMapKey(map) : null;
+  }
+  /** Saves the host's project map; captures from then on compute evidence under it. */
+  async setProjectMap(input: ProjectMap) {
+    const map = projectMapSchema.parse(input);
+    await this.db.setting.upsert({
+      where: { key: PROJECT_MAP },
+      create: { key: PROJECT_MAP, value: map },
+      update: { value: map },
+    });
+    return { key: projectMapKey(map) };
+  }
   async settings(db: Prisma.TransactionClient | PrismaClient = this.db): Promise<ArchiveSettings> {
     const row = await db.setting.findUnique({ where: { key: 'archive' } });
     // A setting added after the row was saved takes its default.
@@ -1256,7 +1619,7 @@ export class ArchiveStore {
     let nextCursor: string | null = null;
     scan: for (;;) {
       const rows = await this.db.archive.findMany({
-        where: cursor === undefined ? {} : { seq: { lt: cursor } },
+        where: { partOf: null, ...(cursor === undefined ? {} : { seq: { lt: cursor } }) },
         include: { tagEdits: true, suggestion: true },
         orderBy: { seq: 'desc' },
         take: BATCH,
@@ -1342,7 +1705,7 @@ export class ArchiveStore {
         outcome.stale++;
         continue;
       }
-      if (exemptRun(listing(row, { exempt: 'include' })[0]!.tags)) {
+      if (row.partOf || exemptRun(listing(row, { exempt: 'include' })[0]!.tags)) {
         outcome.refused++;
         continue;
       }
@@ -1365,6 +1728,651 @@ export class ArchiveStore {
     }
     return outcome;
   }
+  /** A session as the planner reads it: its current revision without tool activity. */
+  private async plannedSession(id: string) {
+    const row = await this.db.archive.findUnique({
+      where: { id },
+      include: { tagEdits: true, routingPlan: true },
+    });
+    // A part, cut here or received as one, is never planned.
+    if (!row || row.partOf || (row.summary as Summary).lineage?.kind === 'part') return undefined;
+    const revision = await this.db.revision.findUnique({
+      where: { archiveId_revision: { archiveId: id, revision: row.revision } },
+      select: { snapshot: true },
+    });
+    if (!revision) return undefined;
+    const settings = await this.settings();
+    const { snapshot } = withoutToolActivity(
+      archiveSnapshotSchema.parse(revision.snapshot),
+      settings.integrations,
+    );
+    const valid = row.routingPlan?.plan ? storedPlanSchema.parse(row.routingPlan.plan) : undefined;
+    return { row, snapshot, plan: valid };
+  }
+  /** The archive of another session of the same writer and source, by its session id. */
+  private relatedId(snapshot: ArchiveSnapshot, sessionId: string) {
+    return archiveKey({ sourceId: snapshot.sourceId, source: snapshot.source, sessionId });
+  }
+  /**
+   * What validation and the planner need beyond the session: where the plan starts, a person's
+   * `route:` decisions, the subagents it spawned (with their evidence), its parent's reach at the
+   * spawn, and where each quoted entry's own session is routed.
+   */
+  private async routingContext(
+    session: NonNullable<Awaited<ReturnType<ArchiveStore['plannedSession']>>>,
+    routing: Routing,
+  ) {
+    const { row, snapshot, plan } = session;
+    const entries = snapshot.entries;
+    const map = await this.projectMap();
+    const evidence = (row.evidence ?? null) as SessionEvidence | null;
+    const at = plan ? entries.findIndex((e) => e.id === plan.throughEntryId) : -1;
+    const from = at + 1;
+    const overrideTags = row.tagEdits
+      .filter((e) => e.added && e.tag.startsWith(ROUTE_TAG_PREFIX))
+      .map((e) => e.tag)
+      .sort();
+    const known = new Set(routing.organizations.map((o) => o.id));
+    const overrides = {
+      organizations: new Set(
+        overrideTags.map((t) => t.slice(ROUTE_TAG_PREFIX.length)).filter((o) => known.has(o)),
+      ),
+      personal: overrideTags.includes(`${ROUTE_TAG_PREFIX}${PERSONAL}`),
+    };
+    const bySpawn = (list: typeof entries, lineage?: ArchiveSnapshot['lineage']) =>
+      lineage &&
+      list.find(
+        (e) =>
+          (lineage.toolUseId && e.callId === lineage.toolUseId) || e.id === lineage.parentEntryId,
+      )?.id;
+    const childRows = await this.db.archive.findMany({
+      where: {
+        partOf: null,
+        source: snapshot.source,
+        AND: [
+          { summary: { path: ['sourceId'], equals: snapshot.sourceId } },
+          { summary: { path: ['lineage', 'parentSessionId'], equals: snapshot.sessionId } },
+        ],
+      },
+      select: { summary: true, evidence: true },
+    });
+    const children = childRows.map((child) => {
+      const summary = child.summary as Summary;
+      const childEvidence = (child.evidence ?? null) as SessionEvidence | null;
+      const spawnEntryId = bySpawn(entries, summary.lineage);
+      return {
+        spawnEntryId,
+        organizations: evidencedOrganizations(childEvidence, routing, map),
+        evidence: evidenceByOrganization(childEvidence, routing, map),
+        description: (summary.lineage?.description ?? summary.session?.task ?? summary.title).slice(
+          0,
+          300,
+        ),
+      };
+    });
+    let parentReach: Set<string> | undefined;
+    let parentIssue: string | undefined;
+    let parent: { title: string; organizations: string[] } | undefined;
+    const lineage = snapshot.lineage;
+    if (lineage && lineage.kind !== 'part') {
+      const parentSession = await this.plannedSession(
+        this.relatedId(snapshot, lineage.parentSessionId),
+      );
+      if (!parentSession) parentIssue = 'its parent session is not in this Archive';
+      else if (!parentSession.plan) parentIssue = 'its parent session has no valid plan yet';
+      else {
+        const spawn = bySpawn(parentSession.snapshot.entries, lineage);
+        // Without the spawn, the parent's reach is unknown: never the whole of it.
+        if (!spawn) parentIssue = 'its spawn entry is not found in its parent session';
+        else {
+          parentReach = planReach(parentSession.plan, parentSession.snapshot.entries, spawn);
+          parent = { title: parentSession.snapshot.title, organizations: [...parentReach] };
+        }
+      }
+    }
+    const root =
+      lineage?.kind === 'part'
+        ? snapshot.sessionId
+        : (lineage?.rootSessionId ?? snapshot.sessionId);
+    const foreign = new Map<string, Set<string> | null>();
+    const foreignLabel = new Map<string, string>();
+    const reachOf = new Map<string, Set<string> | null>();
+    for (const entry of entries) {
+      if (entry.kind !== 'user' && entry.kind !== 'event') continue;
+      const origins = quotedOrigins(entry.text, root);
+      if (!origins) continue;
+      let reach: Set<string> | null | undefined;
+      for (const origin of origins) {
+        if (!reachOf.has(origin)) {
+          // Unknown, not held here, or not planned: the quoted text stays here.
+          const other =
+            origin === 'unknown'
+              ? undefined
+              : await this.plannedSession(this.relatedId(snapshot, origin));
+          reachOf.set(origin, other?.plan ? planReach(other.plan, other.snapshot.entries) : null);
+        }
+        const found = reachOf.get(origin)!;
+        if (found === null) reach = null;
+        else if (reach !== null)
+          reach = reach ? new Set([...reach].filter((o) => found.has(o))) : new Set(found);
+      }
+      if (reach === undefined) continue;
+      foreign.set(entry.id, reach);
+      foreignLabel.set(
+        entry.id,
+        origins.includes('unknown') ? 'another session' : origins.join(', '),
+      );
+    }
+    return {
+      entries,
+      map,
+      evidence,
+      plan,
+      from,
+      overrides,
+      overrideTags,
+      children,
+      parentReach,
+      parentIssue,
+      parent,
+      parentArchiveId:
+        lineage && lineage.kind !== 'part'
+          ? this.relatedId(snapshot, lineage.parentSessionId)
+          : undefined,
+      foreign,
+      foreignLabel,
+    };
+  }
+  /**
+   * What the routing planner reads for one session: the entries since its plan (up to a budget,
+   * each clipped), with their evidence and whether they quote another session, and the context.
+   */
+  async routingInput(archiveId: string, routing: Routing): Promise<RoutingInput> {
+    const session = await this.plannedSession(archiveId);
+    if (!session) throw new Error('Archive unavailable');
+    const context = await this.routingContext(session, routing);
+    const { row, snapshot } = session;
+    const { entries, evidence, map, plan, from } = context;
+    const clip = (text: string, max: number) =>
+      text.length > max ? `${text.slice(0, max)}… [${text.length - max} more characters]` : text;
+    const show = (entry: (typeof entries)[number], index: number, max: number): RoutingEntry => {
+      const own = evidence?.anchors.some((a) => a.entryId === entry.id)
+        ? evidenceByOrganization(evidence, routing, map, new Set([entry.id]))
+        : undefined;
+      const foreign = context.foreignLabel.get(entry.id);
+      return {
+        index,
+        kind: entry.kind,
+        // Shown as stored, so a redaction quoting it matches byte for byte.
+        text: clip(entry.text, max),
+        ...(entry.text.length > max ? { clipped: true } : {}),
+        ...(foreign ? { foreign } : {}),
+        ...(own && Object.keys(own).length ? { evidence: own } : {}),
+      };
+    };
+    const window: RoutingEntry[] = [];
+    let used = 0;
+    for (let i = from; i < entries.length; i++) {
+      const shown = show(entries[i]!, i, ROUTE_WINDOW_CHARS);
+      if (window.length && used + shown.text.length > ROUTE_WINDOW_CHARS) break;
+      used += shown.text.length;
+      window.push(shown);
+    }
+    const index = new Map(entries.map((e, i) => [e.id, i]));
+    const last = plan?.parts.at(-1);
+    const startProject = evidence?.startProjectId;
+    return {
+      archiveId,
+      digest: row.digest,
+      session: {
+        title: snapshot.title,
+        source: snapshot.source,
+        ...(snapshot.projectId ? { projectId: snapshot.projectId } : {}),
+        ...(snapshot.lineage
+          ? {
+              lineage: {
+                kind: snapshot.lineage.kind,
+                ...(snapshot.lineage.agentType ? { agentType: snapshot.lineage.agentType } : {}),
+                ...(snapshot.lineage.description
+                  ? { description: snapshot.lineage.description }
+                  : {}),
+              },
+            }
+          : {}),
+        ...(startProject
+          ? {
+              startOrganization:
+                routing.organizations.find((o) => o.projects.includes(startProject))?.id ??
+                PERSONAL,
+            }
+          : {}),
+      },
+      organizations: routing.organizations.map((o) => ({
+        id: o.id,
+        projects: o.projects,
+        roster: o.roster ?? [],
+      })),
+      total: entries.length,
+      through: from + window.length - 1,
+      entries: window,
+      before: entries
+        .slice(Math.max(0, from - 3), from)
+        .map((e, i) => show(e, Math.max(0, from - 3) + i, 400)),
+      ...(plan
+        ? {
+            prior: {
+              ...(last
+                ? {
+                    lastPart: {
+                      from: index.get(last.firstEntryId) ?? 0,
+                      to: index.get(last.lastEntryId) ?? 0,
+                      organizations: last.organizations,
+                      rationale: last.rationale,
+                    },
+                  }
+                : {}),
+              sensitive: plan.parts
+                .filter((p) => p.sensitive)
+                .map((p) => ({
+                  from: index.get(p.firstEntryId) ?? 0,
+                  to: index.get(p.lastEntryId) ?? 0,
+                })),
+              redactions: plan.redactions.map((r) => ({
+                entry: index.get(r.entryId) ?? 0,
+                reason: r.reason,
+              })),
+            },
+          }
+        : {}),
+      evidence: evidenceByOrganization(evidence, routing, map),
+      children: context.children.map((c) => ({
+        description: c.description,
+        ...(c.spawnEntryId !== undefined && index.has(c.spawnEntryId)
+          ? { spawnedAt: index.get(c.spawnEntryId)! }
+          : {}),
+        evidence: c.evidence,
+      })),
+      ...(context.parent ? { parent: context.parent } : {}),
+      ...(context.parentArchiveId ? { parentArchiveId: context.parentArchiveId } : {}),
+      overrides: context.overrideTags,
+    };
+  }
+  /**
+   * Records the planner's answer for one session: validated in code (`validatePlan`), then, when
+   * valid, stored and applied (its parts written, the ones it dropped retired). A failed run or a
+   * plan that fails validation is held for review and changes nothing that publishes. A dry run
+   * returns what would publish and stores nothing.
+   */
+  async recordPlan(
+    body: RecordPlanBody,
+    routing: Routing,
+    now = Date.now(),
+  ): Promise<RecordPlanResult> {
+    const session = await this.plannedSession(body.archiveId);
+    if (!session) throw new Error('Archive unavailable');
+    const context = await this.routingContext(session, routing);
+    const { row, snapshot } = session;
+    const { entries, plan: prior } = context;
+    // The planner's indices describe the session as it read it.
+    if (row.digest !== body.digest) return { status: 'stale' };
+    // Nothing new to plan re-applies the plan as it stands (a person's decision changed).
+    const reapply =
+      body.through === context.from - 1 && Boolean(prior) && !body.proposal?.parts.length;
+    if ((body.through < context.from && !reapply) || body.through >= entries.length)
+      return { status: 'stale' };
+    const record = {
+      contextKey: await this.routingContextKey(routing),
+      key: body.key,
+      by: body.by,
+      digest: row.digest,
+      // A plan that covers only part of the session (a window) leaves it due.
+      entries: body.through === entries.length - 1 ? (row.summary as Summary).entries : -1,
+      overrides: context.overrideTags,
+      at: now,
+    };
+    const hold = async (issues: string[], notes: string[] = []) => {
+      if (!body.dryRun) {
+        const attempt = (body.proposal ?? { failure: body.failure }) as Prisma.InputJsonValue;
+        const fields = {
+          ...record,
+          status: 'held',
+          attempt,
+          issues,
+          notes,
+          reviewedAt: null,
+          due: null,
+        };
+        const recorded = await this.underSessionLock(body.archiveId, body.digest, (tx) =>
+          tx.routingPlan.upsert({
+            where: { archiveId: body.archiveId },
+            create: { archiveId: body.archiveId, ...fields },
+            update: fields,
+          }),
+        );
+        if (!recorded) return { status: 'stale' as const };
+      }
+      return { status: 'held' as const, issues, notes };
+    };
+    if (body.dryRun && body.assumeParentReach) {
+      context.parentReach = new Set(body.assumeParentReach);
+      context.parentIssue = undefined;
+    }
+    const holds = await this.heldBy(body.archiveId, routing);
+    if (context.parentIssue) return { ...(await hold([context.parentIssue])), holds };
+    if (!body.proposal) return { ...(await hold([body.failure ?? 'no plan'])), holds };
+    const result = validatePlan(body.proposal, {
+      entries,
+      routing,
+      ...(context.map ? { map: context.map } : {}),
+      evidence: context.evidence,
+      ...(prior ? { prior } : {}),
+      from: context.from,
+      through: body.through,
+      clipped: new Set(
+        entries
+          .slice(context.from, body.through + 1)
+          .filter((e) => e.text.length > ROUTE_WINDOW_CHARS)
+          .map((e) => e.id),
+      ),
+      overrides: context.overrides,
+      children: context.children,
+      ...(context.parentReach ? { parentReach: context.parentReach } : {}),
+      foreign: context.foreign,
+    });
+    if (result.status === 'held') return { ...(await hold(result.issues, result.notes)), holds };
+    const published = publishedParts(
+      result.plan,
+      entries,
+      context.foreign,
+      sensitiveEntries(result.plan, entries),
+    );
+    const projectsOf = (organizations: string[]) =>
+      new Set(
+        routing.organizations
+          .filter((o) => organizations.includes(o.id))
+          .flatMap((o) => o.projects),
+      );
+    const parts = published.map((part) => ({
+      snapshot: partSnapshot(
+        snapshot,
+        { ...part, projects: projectsOf(part.organizations) },
+        result.plan.redactions,
+      ),
+      organizations: part.organizations,
+    }));
+    const outcome = {
+      notes: result.notes,
+      parts: parts.map((p) => ({
+        sessionId: p.snapshot.sessionId,
+        organizations: p.organizations,
+        entries: p.snapshot.entries.length,
+        redacted: p.snapshot.entries.filter((e) => e.text.includes('[redacted: ')).length,
+      })),
+    };
+    if (body.dryRun) return { status: 'valid', ...outcome, holds };
+    // A delta that only moves `through` changes nothing a person reviewed.
+    const decisions = (plan?: StoredPlan) =>
+      plan && JSON.stringify([plan.parts, plan.prune, plan.redactions]);
+    const changed = decisions(prior) !== decisions(result.plan);
+    const version = (row.routingPlan?.version ?? 0) + (changed ? 1 : 0);
+    const fields = {
+      ...record,
+      status: 'valid',
+      plan: result.plan as Prisma.InputJsonValue,
+      attempt: Prisma.DbNull,
+      issues: [],
+      notes: result.notes,
+      version,
+      // A window still to plan keeps it due; otherwise it is not until something changes.
+      due: record.entries === -1 ? 'partial' : null,
+      ...(changed ? { reviewedAt: null } : {}),
+    };
+    // The plan and its parts are stored together, against the digest the planner read.
+    const applied = await this.underSessionLock(body.archiveId, body.digest, async (tx) => {
+      await tx.routingPlan.upsert({
+        where: { archiveId: body.archiveId },
+        create: { archiveId: body.archiveId, ...fields },
+        update: fields,
+      });
+      const applied = await this.applyPartsIn(tx, body.archiveId, parts);
+      if (changed) await this.markRelatedDue(tx, body.archiveId);
+      return applied;
+    });
+    if (!applied) return { status: 'stale' };
+    return { status: 'valid', version, ...outcome, retired: applied.retired, holds };
+  }
+  /**
+   * Runs `work` in one transaction under the session's advisory lock (the one its captures take),
+   * only while the session is still at `digest`; undefined when it moved on.
+   */
+  private async underSessionLock<T>(
+    archiveId: string,
+    digest: string,
+    work: (tx: Prisma.TransactionClient) => Promise<T>,
+  ) {
+    return this.db.$transaction(
+      async (tx) => {
+        await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${archiveId}))`;
+        const row = await tx.archive.findUnique({
+          where: { id: archiveId },
+          select: { digest: true },
+        });
+        if (row?.digest !== digest) return undefined;
+        return work(tx);
+      },
+      { timeout: 120_000, maxWait: 30_000 },
+    );
+  }
+  /** The organizations whose destinations hold this session or one of its parts (receipts). */
+  private async heldBy(archiveId: string, routing: Routing) {
+    const receipts = await this.db.receipt.findMany({
+      where: { OR: [{ archiveId }, { archive: { partOf: archiveId } }] },
+      select: { destination: true },
+    });
+    const byIdentity = new Map(
+      routing.destinations.map((d) => [destinationIdentity(d), d.organizationId]),
+    );
+    return [...new Set(receipts.flatMap((r) => byIdentity.get(r.destination) ?? []))].sort();
+  }
+  /**
+   * Plans for review, most in need first: held ones, then ones with redactions or low confidence
+   * a person has not read since they changed. `all` lists every plan.
+   */
+  async routingPlans(input: { all?: boolean; limit: number }) {
+    const rows = await this.db.routingPlan.findMany({
+      include: { archive: { select: { summary: true } } },
+      orderBy: { at: 'desc' },
+    });
+    const items = rows.flatMap((row) => {
+      const plan = row.plan ? storedPlanSchema.parse(row.plan) : undefined;
+      const confidence = plan?.parts.length ? Math.min(...plan.parts.map((p) => p.confidence)) : 1;
+      const redactions = plan?.redactions.length ?? 0;
+      const due =
+        row.status === 'held' || (row.reviewedAt === null && (redactions > 0 || confidence < 0.6));
+      if (!input.all && !due) return [];
+      const summary = row.archive.summary as Summary;
+      return [
+        {
+          archiveId: row.archiveId,
+          title: summary.title,
+          sessionId: summary.sessionId,
+          status: row.status,
+          version: row.version,
+          issues: row.issues,
+          notes: row.notes,
+          redactions,
+          confidence,
+          reviewedAt: row.reviewedAt,
+          by: row.by,
+          at: row.at,
+          plan: plan ?? null,
+          attempt: row.attempt,
+        },
+      ];
+    });
+    items.sort(
+      (a, b) =>
+        Number(b.status === 'held') - Number(a.status === 'held') || a.confidence - b.confidence,
+    );
+    return items.slice(0, input.limit);
+  }
+  /**
+   * Sessions due for a routing plan, in the order to plan them: a tree's parents before their
+   * subagents, oldest change first. Only rows with no plan, or whose plan something marked due
+   * (`RoutingPlan.due`), are read. `decision` (a person's `route:` change), `related` (its parent's
+   * or a subagent's plan changed) and `partial` (windows still to plan) are due at once; `new
+   * entries` once the session paused (no capture for `pausedMs`) or its plan is older than
+   * `intervalMs` plus a stagger of up to `staggerMs` from its id. Exempt runs, superseded raw
+   * captures and parts (cut here or received as parts) are never planned, and an unplanned
+   * subagent waits for its parent's plan.
+   */
+  async routingDue(input: {
+    now?: number;
+    limit: number;
+    intervalMs?: number;
+    pausedMs?: number;
+    staggerMs?: number;
+    /** Only sessions with no plan at all (a backfill). */
+    unplanned?: boolean;
+    /** Subagents too, before their parent is planned (a dry run judges them on its own plans). */
+    withoutParents?: boolean;
+    /** The current `routingContextKey`: a plan validated under another is due to re-validate. */
+    contextKey?: string;
+  }) {
+    const now = input.now ?? Date.now();
+    const interval = input.intervalMs ?? 60 * 60_000;
+    const paused = input.pausedMs ?? 30 * 60_000;
+    const stagger = input.staggerMs ?? 10 * 60_000;
+    const rows = await this.db.archive.findMany({
+      where: {
+        partOf: null,
+        supersededBy: null,
+        OR: [
+          { routingPlan: null },
+          // A backfill also finishes the sessions it planned only part of.
+          ...(input.unplanned
+            ? [{ routingPlan: { due: 'partial' } }]
+            : [{ routingPlan: { due: { not: null } } }]),
+          ...(input.unplanned || !input.contextKey
+            ? []
+            : [{ routingPlan: { contextKey: { not: input.contextKey } } }]),
+        ],
+      },
+      select: {
+        id: true,
+        revision: true,
+        digest: true,
+        capturedAt: true,
+        summary: true,
+        tagEdits: true,
+        routingPlan: { select: { due: true, at: true, contextKey: true } },
+      },
+    });
+    const parentOf = (summary: Summary) =>
+      archiveKey({
+        sourceId: summary.sourceId,
+        source: summary.source,
+        sessionId: summary.lineage!.parentSessionId,
+      });
+    const waiting = rows.filter((r) => !r.routingPlan && (r.summary as Summary).lineage);
+    const planned = new Set(
+      (
+        await this.db.routingPlan.findMany({
+          where: {
+            archiveId: { in: waiting.map((r) => parentOf(r.summary as Summary)) },
+            plan: { not: Prisma.DbNull },
+          },
+          select: { archiveId: true },
+        })
+      ).map((p) => p.archiveId),
+    );
+    const due: { archiveId: string; capturedAt: number; depth: number; reason: string }[] = [];
+    for (const row of rows) {
+      const summary = row.summary as Summary;
+      const lineage = summary.lineage;
+      if (lineage?.kind === 'part') continue;
+      const view = listing({ ...row, suggestion: null }, { exempt: 'include' })[0]!;
+      if (exemptRun(view.tags)) continue;
+      const plan = row.routingPlan;
+      if (!plan && lineage && !input.withoutParents && !planned.has(parentOf(summary))) continue;
+      let reason =
+        plan?.due ??
+        (plan && input.contextKey && plan.contextKey !== input.contextKey
+          ? 'context'
+          : 'unplanned');
+      if (plan && reason === 'new entries') {
+        const offset = Number.parseInt(digest(row.id).slice(0, 8), 16) % (stagger + 1);
+        const pausedNow = now - row.capturedAt >= paused;
+        if (!pausedNow && now < plan.at + interval + offset) continue;
+        if (pausedNow) reason = `${reason}, paused`;
+      }
+      due.push({
+        archiveId: row.id,
+        capturedAt: row.capturedAt,
+        depth: lineage?.depth ?? (lineage ? 1 : 0),
+        reason,
+      });
+    }
+    due.sort((a, b) => a.depth - b.depth || a.capturedAt - b.capturedAt);
+    return due
+      .slice(0, input.limit)
+      .map(({ archiveId, reason, depth }) => ({ archiveId, reason, depth }));
+  }
+  /** What a plan is validated under: the organizations and the project map. */
+  async routingContextKey(routing: Routing) {
+    return digest(JSON.stringify([routing.organizations, await this.projectMapKey()])).slice(0, 32);
+  }
+  /** Marks the plans of a session's parent and subagents due: a change to its plan moves theirs. */
+  private async markRelatedDue(tx: Prisma.TransactionClient, archiveId: string) {
+    const row = await tx.archive.findUnique({
+      where: { id: archiveId },
+      select: { summary: true },
+    });
+    if (!row) return;
+    const summary = row.summary as Summary;
+    const children = await tx.archive.findMany({
+      where: {
+        partOf: null,
+        source: summary.source,
+        AND: [
+          { summary: { path: ['sourceId'], equals: summary.sourceId } },
+          { summary: { path: ['lineage', 'parentSessionId'], equals: summary.sessionId } },
+        ],
+      },
+      select: { id: true },
+    });
+    const related = children.map((c) => c.id);
+    if (summary.lineage && summary.lineage.kind !== 'part')
+      related.push(
+        archiveKey({
+          sourceId: summary.sourceId,
+          source: summary.source,
+          sessionId: summary.lineage.parentSessionId,
+        }),
+      );
+    await tx.routingPlan.updateMany({
+      where: { archiveId: { in: related }, due: null },
+      data: { due: 'related' },
+    });
+  }
+  /** A person read this plan; it leaves the review queue until it changes. */
+  async reviewPlan(archiveId: string, now = Date.now()) {
+    return (
+      (await this.db.routingPlan.updateMany({ where: { archiveId }, data: { reviewedAt: now } }))
+        .count > 0
+    );
+  }
+  /**
+   * A person drops a session's plan, its sticky decisions with it: the session is planned afresh.
+   * Its parts stand until the next plan replaces them.
+   */
+  async resetPlan(archiveId: string) {
+    return this.db.$transaction(async (tx) => {
+      const reset = (await tx.routingPlan.deleteMany({ where: { archiveId } })).count > 0;
+      if (reset) await this.markRelatedDue(tx, archiveId);
+      return reset;
+    });
+  }
   async close() {
     await this.db.$disconnect();
   }
@@ -1374,6 +2382,42 @@ export class ArchiveStore {
  * Deletes one earlier revision (its chunks cascade) unless it is current or an outbox row names it.
  * Returns how many went (0 or 1).
  */
+/**
+ * Stores a snapshot as an archive's revision: the row's fields, the revision and its chunks, and
+ * the revision it replaces compacted.
+ */
+async function writeRevision(
+  tx: Prisma.TransactionClient,
+  id: string,
+  snapshot: ArchiveSnapshot,
+  fields: Omit<Prisma.ArchiveUncheckedCreateInput, 'id'> & {
+    revision: number;
+    storedDigest: string;
+  },
+  oldRevision?: number,
+) {
+  await tx.archive.upsert({ where: { id }, create: { id, ...fields }, update: fields });
+  await tx.revision.create({
+    data: {
+      archiveId: id,
+      revision: fields.revision,
+      digest: fields.storedDigest,
+      snapshot: snapshot as Prisma.InputJsonValue,
+    },
+  });
+  const chunks = chunkArchive(snapshot);
+  for (let offset = 0; offset < chunks.length; offset += 1000)
+    await tx.chunk.createMany({
+      data: chunks.slice(offset, offset + 1000).map(({ encoding: _, ...chunk }, i) => ({
+        archiveId: id,
+        revision: fields.revision,
+        position: offset + i,
+        ...chunk,
+      })),
+    });
+  if (oldRevision !== undefined) await dropRevision(tx, id, oldRevision);
+}
+
 const dropRevision = (
   db: Prisma.TransactionClient | PrismaClient,
   archiveId: string,
@@ -1384,6 +2428,13 @@ const dropRevision = (
     AND r."revision" < (SELECT a."revision" FROM "archives" a WHERE a."id" = r."archiveId")
     AND NOT EXISTS (SELECT 1 FROM "outbox" o
       WHERE o."archiveId" = r."archiveId" AND o."revision" = r."revision")`;
+
+/**
+ * How a capture is checked and what comes with it: `previousDigest` (the writer's last known
+ * digest; checked when given), `cwd` (the session's working directory, for evidence), `restore`
+ * (lift this session's tombstone: the writer means to bring a deleted session back).
+ */
+export type CaptureOptions = { previousDigest?: string | null; cwd?: string; restore?: boolean };
 
 /** A capture that lost a race or arrived out of order; the server answers 409. */
 export class ArchiveConflict extends Error {}

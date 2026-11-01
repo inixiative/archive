@@ -11,6 +11,7 @@ import {
   defaultHistoryDirectory,
   defaultHome,
   installAgents,
+  machineProjectMap,
   readAgents,
   uninstallAgents,
   upsertCollector,
@@ -25,6 +26,7 @@ import {
   excludeGlob,
   type FolderFilters,
   folderGlob,
+  sessionMetadata,
   UNROUTED,
 } from './collector';
 import {
@@ -34,7 +36,9 @@ import {
   kingdomDirectory,
   readRouting,
   removeOrganization,
+  setCleanup,
   setOrganization,
+  setPublish,
 } from './config';
 import { stampedRun } from './exemption';
 import { importTranscriptFile } from './import-file';
@@ -105,6 +109,12 @@ export async function runCli(args = Bun.argv.slice(2)) {
       'capture-tool-calls-and-results': { type: 'string' },
       'capture-run-sessions': { type: 'string' },
       'retention-days': { type: 'string' },
+      'claude-bin': { type: 'string' },
+      'claude-config-dir': { type: 'string' },
+      'dry-run': { type: 'boolean', default: false },
+      backfill: { type: 'boolean', default: false },
+      all: { type: 'boolean', default: false },
+      roster: { type: 'string', multiple: true },
       name: { type: 'string' },
       hostname: { type: 'string', default: '127.0.0.1' },
       watch: { type: 'boolean', default: false },
@@ -122,7 +132,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
   const command = positionals[0];
   if (v.help || !command) {
     process.stdout.write(
-      'Archive: init | up | down | serve | connect (setup) | preview | import | collect | repair | list | export | tag | tags | suggest | routes | sync | search | settings | maintenance | organizations | agents\n' +
+      'Archive: init | up | down | serve | connect (setup) | preview | import | collect | repair | list | export | tag | tags | suggest | route | routes | sync | search | settings | maintenance | organizations | agents\n' +
         'up | down   (the local Archive: bundled compose.yaml with Postgres, data in --home)\n' +
         'serve [--port 4700 --hostname 127.0.0.1] [--sync]   (DATABASE_URL; token from ARCHIVE_SERVER_TOKEN or --token-file)\n' +
         'import --file PATH --source codex|claude-code|chatgpt --project-id ID [--tag TAG]\n' +
@@ -136,11 +146,16 @@ export async function runCli(args = Bun.argv.slice(2)) {
         "pair --kingdom KINGDOM_API_URL [--name NAME] [--organization SLUG|ID] [--library ID|NAME ...] [--yes]   (register this Archive with Kingdom, asking for sessions.write on those libraries, by default the ones its Kingdom destinations name, else the owner's; claim the review code there, then confirm the owner)\n" +
         'connect --url HTTPS_URL --organization-id ID (--token-env ENV | --token-file PATH)   (a remote Archive an organization publishes to, for serve --sync)\n' +
         'connect --kind kingdom --url KINGDOM_API_URL --credential-file PATH --integration-id UUID --resource-id UUID --organization-id ID   (a hosted Archive through Kingdom)\n' +
-        'organizations list | organizations set --id ID [--project ID ...] | organizations remove --id ID   (the projects each organization owns; a session publishes to every organization its project or a project it touched belongs to)\n' +
+        'organizations list | organizations set --id ID [--project ID ...] [--roster NAME ...] | organizations remove --id ID   (the projects each organization owns; a session publishes to every organization its project or a project it touched belongs to)\n' +
+        'route [--watch] [--concurrency 2] [--limit N] [--model claude-sonnet-5-5] [--claude-bin PATH] [--claude-config-dir DIR] [--dry-run]   (plan due sessions on the personal Claude login: parts × organizations; --watch wakes every 2 minutes)\n' +
+        'route --backfill [--dry-run]   (plan every session and print the plan against what destinations hold now) | route plans [--all] | route review --id ID | route reset --id ID\n' +
+        'cleanup [ORG] [off|leaked|all]   (what sync deletes at destinations, default off; with ORG, that organization only) | sync --dry-run   (per destination, the ids cleanup would delete now)\n' +
+        'publish [on|off]   (the go-live switch: off, the default, plans and deletes leaked whole-session copies but publishes nothing new)\n' +
         'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
         "settings [--capture-tool-calls-and-results true|false] [--capture-run-sessions true|false] [--retention-days N|off]   (read, or change, this Archive's settings)\n" +
         'maintenance status | maintenance reclaim   (compaction left to do and table sizes; return freed space to the OS once compaction is done)\n' +
         'agents add-collector --name N --source codex|claude-code (--project-id ID --project-root DIR [--project-root ...] [--worktrees] [--subdirectories] | --catch-all) [--directory HISTORY] [--atlas]\n' +
+        'agents router [--concurrency N] | agents router off   (install the routing scheduler beside the collectors)\n' +
         'agents remove-collector --name N | folders [--include GLOB ...] [--exclude GLOB ...] | server --url URL | install | uninstall | status\n' +
         `Data commands talk to the Archive server at --url (default ${DEFAULT_URL}) with the token in --token-file (default <home>/server.token) or ARCHIVE_TOKEN.\n`,
     );
@@ -226,10 +241,15 @@ export async function runCli(args = Bun.argv.slice(2)) {
     // One process owns the database connection: the server and its sync share it.
     // Failed deliveries back off across cycles instead of being re-sent every 30 seconds.
     const backoff: SyncBackoff = new Map();
+    // Each destination's own listing is reconciled every ten minutes, not every cycle.
+    const reconciled = new Map<string, number>();
     const sync = (async () => {
       while (v.sync && !stopped) {
         try {
-          const results = await syncArchives(instance.store, readRouting(config), { backoff });
+          const results = await syncArchives(instance.store, readRouting(config), {
+            backoff,
+            reconciled,
+          });
           const failed = results.filter((r) => r.status.startsWith('failed'));
           if (failed.length) console.error(JSON.stringify({ sync: 'failed', archives: failed }));
         } catch {
@@ -313,12 +333,34 @@ export async function runCli(args = Bun.argv.slice(2)) {
     output(connectDestination(config, destination));
     return;
   }
+  if (command === 'cleanup') {
+    // `cleanup MODE` sets the default; `cleanup ORG MODE` overrides it for one organization.
+    const [first, second] = positionals.slice(1);
+    const mode = second ?? first;
+    if (mode !== 'off' && mode !== 'leaked' && mode !== 'all') {
+      const routing = readRouting(config);
+      output({ cleanup: routing.cleanup, cleanupFor: routing.cleanupFor });
+    } else output(setCleanup(config, mode, second ? first : undefined));
+    return;
+  }
+  if (command === 'publish') {
+    const value = positionals[1];
+    if (value !== 'on' && value !== 'off') output({ publish: readRouting(config).publish });
+    else output({ publish: setPublish(config, value) });
+    return;
+  }
   if (command === 'organizations') {
     const action = positionals[1] ?? 'list';
     if (action === 'list') output(readRouting(config).organizations);
     else if (action === 'set') {
       if (!v.id) throw new Error('organizations set requires --id');
-      output(setOrganization(config, { id: v.id, projects: v.project ?? [] }));
+      output(
+        setOrganization(config, {
+          id: v.id,
+          projects: v.project ?? [],
+          ...(v.roster ? { roster: v.roster } : {}),
+        }),
+      );
     } else if (action === 'remove') {
       if (!v.id) throw new Error('organizations remove requires --id');
       output({ removed: removeOrganization(config, v.id) });
@@ -369,6 +411,22 @@ export async function runCli(args = Bun.argv.slice(2)) {
           ...base,
           collectors: base.collectors.filter((c) => c.name !== v.name),
         }),
+      );
+    } else if (action === 'router') {
+      const { router: _, ...rest } = base;
+      output(
+        writeAgents(
+          file,
+          positionals[2] === 'off'
+            ? rest
+            : {
+                ...rest,
+                router:
+                  v.concurrency !== '2'
+                    ? { concurrency: whole(v.concurrency!, 'concurrency', 8) }
+                    : {},
+              },
+        ),
       );
     } else if (action === 'server') {
       if (!v.url) throw new Error('agents server requires --url');
@@ -499,8 +557,97 @@ export async function runCli(args = Bun.argv.slice(2)) {
     } finally {
       await model.close();
     }
+  } else if (command === 'route') {
+    // Session content goes to this machine's own Claude login, so only this machine's Archive is read.
+    if (!['127.0.0.1', 'localhost', '[::1]'].includes(new URL(v.url ?? DEFAULT_URL).hostname))
+      throw new Error('route reads only this machine’s Archive');
+    const action = positionals[1];
+    if (action === 'plans') {
+      output(await archive.routingPlans({ all: v.all, limit: Number(v.limit ?? 50) }));
+      return;
+    }
+    if (action === 'review' || action === 'reset') {
+      if (!v.id) throw new Error(`route ${action} requires --id`);
+      output(action === 'review' ? await archive.reviewPlan(v.id) : await archive.resetPlan(v.id));
+      return;
+    }
+    if (action) throw new Error('Unknown route command; use --help');
+    const { runBackfill, runRouting } = await import('./route');
+    const { claudeRouteModel } = await import('./suggest-claude');
+    const concurrency = whole(v.concurrency!, 'concurrency', 8);
+    const model = await claudeRouteModel({
+      home,
+      concurrency,
+      ...(v.model ? { model: v.model } : {}),
+      ...(v['claude-bin'] ? { bin: v['claude-bin'] } : {}),
+      ...(v['claude-config-dir'] ? { configDir: resolve(v['claude-config-dir']) } : {}),
+    });
+    if (v.backfill) {
+      try {
+        const agents = readAgents(agentsFile);
+        if (agents && !v['dry-run']) await archive.setProjectMap(machineProjectMap(agents));
+        output(
+          await runBackfill(archive, model, {
+            concurrency,
+            ...(v['dry-run'] ? { dryRun: true } : {}),
+            ...(v.limit ? { limit: whole(v.limit, 'limit', 100_000) } : {}),
+            progress: (line) => console.error(line),
+          }),
+        );
+      } finally {
+        await model.close();
+      }
+      return;
+    }
+    let stopped = false;
+    const stop = () => {
+      stopped = true;
+    };
+    process.once('SIGINT', stop);
+    process.once('SIGTERM', stop);
+    try {
+      do {
+        try {
+          // Evidence follows the machine's projects as they are now (new worktrees included).
+          const agents = readAgents(agentsFile);
+          if (agents) await archive.setProjectMap(machineProjectMap(agents));
+          const report = await runRouting(archive, model, {
+            concurrency,
+            ...(v.limit ? { limit: whole(v.limit, 'limit', 100_000) } : {}),
+            ...(v['dry-run'] ? { dryRun: true } : {}),
+            progress: (line) => console.error(line),
+          });
+          if (!v.watch || report.due) output(report);
+        } catch (error) {
+          if (!v.watch) throw error;
+          console.error(JSON.stringify({ route: 'unavailable', error: (error as Error).message }));
+        }
+        // The scheduler wakes every two minutes; short waits allow prompt shutdown.
+        for (let i = 0; v.watch && !stopped && i < 120; i++) await Bun.sleep(1000);
+      } while (v.watch && !stopped);
+    } finally {
+      await model.close();
+      process.removeListener('SIGINT', stop);
+      process.removeListener('SIGTERM', stop);
+    }
   } else if (command === 'sync') {
-    const results = await archive.sync();
+    const results = await archive.sync(v['dry-run'] ? { dryRun: true } : {});
+    if (v['dry-run']) {
+      // Per destination, what cleanup would delete under the current settings.
+      const byDestination: Record<string, { wouldDelete: number; ids: string[] }> = {};
+      for (const r of results.filter((r) => r.status === 'would delete')) {
+        const row = byDestination[r.destination] ?? { wouldDelete: 0, ids: [] };
+        row.wouldDelete++;
+        row.ids.push(r.id);
+        byDestination[r.destination] = row;
+      }
+      output({
+        dryRun: true,
+        destinations: byDestination,
+        other: results.filter((r) => r.status !== 'would delete'),
+      });
+      return;
+    }
     output(results);
     if (results.some((r) => r.status.startsWith('failed'))) process.exitCode = 1;
   } else if (command === 'import') {
@@ -529,8 +676,12 @@ export async function runCli(args = Bun.argv.slice(2)) {
           });
     const run = stampedRun();
     snapshot.tags = [...new Set([...(run ? [run] : []), ...(v.tag ?? [])])];
+    const cwd =
+      v.source === 'chatgpt'
+        ? undefined
+        : sessionMetadata(v.file, v.source as 'codex' | 'claude-code')?.cwd;
     output({
-      ...(await archive.capture(snapshot)),
+      ...(await archive.capture(snapshot, cwd ? { cwd } : {})),
       entries: snapshot.entries.length,
       coverage: snapshot.coverage,
     });
@@ -630,6 +781,8 @@ export async function runCli(args = Bun.argv.slice(2)) {
     const config = readAgents(agentsFile);
     if (!config) throw new Error('No agents.json; declare agents first');
     const names = v.agent ? [v.agent] : config.collectors.map((c) => c.name);
+    // Sessions whose evidence predates the machine's projects are re-sent, so evidence is current.
+    await archive.setProjectMap(machineProjectMap(config));
     const results = [];
     for (const name of names) {
       const { collector, peers, filters, projects, server } = collectorPlan(config, name);

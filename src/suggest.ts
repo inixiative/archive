@@ -261,7 +261,8 @@ export interface SuggestReport {
 const PAGE = 20;
 const STOP_AFTER = 6;
 
-async function pool<T>(
+/** Runs `run` over the items, at most `concurrency` at once. */
+export async function pool<T>(
   items: T[],
   concurrency: number,
   run: (item: T, slot: number) => Promise<void>,

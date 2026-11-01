@@ -14,13 +14,13 @@ import {
 import { dirname, isAbsolute, join } from 'node:path';
 import { z } from 'zod';
 import { UNROUTED } from './index';
-import { PROJECT_TAG_PREFIX } from './tags';
 
 const projectId = z
   .string()
   .min(1)
   .max(256)
   .refine((id) => id !== UNROUTED, `${UNROUTED} sessions stay on this machine`);
+const cleanupMode = z.enum(['off', 'leaked', 'all']);
 /** An organization: the owner a set of projects belongs to, and where its sessions publish. */
 const organizationId = z
   .string()
@@ -61,17 +61,33 @@ export type ArchiveDestination = z.infer<typeof archiveDestinationSchema>;
 export const organizationSchema = z.strictObject({
   id: organizationId,
   projects: z.array(projectId).max(1000),
+  /** Coworkers' names, so the routing planner recognizes remarks about them. */
+  roster: z.array(z.string().min(1).max(100)).max(500).optional(),
 });
 /**
  * Where sessions publish: one archive per organization, not per project. Each project belongs to
- * an organization, and each organization has its destinations. A session publishes to the
- * destinations of every organization its own project, or a project it touched (`project:` tags),
- * belongs to. Projects in no organization stay on this machine.
+ * an organization, and each organization has its destinations. What publishes is a session's
+ * parts, to the organizations its validated routing plan gives them (`routedTo`); the session
+ * itself, and one not planned or held, publishes nowhere. `project:` tags are for search only.
  */
 export const routingSchema = z
   .strictObject({
     organizations: z.array(organizationSchema).max(50),
     destinations: z.array(archiveDestinationSchema).max(100),
+    /**
+     * The go-live switch. `off` (the default): sessions are planned and plans validated and
+     * applied here, and sync only deletes the whole-session copies destinations hold; nothing new
+     * publishes to an organization. `on`: parts publish, and re-plans delete what they drop.
+     */
+    publish: z.enum(['off', 'on']).default('off'),
+    /**
+     * What sync deletes at destinations. `off` (the default): nothing; pending deletes stay
+     * queued. `leaked`: what routing doesn't send there, keeping (with publishing off) a whole copy
+     * whose current valid plan sends the whole session there unredacted and unpruned. `all`: the
+     * same, keeping no whole copy. `cleanupFor` overrides it per organization.
+     */
+    cleanup: cleanupMode.default('off'),
+    cleanupFor: z.record(organizationId, cleanupMode).default({}),
   })
   .superRefine((routing, ctx) => {
     const ids = routing.organizations.map((o) => o.id);
@@ -84,9 +100,15 @@ export const routingSchema = z
       if (!ids.includes(d.organizationId))
         ctx.addIssue({ code: 'custom', message: `Unknown organization ${d.organizationId}` });
   });
-export type Routing = z.infer<typeof routingSchema>;
+export type Routing = z.output<typeof routingSchema>;
 export type Organization = z.infer<typeof organizationSchema>;
-const noRouting = (): Routing => ({ organizations: [], destinations: [] });
+const noRouting = (): Routing => ({
+  organizations: [],
+  destinations: [],
+  publish: 'off',
+  cleanup: 'off',
+  cleanupFor: {},
+});
 
 /** Private regular file owned by this user; a symlink or group/world access is refused. */
 export function readTokenFile(path: string) {
@@ -124,27 +146,21 @@ export function readRouting(file: string): Routing {
     : noRouting();
 }
 
-/** The organizations a session belongs to: its own project's and each touched project's. */
-export function sessionOrganizations(
-  routing: Routing,
-  session: { projectId?: string | null; tags: readonly string[] },
-): string[] {
-  const projects = new Set([
-    ...(session.projectId ? [session.projectId] : []),
-    ...session.tags.flatMap((tag) =>
-      tag.startsWith(PROJECT_TAG_PREFIX) ? [tag.slice(PROJECT_TAG_PREFIX.length)] : [],
-    ),
-  ]);
-  return routing.organizations
-    .filter((o) => o.projects.some((p) => projects.has(p)))
-    .map((o) => o.id);
+/** What routing reads of an archive: a part, and its plan's organizations. */
+export type RoutedArchive = { partOf?: string | null; routedTo?: readonly string[] };
+
+/**
+ * The organizations an archive publishes to: a part's, from its session's validated plan, among
+ * those the routing declares. A session (not a part) publishes to none.
+ */
+export function sessionOrganizations(routing: Routing, session: RoutedArchive): string[] {
+  if (!session.partOf) return [];
+  const routed = new Set(session.routedTo ?? []);
+  return routing.organizations.filter((o) => routed.has(o.id)).map((o) => o.id);
 }
 
-/** The destinations a session publishes to: those of every organization it belongs to. */
-export const sessionDestinations = (
-  routing: Routing,
-  session: { projectId?: string | null; tags: readonly string[] },
-) => {
+/** The destinations an archive publishes to: those of every organization it is routed to. */
+export const sessionDestinations = (routing: Routing, session: RoutedArchive) => {
   const organizations = sessionOrganizations(routing, session);
   return routing.destinations.filter((d) => organizations.includes(d.organizationId));
 };
@@ -236,8 +252,11 @@ export function setOrganization(file: string, input: Organization) {
   if (taken.length)
     throw new Error(`Projects already in another organization: ${taken.join(', ')}`);
   const index = routing.organizations.findIndex((o) => o.id === organization.id);
-  if (index < 0) routing.organizations.push(organization);
-  else routing.organizations[index] = organization;
+  const roster = organization.roster ?? routing.organizations[index]?.roster;
+  // Setting the projects keeps the roster unless one is given.
+  const next = { ...organization, ...(roster ? { roster } : {}) };
+  if (index < 0) routing.organizations.push(next);
+  else routing.organizations[index] = next;
   return writeRouting(file, routing).organizations;
 }
 
@@ -246,8 +265,28 @@ export function removeOrganization(file: string, id: string) {
   const routing = readRouting(file);
   if (!routing.organizations.some((o) => o.id === id)) return false;
   writeRouting(file, {
+    ...routing,
     organizations: routing.organizations.filter((o) => o.id !== id),
     destinations: routing.destinations.filter((d) => d.organizationId !== id),
   });
   return true;
+}
+
+/** The cleanup mode at an organization's destinations: its override, else the default. */
+export const cleanupFor = (routing: Routing, organizationId: string) =>
+  routing.cleanupFor[organizationId] ?? routing.cleanup;
+
+/** Sets cleanup for every organization, or overrides it for one. */
+export function setCleanup(file: string, mode: Routing['cleanup'], organizationId?: string) {
+  const routing = readRouting(file);
+  const next = organizationId
+    ? { ...routing, cleanupFor: { ...routing.cleanupFor, [organizationId]: mode } }
+    : { ...routing, cleanup: mode };
+  const written = writeRouting(file, next);
+  return { cleanup: written.cleanup, cleanupFor: written.cleanupFor };
+}
+
+/** Turns publishing to organizations on or off (`routing.publish`). */
+export function setPublish(file: string, publish: Routing['publish']) {
+  return writeRouting(file, { ...readRouting(file), publish }).publish;
 }
