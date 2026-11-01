@@ -53,7 +53,7 @@ test('a part publishes its kept entries with every redaction applied, its own ti
     ['e3', 'Sorry [redacted: coworker]. Ported.'],
   ]);
   expect(part.title).toBe('Port the error envelope; [redacted: coworker]');
-  expect(part.tags).toEqual(['project:template', 'atlas:x']);
+  expect(part.tags).toEqual(['project:template']);
   expect(part.references).toBeUndefined();
   expect(part.projectId).toBe('template');
   expect(part.lineage).toEqual({
@@ -64,7 +64,7 @@ test('a part publishes its kept entries with every redaction applied, its own ti
     lastEntryId: 'e4',
   });
   expect(part.coverage.omissions.at(-1)).toBe(
-    'A part of its session: 2 of 3 entries in its range; 1 pruned; 2 redacted',
+    'A part of its session: 2 of 3 entries in its range; 1 pruned; 2 redacted; tool activity is never kept',
   );
   // Echoes of a redacted span in other kept entries go too.
   const echoed = partSnapshot(
@@ -151,4 +151,20 @@ test('L4: overlapping redactions are one span over the original text; nothing be
     ],
   );
   expect(part.entries[0]!.text).toBe('I am [redacted: career, coworker]. Ship it.');
+});
+
+test('S6: a part carries only its organizations’ project tags and no whole-session metadata', () => {
+  const part = partSnapshot(
+    {
+      ...sample(),
+      goalIds: ['g1'],
+      runIds: ['r1'],
+      tags: ['project:template', 'project:kingdom', 'atlas:oracle:internals', 'secret-plan'],
+    },
+    { firstEntryId: 'e2', lastEntryId: 'e2', entryIds: ['e2'], projects: new Set(['template']) },
+    [],
+  );
+  expect(part.tags).toEqual(['project:template']);
+  expect(part.goalIds).toEqual([]);
+  expect(part.runIds).toEqual([]);
 });

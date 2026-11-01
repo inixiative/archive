@@ -279,6 +279,16 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
   const known = new Set([...context.routing.organizations.map((o) => o.id), PERSONAL]);
   const idAt = (index: number) => entries[index]?.id;
   const inWindow = (index: number) => index >= context.from && index <= context.through;
+  /** Organizations a range's own evidence, the subagents it spawned, or a person allow. */
+  const allowedFor = (range: Pick<ArchiveEntry, 'id'>[]) => {
+    const ids = new Set(range.map((e) => e.id));
+    const allowed = evidencedOrganizations(context.evidence, context.routing, context.map, ids);
+    for (const child of context.children)
+      if (child.spawnEntryId && ids.has(child.spawnEntryId))
+        for (const o of child.organizations) allowed.add(o);
+    for (const o of context.overrides.organizations) allowed.add(o);
+    return allowed;
+  };
   const parts: PlanPart[] = [];
   let previousEnd = context.from - 1;
   let continued: PlanPart | undefined;
@@ -294,12 +304,7 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
     const organizations = [...new Set(part.organizations)];
     const unknown = organizations.filter((o) => !known.has(o));
     if (unknown.length) issues.push(`${label} names unknown organizations: ${unknown.join(', ')}`);
-    const ids = new Set(entries.slice(part.from, part.to + 1).map((e) => e.id));
-    const allowed = evidencedOrganizations(context.evidence, context.routing, context.map, ids);
-    for (const child of context.children)
-      if (child.spawnEntryId && ids.has(child.spawnEntryId))
-        for (const o of child.organizations) allowed.add(o);
-    for (const o of context.overrides.organizations) allowed.add(o);
+    const allowed = allowedFor(entries.slice(part.from, part.to + 1));
     for (const o of organizations)
       if (o !== PERSONAL && known.has(o) && !allowed.has(o))
         issues.push(`${label}: no evidence for ${o} in its entries`);
@@ -364,7 +369,17 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
   const all = [...(continued ? [...priorParts.slice(0, -1), continued] : priorParts), ...parts];
   // Narrowing: what may never leave this machine, whatever the parts say.
   const narrowed = all.map((part) => {
-    let organizations = part.organizations;
+    // Every part, prior ones included, is held to today's organizations and evidence.
+    const from = entries.findIndex((e) => e.id === part.firstEntryId);
+    const to = entries.findIndex((e) => e.id === part.lastEntryId);
+    const allowed =
+      from < 0 || to < 0 ? new Set<string>() : allowedFor(entries.slice(from, to + 1));
+    let organizations = part.organizations.filter(
+      (o) => o === PERSONAL || (known.has(o) && allowed.has(o)),
+    );
+    if (organizations.length < part.organizations.length)
+      notes.push(`${part.firstEntryId}: narrowed to what its evidence allows today`);
+    if (!organizations.length) organizations = [PERSONAL];
     if (context.overrides.personal && organizations.some((o) => o !== PERSONAL)) {
       notes.push(`E…${part.lastEntryId}: personal by a person's decision`);
       organizations = [PERSONAL];
@@ -471,22 +486,6 @@ export function planReach(plan: StoredPlan, entries: Pick<ArchiveEntry, 'id'>[],
     for (const o of part.organizations) if (o !== PERSONAL) reach.add(o);
   }
   return reach;
-}
-
-/**
- * Where an entry quotes another session: a cross-session message (its sender is not resolvable,
- * `unknown`), or, in a Claude Code session, a subagent's message or result (`agent-<id>` of the
- * tree's root). Undefined when the entry is the session's own.
- */
-export function quotedSessions(text: string, rootSessionId: string): string[] | undefined {
-  const found: string[] = [];
-  if (/<cross-session-message\b/.test(text)) found.push('unknown');
-  for (const [, id] of text.matchAll(/<agent-message from=\\?"([\w-]+)\\?"/g))
-    found.push(`${rootSessionId}/agent-${id}`);
-  if (/<task-notification>/.test(text))
-    for (const [, id] of text.matchAll(/<task-id>([\w-]+)<\/task-id>/g))
-      found.push(`${rootSessionId}/agent-${id}`);
-  return found.length ? [...new Set(found)] : undefined;
 }
 
 /** The archive the planner reads from and records to. */

@@ -183,6 +183,9 @@ model RoutingPlan {
   /// Why it is due again, or null: `new entries`, `decision`, `related`, `partial`. Set by the
   /// change that makes it due, so the scheduler reads only these rows.
   due        String?
+  /// The organizations and project map it was validated under (`routingContextKey`): another
+  /// key makes it due, to re-validate its parts.
+  contextKey String?
 
   archive Archive @relation(fields: [archiveId], references: [id], onDelete: Cascade)
 

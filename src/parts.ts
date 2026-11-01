@@ -115,21 +115,22 @@ export function partSnapshot(
       lastEntryId: part.lastEntryId,
       ...(source.lineage?.agentType ? { agentType: source.lineage.agentType } : {}),
     },
-    tags: source.tags.filter(
-      (tag) =>
-        !tag.startsWith(PROJECT_TAG_PREFIX) ||
-        part.projects.has(tag.slice(PROJECT_TAG_PREFIX.length)),
+    // Only its organizations' project tags, and run tags so a destination can drop a run; no
+    // concept tags, goals or runs of the whole session.
+    tags: source.tags.filter((tag) =>
+      tag.startsWith(PROJECT_TAG_PREFIX)
+        ? part.projects.has(tag.slice(PROJECT_TAG_PREFIX.length))
+        : tag.startsWith('run:'),
     ),
-    goalIds: source.goalIds,
-    runIds: source.runIds,
+    goalIds: [],
+    runIds: [],
     capturedAt: source.capturedAt,
     coverage: {
       reasoning: source.coverage.reasoning,
       completeness: 'partial',
       omissions: [
-        ...source.coverage.omissions,
-        `A part of its session: ${entries.length} of ${span} entries in its range; ${span - entries.length} pruned; ${redacted} redacted`,
-      ].slice(-100),
+        `A part of its session: ${entries.length} of ${span} entries in its range; ${span - entries.length} pruned; ${redacted} redacted; tool activity is never kept`,
+      ],
     },
     entries,
   });

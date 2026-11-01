@@ -58,6 +58,39 @@ const injectedTags = [
   'send_user_message_question_reply',
   'turn_aborted',
 ].join('|');
+/**
+ * Harness blocks that carry another session's words into this one: a cross-session or teammate
+ * message (its sender is not resolvable), a subagent's message, a task notification with a
+ * subagent's result. Beside `injectedTags`: these are injected too, and also say whose they are.
+ */
+const quotedTags = [
+  'cross-session-message',
+  'teammate-message',
+  'agent-message',
+  'task-notification',
+];
+const quotedBlock = new RegExp(`<(${quotedTags.join('|')})(\\s[^>]*)?>([\\s\\S]*?)</\\1>`, 'g');
+
+/**
+ * The sessions an entry quotes, by session id, `unknown` where the sender can't be resolved; a
+ * subagent of the tree is `<root>/agent-<id>`. Undefined when the entry quotes no one.
+ */
+export function quotedOrigins(text: string, rootSessionId: string): string[] | undefined {
+  const found = new Set<string>();
+  for (const [, tag, attributes = '', body = ''] of text.matchAll(quotedBlock)) {
+    if (tag === 'cross-session-message' || tag === 'teammate-message') found.add('unknown');
+    else if (tag === 'agent-message') {
+      const from = attributes.match(/from=\\?"([\w-]+)\\?"/)?.[1];
+      found.add(from ? `${rootSessionId}/agent-${from}` : 'unknown');
+    } else {
+      const ids = [...body.matchAll(/<task-id>([\w-]+)<\/task-id>/g)].map((m) => m[1]!);
+      for (const id of ids.length ? ids : ['unknown'])
+        found.add(id === 'unknown' ? id : `${rootSessionId}/agent-${id}`);
+    }
+  }
+  return found.size ? [...found] : undefined;
+}
+
 /** Prompts Codex writes in the user's role. */
 const injectedPreamble = /^(?:# In app browser:|The following is the Codex agent history)/;
 /**

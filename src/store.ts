@@ -12,6 +12,7 @@ import {
   sessionEvidence,
 } from './evidence';
 import { droppableRun, exemptRun, identityRunTags, RUN_TAGS } from './exemption';
+import { quotedOrigins } from './import';
 import {
   type ArchiveChunk,
   type ArchiveSnapshot,
@@ -29,7 +30,6 @@ import {
   PERSONAL,
   planReach,
   publishedParts,
-  quotedSessions,
   type RecordPlanBody,
   type RecordPlanResult,
   ROUTE_TAG_PREFIX,
@@ -307,7 +307,8 @@ export class ArchiveStore {
         const tombstone = old ? null : await tx.archiveTombstone.findUnique({ where: { id } });
         if (
           tombstone &&
-          !options.restore &&
+          // Only a part is restored on purpose (a re-plan routed it there again).
+          !(options.restore && incoming.lineage?.kind === 'part') &&
           (tombstone.digest === digest || tombstone.transcriptDigest === transcript)
         ) {
           if (tombstone.digest !== digest)
@@ -1627,7 +1628,8 @@ export class ArchiveStore {
       where: { id },
       include: { tagEdits: true, routingPlan: true },
     });
-    if (!row || row.partOf) return undefined;
+    // A part, cut here or received as one, is never planned.
+    if (!row || row.partOf || (row.summary as Summary).lineage?.kind === 'part') return undefined;
     const revision = await this.db.revision.findUnique({
       where: { archiveId_revision: { archiveId: id, revision: row.revision } },
       select: { snapshot: true },
@@ -1728,33 +1730,22 @@ export class ArchiveStore {
         : (lineage?.rootSessionId ?? snapshot.sessionId);
     const foreign = new Map<string, Set<string> | null>();
     const foreignLabel = new Map<string, string>();
-    const reachOf = new Map<string, Set<string> | null | 'own'>();
+    const reachOf = new Map<string, Set<string> | null>();
     for (const entry of entries) {
       if (entry.kind !== 'user' && entry.kind !== 'event') continue;
-      const origins =
-        snapshot.source === 'claude-code' ? quotedSessions(entry.text, root) : undefined;
+      const origins = quotedOrigins(entry.text, root);
       if (!origins) continue;
       let reach: Set<string> | null | undefined;
       for (const origin of origins) {
         if (!reachOf.has(origin)) {
-          if (origin === 'unknown') reachOf.set(origin, null);
-          else {
-            const other = await this.plannedSession(this.relatedId(snapshot, origin));
-            // A task notification naming no archived session is this session's own background task.
-            reachOf.set(
-              origin,
-              other
-                ? other.plan
-                  ? planReach(other.plan, other.snapshot.entries)
-                  : null
-                : entry.text.includes('<agent-message')
-                  ? null
-                  : 'own',
-            );
-          }
+          // Unknown, not held here, or not planned: the quoted text stays here.
+          const other =
+            origin === 'unknown'
+              ? undefined
+              : await this.plannedSession(this.relatedId(snapshot, origin));
+          reachOf.set(origin, other?.plan ? planReach(other.plan, other.snapshot.entries) : null);
         }
         const found = reachOf.get(origin)!;
-        if (found === 'own') continue;
         if (found === null) reach = null;
         else if (reach !== null)
           reach = reach ? new Set([...reach].filter((o) => found.has(o))) : new Set(found);
@@ -1924,6 +1915,7 @@ export class ArchiveStore {
     if ((body.through < context.from && !reapply) || body.through >= entries.length)
       return { status: 'stale' };
     const record = {
+      contextKey: await this.routingContextKey(routing),
       key: body.key,
       by: body.by,
       digest: row.digest,
@@ -2138,6 +2130,8 @@ export class ArchiveStore {
     unplanned?: boolean;
     /** Subagents too, before their parent is planned (a dry run judges them on its own plans). */
     withoutParents?: boolean;
+    /** The current `routingContextKey`: a plan validated under another is due to re-validate. */
+    contextKey?: string;
   }) {
     const now = input.now ?? Date.now();
     const interval = input.intervalMs ?? 60 * 60_000;
@@ -2150,6 +2144,9 @@ export class ArchiveStore {
         OR: [
           { routingPlan: null },
           ...(input.unplanned ? [] : [{ routingPlan: { due: { not: null } } }]),
+          ...(input.unplanned || !input.contextKey
+            ? []
+            : [{ routingPlan: { contextKey: { not: input.contextKey } } }]),
         ],
       },
       select: {
@@ -2159,7 +2156,7 @@ export class ArchiveStore {
         capturedAt: true,
         summary: true,
         tagEdits: true,
-        routingPlan: { select: { due: true, at: true } },
+        routingPlan: { select: { due: true, at: true, contextKey: true } },
       },
     });
     const parentOf = (summary: Summary) =>
@@ -2189,7 +2186,11 @@ export class ArchiveStore {
       if (exemptRun(view.tags)) continue;
       const plan = row.routingPlan;
       if (!plan && lineage && !input.withoutParents && !planned.has(parentOf(summary))) continue;
-      let reason = plan?.due ?? 'unplanned';
+      let reason =
+        plan?.due ??
+        (plan && input.contextKey && plan.contextKey !== input.contextKey
+          ? 'context'
+          : 'unplanned');
       if (plan && reason === 'new entries') {
         const offset = Number.parseInt(digest(row.id).slice(0, 8), 16) % (stagger + 1);
         const pausedNow = now - row.capturedAt >= paused;
@@ -2207,6 +2208,10 @@ export class ArchiveStore {
     return due
       .slice(0, input.limit)
       .map(({ archiveId, reason, depth }) => ({ archiveId, reason, depth }));
+  }
+  /** What a plan is validated under: the organizations and the project map. */
+  async routingContextKey(routing: Routing) {
+    return digest(JSON.stringify([routing.organizations, await this.projectMapKey()])).slice(0, 32);
   }
   /** Marks the plans of a session's parent and subagents due: a change to its plan moves theirs. */
   private async markRelatedDue(tx: Prisma.TransactionClient, archiveId: string) {

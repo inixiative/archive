@@ -216,3 +216,24 @@ test('a backfill dry run plans every session, subagents against their parent’s
   ]);
   expect(root).toBeDefined();
 });
+
+test('S4: a change to the organizations or the project map makes plans due to re-validate their parts', async () => {
+  const store = await freshStore();
+  await store.setProjectMap(map);
+  const archive: RoutingArchive = {
+    routingInput: (b) => store.routingInput(b.archiveId, routing),
+    recordPlan: (b) => store.recordPlan(b, routing),
+    routingDue: (b) => store.routingDue(b),
+  };
+  const { id } = await store.capture(session('ctx', 2), { cwd: '/w/template' });
+  await runRouting(archive, model);
+  const key = await store.routingContextKey(routing);
+  expect(await store.routingDue({ limit: 10, contextKey: key })).toEqual([]);
+  const moved = await store.routingContextKey({
+    ...routing,
+    organizations: [{ id: 'inixiative', projects: [] }],
+  });
+  expect(await store.routingDue({ limit: 10, contextKey: moved })).toEqual([
+    { archiveId: id, reason: 'context', depth: 0 },
+  ]);
+});

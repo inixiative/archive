@@ -347,8 +347,17 @@ export function createArchiveHandler(
             readRouting(config.destinationsFile),
           ),
         });
-      if (path === '/api/v1/archive/routing/due')
-        return json({ data: { due: await store.routingDue(routingDueSchema.parse(body)) } });
+      if (path === '/api/v1/archive/routing/due') {
+        const input = routingDueSchema.parse(body);
+        const contextKey = config
+          ? await store.routingContextKey(readRouting(config.destinationsFile))
+          : undefined;
+        return json({
+          data: {
+            due: await store.routingDue({ ...input, ...(contextKey ? { contextKey } : {}) }),
+          },
+        });
+      }
       if (path === '/api/v1/archive/routing/plans')
         return json({ data: { plans: await store.routingPlans(routingPlansSchema.parse(body)) } });
       if (path === '/api/v1/archive/routing/review')

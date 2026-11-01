@@ -3,13 +3,13 @@ import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Routing } from '../src/config';
+import { quotedOrigins } from '../src/import';
 import { type ArchiveEntry, archiveKey, archiveSnapshotSchema } from '../src/index';
 import {
   type ProposedPlan,
   parsePlan,
   planSession,
   publishedParts,
-  quotedSessions,
   type RoutingArchive,
   validatePlan,
 } from '../src/route';
@@ -208,15 +208,15 @@ test('validation narrows, never widens: closed organizations, evidence per part,
     publishedParts(valid.plan, entries, new Map([['e3', new Set(['userevidence'])]]))[0]!.entryIds,
   ).toEqual(['e2', 'e3']);
   expect(
-    quotedSessions(
+    quotedOrigins(
       '<cross-session-message from="uds:x" from-name="inixiative-47">hi</cross-session-message>',
       'r',
     ),
   ).toEqual(['unknown']);
   expect(
-    quotedSessions('<task-notification><task-id>a1b2</task-id></task-notification>', 'r'),
+    quotedOrigins('<task-notification><task-id>a1b2</task-id></task-notification>', 'r'),
   ).toEqual(['r/agent-a1b2']);
-  expect(quotedSessions('plain', 'r')).toBeUndefined();
+  expect(quotedOrigins('plain', 'r')).toBeUndefined();
 });
 
 test('an opener that is personal and sensitive stays here; the template work after it publishes to inixiative (512aaec0a6)', async () => {
@@ -640,4 +640,69 @@ test('S2: a subagent whose spawn can’t be found holds; a parent re-routed pers
   expect(await due()).toContain(found);
   await planSession(archive, none, found);
   expect(await store.list({ exempt: 'include', parts: 'only' })).toEqual([]);
+});
+
+test('S3: a result quoted from a session this Archive does not hold is excluded, not taken as the session’s own', async () => {
+  const { store, archive } = await setup();
+  const s = session('notified', [
+    { kind: 'user', text: 'Fix zealot' },
+    call({ file_path: '/z/a.ts' }),
+    {
+      kind: 'event',
+      text: '<task-notification><task-id>a9</task-id><result>Grant is useless</result></task-notification>',
+    },
+    { kind: 'assistant', text: 'Fixed' },
+  ]);
+  const { id } = await store.capture(s, { cwd: '/z' });
+  const { model } = scripted([plan([{ from: 0, to: 2, organizations: ['userevidence'] }])]);
+  expect((await planSession(archive, model, id)).status).toBe('valid');
+  const [part] = await store.list({ exempt: 'include', parts: 'only' });
+  const text = (await store.read(part!.id))!.snapshot.entries.map((e) => e.text).join('\n');
+  expect(text).not.toContain('Grant');
+});
+
+test('S4: prior parts are re-validated on every plan: an organization that lost its evidence or its place is narrowed away', async () => {
+  const entries = ['a', 'b'].map((text, i) => ({ id: `e${i}`, text }));
+  const prior = {
+    parts: [
+      {
+        firstEntryId: 'e0',
+        lastEntryId: 'e1',
+        organizations: ['userevidence'],
+        sensitive: false,
+        confidence: 1,
+        rationale: '',
+      },
+    ],
+    prune: [],
+    redactions: [],
+    rationale: '',
+    throughEntryId: 'e1',
+  };
+  const result = validatePlan(plan([]), {
+    entries,
+    routing,
+    map,
+    evidence: { key: 'k', anchors: [], unattributedWrites: 0 },
+    prior,
+    from: 2,
+    through: 1,
+    overrides: { organizations: new Set(), personal: false },
+    children: [],
+    foreign: new Map(),
+  });
+  expect(result.status === 'valid' && result.plan.parts[0]!.organizations).toEqual(['personal']);
+});
+
+test('S5: restore lifts a tombstone only for a part; a received part is never planned here', async () => {
+  const { store } = await setup();
+  const whole = session('whole', [{ kind: 'user', text: 'x' }]);
+  const { id } = await store.capture(whole);
+  await store.delete(id);
+  expect((await store.capture(whole, { restore: true })).changed).toBe(false);
+  const received = session('other#part-e', [{ kind: 'user', text: 'x' }], {
+    lineage: { kind: 'part', parentSessionId: 'other', firstEntryId: 'e', lastEntryId: 'e' },
+  });
+  await store.capture(received, { cwd: '/z' });
+  expect(await store.routingDue({ limit: 10 })).toEqual([]);
 });
