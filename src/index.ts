@@ -43,10 +43,13 @@ export const archiveRuntimeSchema = z.strictObject({
 /**
  * The session that started this one: a subagent's parent, or the thread a fork copied. A tree of
  * sessions (a thread, its subagents, theirs) shares `rootSessionId`; `parentSessionId` is the direct
- * parent, and `parentEntryId` the parent's entry that spawned it (its tool call).
+ * parent, and `parentEntryId` the parent's entry that spawned it (its tool call). A `part` is a
+ * range of its parent session that routing publishes (`firstEntryId` to `lastEntryId`).
  */
 export const archiveLineageSchema = z.strictObject({
-  kind: z.enum(['subagent', 'fork']),
+  kind: z.enum(['subagent', 'fork', 'part']),
+  firstEntryId: identifier.optional(),
+  lastEntryId: identifier.optional(),
   parentSessionId: identifier,
   rootSessionId: identifier.optional(),
   parentEntryId: identifier.optional(),

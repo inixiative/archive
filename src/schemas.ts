@@ -59,6 +59,11 @@ export interface ArchiveFilter {
    * them with the rest, `only` lists only them.
    */
   exempt?: 'exclude' | 'include' | 'only';
+  /**
+   * Parts (the ranges of sessions routing publishes, `lineage.kind` `part`, cut here): left out
+   * unless asked for, so a session never shows twice.
+   */
+  parts?: 'exclude' | 'include' | 'only';
   /** Archives with this tag among their suggestions. */
   suggestedTag?: string;
 }

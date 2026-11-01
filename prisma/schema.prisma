@@ -20,32 +20,40 @@ model Setting {
 /// One session. `summary` is its listing (snapshot metadata, tags as captured, models,
 /// references, suggestions), recomputed on capture and when settings change.
 model Archive {
-  id         String  @id
+  id               String    @id
   /// Insertion order: listings are newest first.
-  seq        BigInt  @unique @default(autoincrement())
+  seq              BigInt    @unique @default(autoincrement())
   /// The snapshot as its writer sent it: head, ingest and previousDigest speak this digest.
-  digest     String
+  digest           String
   /// The current revision as stored here and published onward. Differs from `digest` only when
   /// ingest filtered the snapshot (captureToolCallsAndResults off).
-  storedDigest String
-  revision   Int
-  source     String
-  projectId  String?
-  actorId    String?
+  storedDigest     String
+  revision         Int
+  source           String
+  projectId        String?
+  actorId          String?
   /// The model provider (anthropic, openai) and the access path (subscription, api, unknown).
-  provider   String?
-  accessPath String?
-  capturedAt Float
-  summary    Json
+  provider         String?
+  accessPath       String?
+  capturedAt       Float
+  summary          Json
   /// A raw capture of a session its driver later stored itself: kept, never delivered onward.
-  supersededBy String?
+  supersededBy     String?
   /// The incoming transcript without collector additions (`transcriptDigest`), for tombstones.
   transcriptDigest String?
   /// What the session wrote and read where (`SessionEvidence`), computed at ingest before the
   /// tool-activity strip. Local to this row: never in a snapshot, so it never travels.
-  evidence    Json?
+  evidence         Json?
   /// The project map the evidence was computed under; another key makes a capture recompute it.
-  evidenceKey String?
+  evidenceKey      String?
+  /// A part: the session (archive) its routing plan cut it from. Parts are what publishes; they
+  /// stay out of local search, suggestions and retention, and go with their session.
+  partOf           String?
+  whole            Archive?  @relation("Parts", fields: [partOf], references: [id], onDelete: Cascade)
+  parts            Archive[] @relation("Parts")
+  /// A part's organizations, from its session's validated plan; empty once a re-plan drops it
+  /// (it is deleted here when no destination still holds it).
+  routedTo         String[]  @default([])
 
   revisions  Revision[]
   tagEdits   TagEdit[]
@@ -54,6 +62,7 @@ model Archive {
   outbox     Outbox[]
 
   @@index([projectId])
+  @@index([partOf])
   @@index([actorId])
   @@index([provider])
   @@index([accessPath])
@@ -193,7 +202,7 @@ model Claim {
   /// it was then. A later change with no live lease is captured raw.
   fulfilledBy String?
   fulfilledAt DateTime?
-  updatedAt   DateTime @updatedAt
+  updatedAt   DateTime  @updatedAt
 
   @@id([source, sessionId])
   @@map("claims")

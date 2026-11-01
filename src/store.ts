@@ -154,6 +154,8 @@ type ArchiveRow = {
   summary: Prisma.JsonValue;
   tagEdits: { tag: string; added: boolean }[];
   suggestion: { digest: string; by: string; tags: string[] } | null;
+  partOf?: string | null;
+  routedTo?: string[];
 };
 /**
  * Tags are the base tags with this archive's edits applied. Suggestions are the tagger's, minus
@@ -187,7 +189,17 @@ const listing = (row: ArchiveRow, filter: ArchiveFilter) => {
   )
     return [];
   return [
-    { id: row.id, revision: row.revision, digest: row.digest, ...summary, tags, suggestedTags },
+    {
+      id: row.id,
+      revision: row.revision,
+      digest: row.digest,
+      ...summary,
+      tags,
+      suggestedTags,
+      /** The session a part was cut from, and the organizations it publishes to. */
+      partOf: row.partOf ?? null,
+      routedTo: row.routedTo ?? [],
+    },
   ];
 };
 export type ArchiveListing = ReturnType<typeof listing>[number];
@@ -269,6 +281,7 @@ export class ArchiveStore {
         const tombstone = old ? null : await tx.archiveTombstone.findUnique({ where: { id } });
         if (
           tombstone &&
+          !options.restore &&
           (tombstone.digest === digest || tombstone.transcriptDigest === transcript)
         ) {
           if (tombstone.digest !== digest)
@@ -323,6 +336,9 @@ export class ArchiveStore {
           ...evidenceFields(evidenceOf(snapshot)),
         };
         await tx.archive.upsert({ where: { id }, create: { id, ...fields }, update: fields });
+        // A superseded session's parts are superseded with it, so they never publish.
+        if (supersededBy && supersededBy !== old?.supersededBy)
+          await tx.archive.updateMany({ where: { partOf: id }, data: { supersededBy } });
         await tx.revision.create({
           data: {
             archiveId: id,
@@ -442,6 +458,11 @@ export class ArchiveStore {
           ...(filter.actorId ? { actorId: filter.actorId } : {}),
           ...(filter.provider ? { provider: filter.provider } : {}),
           ...(filter.accessPath ? { accessPath: filter.accessPath } : {}),
+          ...(filter.parts === 'include'
+            ? {}
+            : filter.parts === 'only'
+              ? { partOf: { not: null } }
+              : { partOf: null }),
           ...(cursor === undefined ? {} : { seq: { lt: cursor } }),
         },
         include: { tagEdits: true, suggestion: { select: { digest: true, by: true, tags: true } } },
@@ -667,7 +688,9 @@ export class ArchiveStore {
         select: { id: true },
       });
       await tx.archive.updateMany({
-        where: { id: { in: raw.map((a) => a.id) } },
+        where: {
+          OR: [{ id: { in: raw.map((a) => a.id) } }, { partOf: { in: raw.map((a) => a.id) } }],
+        },
         data: { supersededBy: input.archiveId },
       });
       return { fulfilledBy: input.archiveId, superseded: raw.map((a) => a.id) };
@@ -709,6 +732,68 @@ export class ArchiveStore {
       orderBy: { sessionId: 'desc' },
     });
   }
+  /**
+   * Makes a session's parts what its plan says: each part stored as its own row (`partOf` the
+   * session, routed to its organizations, superseded with the session), and each part the plan
+   * no longer has retired: deleted here, or, while a destination still holds it, kept routed
+   * nowhere until sync deletes it there (`forgetDelivery`). Returns the part ids kept and retired.
+   */
+  async applyParts(
+    archiveId: string,
+    parts: { snapshot: ArchiveSnapshot; organizations: string[] }[],
+  ) {
+    const source = await this.db.archive.findUnique({
+      where: { id: archiveId },
+      select: { supersededBy: true, partOf: true },
+    });
+    if (!source || source.partOf) throw new Error('Archive unavailable');
+    const kept: string[] = [];
+    for (const part of parts) {
+      // A part re-added after a re-plan dropped it is meant: its tombstone, if any, is lifted.
+      const { id } = await this.capture(part.snapshot, { restore: true });
+      await this.db.archive.update({
+        where: { id },
+        data: {
+          partOf: archiveId,
+          routedTo: [...new Set(part.organizations)].sort(),
+          supersededBy: source.supersededBy,
+        },
+      });
+      kept.push(id);
+    }
+    const retired = await this.db.archive.findMany({
+      where: { partOf: archiveId, id: { notIn: kept } },
+      select: { id: true, receipts: { select: { destination: true } } },
+    });
+    for (const part of retired)
+      if (part.receipts.length)
+        await this.db.archive.update({ where: { id: part.id }, data: { routedTo: [] } });
+      else await this.db.archive.deleteMany({ where: { id: part.id } });
+    return { kept, retired: retired.map((r) => r.id) };
+  }
+  /**
+   * A destination no longer holds this archive (sync deleted it there): its receipt and queued
+   * revision go, and a retired part no destination holds any more is deleted here.
+   */
+  async forgetDelivery(id: string, destination: string) {
+    await this.db.$transaction([
+      this.db.receipt.deleteMany({ where: { archiveId: id, destination } }),
+      this.db.outbox.deleteMany({ where: { archiveId: id, destination } }),
+    ]);
+    await this.db.archive.deleteMany({
+      where: { id, partOf: { not: null }, routedTo: { isEmpty: true }, receipts: { none: {} } },
+    });
+  }
+  /** Every receipt: which destinations hold which archives, with what routing those rows now have. */
+  async deliveries() {
+    return this.db.receipt.findMany({
+      select: {
+        archiveId: true,
+        destination: true,
+        archive: { select: { partOf: true, routedTo: true, supersededBy: true } },
+      },
+    });
+  }
   /** Deletes a session and leaves its tombstone (`head`), so it is not imported again unchanged. */
   async delete(id: string) {
     return this.db.$transaction(async (tx) => {
@@ -737,7 +822,8 @@ export class ArchiveStore {
     const { retentionDays } = await this.settings();
     if (retentionDays === null) return [];
     const expired = await this.db.archive.findMany({
-      where: { capturedAt: { lt: now - retentionDays * 86_400_000 } },
+      // A part goes with its session.
+      where: { capturedAt: { lt: now - retentionDays * 86_400_000 }, partOf: null },
       select: { id: true },
     });
     const deleted: string[] = [];
@@ -1316,7 +1402,7 @@ export class ArchiveStore {
     let nextCursor: string | null = null;
     scan: for (;;) {
       const rows = await this.db.archive.findMany({
-        where: cursor === undefined ? {} : { seq: { lt: cursor } },
+        where: { partOf: null, ...(cursor === undefined ? {} : { seq: { lt: cursor } }) },
         include: { tagEdits: true, suggestion: true },
         orderBy: { seq: 'desc' },
         take: BATCH,
@@ -1402,7 +1488,7 @@ export class ArchiveStore {
         outcome.stale++;
         continue;
       }
-      if (exemptRun(listing(row, { exempt: 'include' })[0]!.tags)) {
+      if (row.partOf || exemptRun(listing(row, { exempt: 'include' })[0]!.tags)) {
         outcome.refused++;
         continue;
       }

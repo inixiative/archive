@@ -37,6 +37,8 @@ const ingestSchema = z.strictObject({
     .nullable(),
   /** The session's working directory, for evidence; never stored in the snapshot. */
   cwd: z.string().max(4096).refine(isAbsolute).optional(),
+  /** The writer brings a session deleted here back on purpose (a part a re-plan restored). */
+  restore: z.boolean().optional(),
 });
 const archiveId = z.string().regex(/^[a-f0-9]{64}$/);
 const filterFields = {
@@ -50,6 +52,7 @@ const filterFields = {
   provider: z.string().min(1).max(64).optional(),
   accessPath: z.enum(['subscription', 'api', 'unknown']).optional(),
   exempt: z.enum(['exclude', 'include', 'only']).optional(),
+  parts: z.enum(['exclude', 'include', 'only']).optional(),
   suggestedTag: z.string().min(1).max(120).optional(),
   limit: z.number().int().min(1).max(100).default(20),
   beforeId: archiveId.optional(),
@@ -154,9 +157,13 @@ export function createArchiveHandler(
         return json({ data: { sourceId: await store.sourceId(), protocol: 2 } });
       }
       if (path === '/api/v1/archive/ingest') {
-        const { snapshot, previousDigest, cwd } = ingestSchema.parse(body);
+        const { snapshot, previousDigest, cwd, restore } = ingestSchema.parse(body);
         return json({
-          data: await store.capture(snapshot, { previousDigest, ...(cwd ? { cwd } : {}) }),
+          data: await store.capture(snapshot, {
+            previousDigest,
+            ...(cwd ? { cwd } : {}),
+            ...(restore ? { restore } : {}),
+          }),
         });
       }
       if (path === '/api/v1/archive/projects/set')
