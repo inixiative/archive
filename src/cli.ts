@@ -85,6 +85,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       id: { type: 'string' },
       query: { type: 'string', default: '' },
       'project-root': { type: 'string', multiple: true },
+      'former-root': { type: 'string', multiple: true },
       worktrees: { type: 'boolean', default: false },
       subdirectories: { type: 'boolean', default: false },
       'catch-all': { type: 'boolean', default: false },
@@ -155,7 +156,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
         "settings [--capture-tool-calls-and-results true|false] [--capture-run-sessions true|false] [--retention-days N|off]   (read, or change, this Archive's settings)\n" +
         'maintenance status | maintenance reclaim   (compaction left to do and table sizes; return freed space to the OS once compaction is done)\n' +
-        'agents add-collector --name N --source codex|claude-code (--project-id ID --project-root DIR [--project-root ...] [--worktrees] [--subdirectories] | --catch-all) [--directory HISTORY] [--atlas]\n' +
+        'agents add-collector --name N --source codex|claude-code (--project-id ID --project-root DIR [--project-root ...] [--worktrees] [--subdirectories] [--former-root DIR ...] | --catch-all) [--directory HISTORY] [--atlas]   (former roots: where the checkouts used to live, for evidence only)\n' +
         'agents router [--concurrency N] | agents router off   (install the routing scheduler beside the collectors)\n' +
         'agents remove-collector --name N | folders [--include GLOB ...] [--exclude GLOB ...] | server --url URL | install | uninstall | status\n' +
         `Data commands talk to the Archive server at --url (default ${DEFAULT_URL}) with the token in --token-file (default <home>/server.token) or ARCHIVE_TOKEN.\n`,
@@ -396,6 +397,9 @@ export async function runCli(args = Bun.argv.slice(2)) {
             directory: resolve(v.directory ?? defaultHistoryDirectory(source)),
             projectId: catchAll ? UNROUTED : v['project-id']!,
             projectRoots: catchAll ? [] : v['project-root']!.map((root) => resolve(root)),
+            ...(v['former-root']?.length
+              ? { formerRoots: v['former-root'].map((root) => resolve(root)) }
+              : {}),
             ...(v.worktrees ? { worktrees: true } : {}),
             ...(v.subdirectories ? { subdirectories: true } : {}),
             ...(catchAll ? { catchAll: true } : {}),

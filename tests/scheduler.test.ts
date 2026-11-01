@@ -64,7 +64,7 @@ test('due sessions: unplanned now; with new entries once paused or an hour (stag
   const store = await freshStore();
   await store.setProjectMap(map);
   const archive: RoutingArchive = {
-    routingInput: (b) => store.routingInput(b.archiveId, routing),
+    routingInput: (b) => store.routingInput(b.archiveId, routing, b.key),
     recordPlan: (b) => store.recordPlan(b, routing),
     routingDue: (b) => store.routingDue(b),
   };
@@ -164,7 +164,7 @@ test('a backfill dry run plans every session, subagents against their parent’s
     ],
   });
   const archive: RoutingArchive = {
-    routingInput: (b) => store.routingInput(b.archiveId, routed),
+    routingInput: (b) => store.routingInput(b.archiveId, routed, b.key),
     recordPlan: (b) => store.recordPlan(b, routed),
     routingDue: (b) => store.routingDue(b),
   };
@@ -225,7 +225,7 @@ test('S4: a change to the organizations or the project map makes plans due to re
   const store = await freshStore();
   await store.setProjectMap(map);
   const archive: RoutingArchive = {
-    routingInput: (b) => store.routingInput(b.archiveId, routing),
+    routingInput: (b) => store.routingInput(b.archiveId, routing, b.key),
     recordPlan: (b) => store.recordPlan(b, routing),
     routingDue: (b) => store.routingDue(b),
   };
@@ -246,7 +246,7 @@ test('a long session plans one window a pass and stays due; a new worktree does 
   const store = await freshStore();
   await store.setProjectMap(map);
   const archive: RoutingArchive = {
-    routingInput: (b) => store.routingInput(b.archiveId, routing),
+    routingInput: (b) => store.routingInput(b.archiveId, routing, b.key),
     recordPlan: (b) => store.recordPlan(b, routing),
     routingDue: (b) => store.routingDue(b),
   };
@@ -275,7 +275,7 @@ test('a new planner charter or model makes every plan due', async () => {
   const store = await freshStore();
   await store.setProjectMap(map);
   const archive: RoutingArchive = {
-    routingInput: (b) => store.routingInput(b.archiveId, routing),
+    routingInput: (b) => store.routingInput(b.archiveId, routing, b.key),
     recordPlan: (b) => store.recordPlan(b, routing),
     routingDue: (b) => store.routingDue(b),
   };
@@ -285,4 +285,58 @@ test('a new planner charter or model makes every plan due', async () => {
   expect(await store.routingDue({ limit: 10, planKey: routeKey('claude-sonnet-6') })).toEqual([
     { archiveId: id, reason: 'charter', depth: 0 },
   ]);
+});
+
+test('a new charter re-plans with the model from the first entry, over passes, keeping sticky redactions; the old plan publishes until it is done', async () => {
+  const store = await freshStore();
+  await store.setProjectMap(map);
+  const archive: RoutingArchive = {
+    routingInput: (b) => store.routingInput(b.archiveId, routing, b.key),
+    recordPlan: (b) => store.recordPlan(b, routing),
+    routingDue: (b) => store.routingDue(b),
+  };
+  const long = session('retuned', 2);
+  long.entries[0]!.text = `${'first window words '.repeat(11_000)} Grant is useless`;
+  long.entries[1]!.text = 'second window words '.repeat(11_000);
+  const { id } = await store.capture(long, { cwd: '/w/template' });
+  // Under the old charter: two windows, the first redacting a coworker remark.
+  const seen: string[] = [];
+  const planner = (name: string): SuggestModel => ({
+    model: name,
+    async decide({ input }) {
+      seen.push(`${name} ${input.match(/## New entries \(E(\d+)/)![1]}`);
+      const range = input.match(/## New entries \(E(\d+)–E(\d+)/)!;
+      const from = Number(range[1]);
+      return {
+        content: JSON.stringify({
+          parts: [
+            { from, to: Number(range[2]), organizations: ['inixiative'], continues: from > 0 },
+          ],
+          redactions:
+            from === 0 && name === 'old'
+              ? [{ entry: 0, text: 'Grant is useless', reason: 'coworker' }]
+              : [],
+        }),
+      };
+    },
+  });
+  await runRouting(archive, planner('old'));
+  await runRouting(archive, planner('old'));
+  expect(await store.routingDue({ limit: 10, planKey: routeKey('old') })).toEqual([]);
+  // A new charter: due, re-planned from E0 with the new model, one window a pass.
+  expect((await runRouting(archive, planner('new'))).calls).toBe(1);
+  // Mid-rebuild, the old plan still publishes.
+  const [mid] = await store.list({ exempt: 'include', parts: 'only' });
+  expect(mid?.entries).toBe(2);
+  expect((await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } })).key).toBe(
+    routeKey('old'),
+  );
+  await runRouting(archive, planner('new'));
+  expect(seen).toEqual(['old 0', 'old 1', 'new 0', 'new 1']);
+  const plan = await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } });
+  expect(plan.key).toBe(routeKey('new'));
+  expect(await store.routingDue({ limit: 10, planKey: routeKey('new') })).toEqual([]);
+  const [part] = await store.list({ exempt: 'include', parts: 'only' });
+  const text = (await store.read(part!.id))!.snapshot.entries.map((e) => e.text).join('');
+  expect(text).not.toContain('Grant is useless');
 });

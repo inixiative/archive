@@ -248,7 +248,7 @@ export class ArchiveClient {
     return this.request<ArchiveSettings>('settings/read');
   }
   /** What the routing planner reads for one session (the delta since its plan, with context). */
-  routingInput(body: { archiveId: string }) {
+  routingInput(body: { archiveId: string; key?: string }) {
     return this.request<RoutingInput>('routing/input', body, { timeoutMs: 120_000 });
   }
   /** Sessions due for a routing plan, in the order to plan them. */

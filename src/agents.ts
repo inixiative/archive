@@ -64,6 +64,11 @@ export const collectorAgentSchema = z
     directory: absolute,
     projectId: z.string().min(1).max(256),
     projectRoots: z.array(absolute).max(100),
+    /**
+     * Where this project's checkouts used to live (`~/Desktop/inixiative/template`): evidence
+     * resolves paths there to the project. Nothing is collected or routed from them.
+     */
+    formerRoots: z.array(absolute).max(100).optional(),
     worktrees: z.boolean().optional(),
     subdirectories: z.boolean().optional(),
     /** Every session no other collector of this source claims; projectId `unrouted`, never synced. */
@@ -171,6 +176,7 @@ export function machineProjects(config: AgentsConfig) {
 export function machineProjectMap(config: AgentsConfig): ProjectMap {
   const roots = new Map<string, Set<string>>();
   const worktrees = new Map<string, Set<string>>();
+  const former = new Map<string, Set<string>>();
   const add = (into: Map<string, Set<string>>, projectId: string, paths: Iterable<string>) => {
     const set = into.get(projectId) ?? new Set<string>();
     for (const path of paths) set.add(path);
@@ -179,6 +185,11 @@ export function machineProjectMap(config: AgentsConfig): ProjectMap {
   for (const collector of config.collectors.filter((c) => !c.catchAll)) {
     const declared = collectionRoots({ ...source(collector), worktrees: false });
     add(roots, collector.projectId, declared);
+    add(
+      former,
+      collector.projectId,
+      (collector.formerRoots ?? []).map((root) => resolve(root)),
+    );
     add(
       worktrees,
       collector.projectId,
@@ -201,10 +212,12 @@ export function machineProjectMap(config: AgentsConfig): ProjectMap {
           if (repository) repositories.add(repository);
         }
         const found = [...(worktrees.get(projectId) ?? [])].filter((w) => !set.has(w)).sort();
+        const formerRoots = [...(former.get(projectId) ?? [])].sort();
         return {
           projectId,
           roots: sorted,
           ...(found.length ? { worktrees: found } : {}),
+          ...(formerRoots.length ? { formerRoots } : {}),
           repositories: [...repositories].sort(),
         };
       }),

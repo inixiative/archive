@@ -2,8 +2,14 @@ import { expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { collectSessions } from '../src/collector';
-import { evidenceByOrganization, evidencedOrganizations, sessionEvidence } from '../src/evidence';
+import { machineProjectMap } from '../src/agents';
+import { collectSessions, routeSession } from '../src/collector';
+import {
+  evidenceByOrganization,
+  evidencedOrganizations,
+  projectMapKey,
+  sessionEvidence,
+} from '../src/evidence';
 import { type ArchiveEntry, archiveSnapshotSchema } from '../src/index';
 import { freshStore } from './db';
 
@@ -249,4 +255,48 @@ test('repair computes evidence for Codex rollouts Codex archived, and for a sess
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('formerRoots resolve a project’s old checkout paths for evidence, and move the map’s key; nothing collects from them', () => {
+  const former = {
+    projects: [
+      {
+        projectId: 'template',
+        roots: ['/w/template'],
+        formerRoots: ['/Users/me/Desktop/template'],
+        repositories: [],
+      },
+    ],
+  };
+  const session = snapshot([call('Edit', { file_path: 'src/a.ts' })]);
+  expect(
+    sessionEvidence(session, new Set(['e0']), former, '/Users/me/Desktop/template').anchors,
+  ).toEqual([{ entryId: 'e0', writes: { template: 1 } }]);
+  expect(projectMapKey(former)).not.toBe(
+    projectMapKey({ projects: [{ ...former.projects[0]!, formerRoots: [] }] }),
+  );
+  expect(
+    machineProjectMap({
+      collectors: [
+        {
+          name: 'claude-code.template',
+          source: 'claude-code',
+          directory: '/h',
+          projectId: 'template',
+          projectRoots: ['/w/template'],
+          formerRoots: ['/Users/me/Desktop/template'],
+        },
+      ],
+    }).projects[0],
+  ).toMatchObject({ roots: ['/w/template'], formerRoots: ['/Users/me/Desktop/template'] });
+  expect(
+    routeSession('/Users/me/Desktop/template', [
+      {
+        directory: '/h',
+        source: 'claude-code',
+        projectId: 'template',
+        projectRoots: ['/w/template'],
+      },
+    ]),
+  ).toBeUndefined();
 });

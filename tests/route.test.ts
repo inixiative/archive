@@ -89,7 +89,7 @@ const setup = async () => {
   await store.updateSettings({ captureToolCallsAndResults: false });
   await store.setProjectMap(map);
   const archive: RoutingArchive = {
-    routingInput: (body) => store.routingInput(body.archiveId, routing),
+    routingInput: (body) => store.routingInput(body.archiveId, routing, body.key),
     recordPlan: (body) => store.recordPlan(body, routing),
     routingDue: (body) => store.routingDue(body),
   };

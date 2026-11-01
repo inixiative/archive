@@ -490,7 +490,7 @@ export function planReach(plan: StoredPlan, entries: Pick<ArchiveEntry, 'id'>[],
 
 /** The archive the planner reads from and records to. */
 export interface RoutingArchive {
-  routingInput(body: { archiveId: string }): Promise<RoutingInput>;
+  routingInput(body: { archiveId: string; key?: string }): Promise<RoutingInput>;
   recordPlan(body: RecordPlanBody): Promise<RecordPlanResult>;
   routingDue(body: {
     limit: number;
@@ -539,8 +539,8 @@ export async function planSession(
   archiveId: string,
   options: { dryRun?: boolean } = {},
 ): Promise<RecordPlanResult & { tokens?: TokenUsage; input?: RoutingInput }> {
-  const input = await archive.routingInput({ archiveId });
   const key = routeKey(model.model);
+  const input = await archive.routingInput({ archiveId, key });
   const base = { archiveId, digest: input.digest, through: input.through, key, by: model.model };
   // Nothing could reach an organization: no evidence, start directory, person's decision or
   // subagent for one. It holds as it is, and no tokens are spent on it.

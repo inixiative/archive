@@ -1779,8 +1779,20 @@ export class ArchiveStore {
   private async routingContext(
     session: NonNullable<Awaited<ReturnType<ArchiveStore['plannedSession']>>>,
     routing: Routing,
+    /** The planner's charter and model (`routeKey`): a plan made under another is re-planned. */
+    key?: string,
   ) {
-    const { row, snapshot, plan } = session;
+    const { row, snapshot } = session;
+    // A plan made under another charter is re-planned from the first entry, window by window
+    // (`rebuild`), while it keeps governing what publishes; its sticky decisions carry over.
+    const governing = session.plan;
+    const rebuilding = Boolean(governing && key && row.routingPlan && row.routingPlan.key !== key);
+    const stored = row.routingPlan?.rebuild as { key?: string; plan?: unknown } | null | undefined;
+    const plan = rebuilding
+      ? stored?.key === key && stored?.plan
+        ? storedPlanSchema.parse(stored.plan)
+        : undefined
+      : governing;
     const entries = snapshot.entries;
     const map = await this.projectMap();
     const evidence = (row.evidence ?? null) as SessionEvidence | null;
@@ -1893,6 +1905,8 @@ export class ArchiveStore {
       parentReach,
       parentIssue,
       parent,
+      governing,
+      rebuilding,
       parentArchiveId:
         lineage && lineage.kind !== 'part'
           ? this.relatedId(snapshot, lineage.parentSessionId)
@@ -1905,10 +1919,10 @@ export class ArchiveStore {
    * What the routing planner reads for one session: the entries since its plan (up to a budget,
    * each clipped), with their evidence and whether they quote another session, and the context.
    */
-  async routingInput(archiveId: string, routing: Routing): Promise<RoutingInput> {
+  async routingInput(archiveId: string, routing: Routing, key?: string): Promise<RoutingInput> {
     const session = await this.plannedSession(archiveId);
     if (!session) throw new Error('Archive unavailable');
-    const context = await this.routingContext(session, routing);
+    const context = await this.routingContext(session, routing, key);
     const { row, snapshot } = session;
     const { entries, evidence, map, plan, from } = context;
     const clip = (text: string, max: number) =>
@@ -2028,9 +2042,9 @@ export class ArchiveStore {
   ): Promise<RecordPlanResult> {
     const session = await this.plannedSession(body.archiveId);
     if (!session) throw new Error('Archive unavailable');
-    const context = await this.routingContext(session, routing);
+    const context = await this.routingContext(session, routing, body.key);
     const { row, snapshot } = session;
-    const { entries, plan: prior } = context;
+    const { entries, plan: prior, governing, rebuilding } = context;
     // The planner's indices describe the session as it read it.
     if (row.digest !== body.digest) return { status: 'stale' };
     // Nothing new to plan re-applies the plan as it stands (a person's decision changed).
@@ -2059,6 +2073,8 @@ export class ArchiveStore {
           notes,
           reviewedAt: null,
           due: null,
+          // A re-plan under a new charter that holds stops there; the plan it was replacing stands.
+          rebuild: Prisma.DbNull,
         };
         const recorded = await this.underSessionLock(body.archiveId, body.digest, (tx) =>
           tx.routingPlan.upsert({
@@ -2098,12 +2114,40 @@ export class ArchiveStore {
       foreign: context.foreign,
     });
     if (result.status === 'held') return { ...(await hold(result.issues, result.notes)), holds };
-    const published = publishedParts(
-      result.plan,
-      entries,
-      context.foreign,
-      sensitiveEntries(result.plan, entries),
-    );
+    // A re-plan keeps the decisions of the plan it replaces: its prunes, redactions and sensitive
+    // personal entries stay.
+    if (rebuilding && governing) {
+      result.plan.prune = [
+        ...new Map([...governing.prune, ...result.plan.prune].map((p) => [p.entryId, p])).values(),
+      ];
+      result.plan.redactions = [
+        ...new Map(
+          [...governing.redactions, ...result.plan.redactions].map((r) => [
+            JSON.stringify([r.entryId, r.text]),
+            r,
+          ]),
+        ).values(),
+      ];
+    }
+    const sticky = new Set([
+      ...sensitiveEntries(result.plan, entries),
+      ...(rebuilding ? sensitiveEntries(governing, entries) : []),
+    ]);
+    // Until the re-plan reaches the last entry, it is stored aside and the old plan governs.
+    if (rebuilding && body.through < entries.length - 1 && !body.dryRun) {
+      const recorded = await this.underSessionLock(body.archiveId, body.digest, (tx) =>
+        tx.routingPlan.update({
+          where: { archiveId: body.archiveId },
+          data: {
+            rebuild: { key: body.key, plan: result.plan } as Prisma.InputJsonValue,
+            due: 'charter',
+          },
+        }),
+      );
+      if (!recorded) return { status: 'stale' };
+      return { status: 'valid', notes: result.notes, parts: [], holds };
+    }
+    const published = publishedParts(result.plan, entries, context.foreign, sticky);
     const projectsOf = (organizations: string[]) =>
       new Set(
         routing.organizations
@@ -2131,7 +2175,7 @@ export class ArchiveStore {
     // A delta that only moves `through` changes nothing a person reviewed.
     const decisions = (plan?: StoredPlan) =>
       plan && JSON.stringify([plan.parts, plan.prune, plan.redactions]);
-    const changed = decisions(prior) !== decisions(result.plan);
+    const changed = decisions(rebuilding ? governing : prior) !== decisions(result.plan);
     // The organizations this plan sends the whole reviewed revision to, unredacted and unpruned,
     // and the stripped digests of the revisions plans sent whole there: a whole copy a destination
     // holds of one of those is kept under `cleanup: leaked` with publishing off.
@@ -2156,6 +2200,7 @@ export class ArchiveStore {
       ...record,
       status: 'valid',
       plan: result.plan as Prisma.InputJsonValue,
+      rebuild: Prisma.DbNull,
       wholeTo: whole,
       wholeDigests,
       attempt: Prisma.DbNull,

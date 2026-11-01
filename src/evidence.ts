@@ -21,6 +21,11 @@ export const projectMapSchema = z.strictObject({
       z.strictObject({
         projectId: z.string().min(1).max(256),
         roots: z.array(z.string().max(4096).refine(isAbsolute, 'Roots are absolute')).max(1000),
+        /** Where its checkouts used to live: they resolve for evidence; nothing collects there. */
+        formerRoots: z
+          .array(z.string().max(4096).refine(isAbsolute, 'Former roots are absolute'))
+          .max(100)
+          .optional(),
         /** Worktrees found under its roots now: they resolve, but don't change the map's key. */
         worktrees: z
           .array(z.string().max(4096).refine(isAbsolute, 'Worktrees are absolute'))
@@ -42,14 +47,19 @@ export type ProjectMap = z.infer<typeof projectMapSchema>;
 export const projectMapKey = (map: ProjectMap) =>
   digest(
     JSON.stringify(
-      map.projects.map(({ projectId, roots, repositories }) => [projectId, roots, repositories]),
+      map.projects.map(({ projectId, roots, repositories, formerRoots }) => [
+        projectId,
+        roots,
+        repositories,
+        formerRoots ?? [],
+      ]),
     ),
   ).slice(0, 32);
 /** Every directory a project's paths resolve under: its roots and its worktrees. */
 const resolvable = (map: ProjectMap) =>
-  map.projects.map(({ projectId, roots, worktrees }) => ({
+  map.projects.map(({ projectId, roots, worktrees, formerRoots }) => ({
     projectId,
-    roots: [...roots, ...(worktrees ?? [])],
+    roots: [...roots, ...(worktrees ?? []), ...(formerRoots ?? [])],
   }));
 
 type Counts = Record<string, number>;

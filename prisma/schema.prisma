@@ -188,6 +188,9 @@ model RoutingPlan {
   /// The organizations the valid plan sends the whole reviewed revision to, unredacted and
   /// unpruned, and the stripped digests of the revisions plans sent whole there.
   wholeTo      String[] @default([])
+  /// A re-plan under a new charter or model, built window by window from the first entry
+  /// (`{key, plan}`); it replaces `plan` once it reaches the last entry.
+  rebuild      Json?
   wholeDigests String[] @default([])
   /// The organizations and project map it was validated under (`routingContextKey`): another
   /// key makes it due, to re-validate its parts.

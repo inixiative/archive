@@ -80,6 +80,9 @@ const suggestionQueueSchema = z.strictObject({
 });
 const suggestionRecordSchema = z.strictObject({ results: z.array(z.unknown()).max(500) });
 const routingInputSchema = z.strictObject({ archiveId });
+const routingInputBodySchema = routingInputSchema.extend({
+  key: z.string().min(1).max(128).optional(),
+});
 const recordPlanSchema = z.strictObject({
   archiveId,
   digest: z.string().regex(/^[a-f0-9]{64}$/),
@@ -339,10 +342,14 @@ export function createArchiveHandler(
       }
       if (config && path === '/api/v1/archive/routing/input')
         return json({
-          data: await store.routingInput(
-            routingInputSchema.parse(body).archiveId,
-            readRouting(config.destinationsFile),
-          ),
+          data: await (async () => {
+            const input = routingInputBodySchema.parse(body);
+            return store.routingInput(
+              input.archiveId,
+              readRouting(config.destinationsFile),
+              input.key,
+            );
+          })(),
         });
       if (config && path === '/api/v1/archive/routing/record')
         return json({
