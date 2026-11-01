@@ -184,15 +184,14 @@ const charter = v.charter ? readFileSync(v.charter, 'utf8') : ROUTE_PROMPT;
 const recorded = v.replay
   ? (JSON.parse(readFileSync(v.replay, 'utf8')) as { proposals: Record<string, unknown> }).proposals
   : undefined;
-const byTitle = new Map(sessions.map((s) => [s.snapshot.title, s.id]));
+/** In a replay (concurrency 1), the session whose input was read last: the one being planned. */
+let replaying: string | undefined;
 const base: SuggestModel & { close(): Promise<void> } = recorded
   ? {
       model: 'replay',
       async decide(request) {
         if (request.key !== 'archive-route') throw new Error('A replay makes no other call');
-        const title = request.input.split('\n')[1]?.replace(/^title: /, '') ?? '';
-        const id = byTitle.get(title);
-        const proposal = id ? recorded[id] : undefined;
+        const proposal = replaying ? recorded[replaying] : undefined;
         // A recorded failure replays as an answer that does not parse, which holds as it did.
         return {
           content: proposal && typeof proposal === 'object' ? JSON.stringify(proposal) : 'no plan',
@@ -232,7 +231,10 @@ const model: SuggestModel = {
 const proposals = new Map<string, ProposedPlan | string>();
 const results = new Map<string, RecordPlanResult>();
 const archive: RoutingArchive = {
-  routingInput: ({ archiveId }) => store.routingInput(archiveId, routing),
+  routingInput: ({ archiveId }) => {
+    replaying = archiveId;
+    return store.routingInput(archiveId, routing);
+  },
   recordPlan: async (body) => {
     proposals.set(body.archiveId, body.proposal ?? body.failure ?? 'none');
     const result = await store.recordPlan({ ...body, preview: true }, routing);
@@ -251,7 +253,7 @@ try {
     ...(only
       ? { only: new Set(cases.cases.filter((c) => only.has(c.label)).map((c) => sessionOf(c).id)) }
       : {}),
-    concurrency: Number(v.concurrency),
+    concurrency: recorded ? 1 : Number(v.concurrency),
     progress: (line) => console.error(line),
   });
 } finally {
