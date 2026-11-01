@@ -61,6 +61,8 @@ export type ArchiveDestination = z.infer<typeof archiveDestinationSchema>;
 export const organizationSchema = z.strictObject({
   id: organizationId,
   projects: z.array(projectId).max(1000),
+  /** Coworkers' names, so the routing planner recognizes remarks about them. */
+  roster: z.array(z.string().min(1).max(100)).max(500).optional(),
 });
 /**
  * Where sessions publish: one archive per organization, not per project. Each project belongs to
@@ -236,8 +238,11 @@ export function setOrganization(file: string, input: Organization) {
   if (taken.length)
     throw new Error(`Projects already in another organization: ${taken.join(', ')}`);
   const index = routing.organizations.findIndex((o) => o.id === organization.id);
-  if (index < 0) routing.organizations.push(organization);
-  else routing.organizations[index] = organization;
+  const roster = organization.roster ?? routing.organizations[index]?.roster;
+  // Setting the projects keeps the roster unless one is given.
+  const next = { ...organization, ...(roster ? { roster } : {}) };
+  if (index < 0) routing.organizations.push(next);
+  else routing.organizations[index] = next;
   return writeRouting(file, routing).organizations;
 }
 

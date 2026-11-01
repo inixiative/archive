@@ -17,6 +17,7 @@ import {
 import { projectMapKey, projectMapSchema } from './evidence';
 import { archiveReferenceSchema, archiveSnapshotSchema, selectChunks } from './index';
 import { KingdomGrantMissing, pairedDestination, pairedLibraries } from './kingdom';
+import { proposedPlanSchema } from './route';
 import { CLAIM_SOURCES } from './schemas';
 import {
   ArchiveConflict,
@@ -76,6 +77,21 @@ const suggestionQueueSchema = z.strictObject({
   refresh: z.boolean().optional(),
 });
 const suggestionRecordSchema = z.strictObject({ results: z.array(z.unknown()).max(500) });
+const routingInputSchema = z.strictObject({ archiveId });
+const recordPlanSchema = z.strictObject({
+  archiveId,
+  digest: z.string().regex(/^[a-f0-9]{64}$/),
+  through: z.number().int().nonnegative(),
+  key: z.string().min(1).max(128),
+  by: z.string().min(1).max(200),
+  proposal: proposedPlanSchema.optional(),
+  failure: z.string().max(500).optional(),
+  dryRun: z.boolean().optional(),
+});
+const routingPlansSchema = z.strictObject({
+  all: z.boolean().optional(),
+  limit: z.number().int().min(1).max(500).default(50),
+});
 const tagListSchema = z.strictObject({ actorId: z.string().min(1).max(256).optional() });
 const claimSession = z.strictObject({
   source: z.enum(CLAIM_SOURCES),
@@ -310,6 +326,30 @@ export function createArchiveHandler(
           }
         return json({ data: { destinations } });
       }
+      if (config && path === '/api/v1/archive/routing/input')
+        return json({
+          data: await store.routingInput(
+            routingInputSchema.parse(body).archiveId,
+            readRouting(config.destinationsFile),
+          ),
+        });
+      if (config && path === '/api/v1/archive/routing/record')
+        return json({
+          data: await store.recordPlan(
+            recordPlanSchema.parse(body),
+            readRouting(config.destinationsFile),
+          ),
+        });
+      if (path === '/api/v1/archive/routing/plans')
+        return json({ data: { plans: await store.routingPlans(routingPlansSchema.parse(body)) } });
+      if (path === '/api/v1/archive/routing/review')
+        return json({
+          data: { reviewed: await store.reviewPlan(routingInputSchema.parse(body).archiveId) },
+        });
+      if (path === '/api/v1/archive/routing/reset')
+        return json({
+          data: { reset: await store.resetPlan(routingInputSchema.parse(body).archiveId) },
+        });
       if (config && path === '/api/v1/archive/organizations/list') {
         z.strictObject({}).parse(body);
         return json({

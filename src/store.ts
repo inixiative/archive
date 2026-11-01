@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { type Prisma, PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { z } from 'zod';
+import type { Routing } from './config';
 import {
+  evidenceByOrganization,
+  evidencedOrganizations,
   type ProjectMap,
   projectMapKey,
   projectMapSchema,
@@ -20,6 +23,21 @@ import {
   transcriptDigest,
   UNROUTED,
 } from './index';
+import { partSnapshot } from './parts';
+import {
+  PERSONAL,
+  planReach,
+  publishedParts,
+  quotedSessions,
+  type RecordPlanBody,
+  type RecordPlanResult,
+  ROUTE_TAG_PREFIX,
+  type RoutingEntry,
+  type RoutingInput,
+  sensitiveEntries,
+  storedPlanSchema,
+  validatePlan,
+} from './route';
 import {
   type ArchiveFilter,
   type ArchiveSettings,
@@ -116,6 +134,9 @@ const SEARCH_INDEX = 'chunks_text_idx';
 const TOOL_ACTIVITY_BATCH = 50;
 /** The settings row holding the host's project map (`projects/set`), for evidence at ingest. */
 const PROJECT_MAP = 'projectMap';
+/** What the routing planner reads per entry, and per request, in characters. */
+const ROUTE_ENTRY_CHARS = 8_000;
+const ROUTE_WINDOW_CHARS = 300_000;
 /** Advisory lock key: captures hold it shared, a settings change exclusively. */
 const SETTINGS_LOCK = 0x41524348;
 
@@ -1510,6 +1531,432 @@ export class ArchiveStore {
       outcome.recorded++;
     }
     return outcome;
+  }
+  /** A session as the planner reads it: its current revision without tool activity. */
+  private async plannedSession(id: string) {
+    const row = await this.db.archive.findUnique({
+      where: { id },
+      include: { tagEdits: true, routingPlan: true },
+    });
+    if (!row || row.partOf) return undefined;
+    const revision = await this.db.revision.findUnique({
+      where: { archiveId_revision: { archiveId: id, revision: row.revision } },
+      select: { snapshot: true },
+    });
+    if (!revision) return undefined;
+    const settings = await this.settings();
+    const { snapshot } = withoutToolActivity(
+      archiveSnapshotSchema.parse(revision.snapshot),
+      settings.integrations,
+    );
+    const valid = row.routingPlan?.plan ? storedPlanSchema.parse(row.routingPlan.plan) : undefined;
+    return { row, snapshot, plan: valid };
+  }
+  /** The archive of another session of the same writer and source, by its session id. */
+  private relatedId(snapshot: ArchiveSnapshot, sessionId: string) {
+    return archiveKey({ sourceId: snapshot.sourceId, source: snapshot.source, sessionId });
+  }
+  /**
+   * What validation and the planner need beyond the session: where the plan starts, a person's
+   * `route:` decisions, the subagents it spawned (with their evidence), its parent's reach at the
+   * spawn, and where each quoted entry's own session is routed.
+   */
+  private async routingContext(
+    session: NonNullable<Awaited<ReturnType<ArchiveStore['plannedSession']>>>,
+    routing: Routing,
+  ) {
+    const { row, snapshot, plan } = session;
+    const entries = snapshot.entries;
+    const map = await this.projectMap();
+    const evidence = (row.evidence ?? null) as SessionEvidence | null;
+    const at = plan ? entries.findIndex((e) => e.id === plan.throughEntryId) : -1;
+    const from = at + 1;
+    const overrideTags = row.tagEdits
+      .filter((e) => e.added && e.tag.startsWith(ROUTE_TAG_PREFIX))
+      .map((e) => e.tag)
+      .sort();
+    const known = new Set(routing.organizations.map((o) => o.id));
+    const overrides = {
+      organizations: new Set(
+        overrideTags.map((t) => t.slice(ROUTE_TAG_PREFIX.length)).filter((o) => known.has(o)),
+      ),
+      personal: overrideTags.includes(`${ROUTE_TAG_PREFIX}${PERSONAL}`),
+    };
+    const bySpawn = (list: typeof entries, lineage?: ArchiveSnapshot['lineage']) =>
+      lineage &&
+      list.find(
+        (e) =>
+          (lineage.toolUseId && e.callId === lineage.toolUseId) || e.id === lineage.parentEntryId,
+      )?.id;
+    const childRows = await this.db.archive.findMany({
+      where: {
+        partOf: null,
+        source: snapshot.source,
+        AND: [
+          { summary: { path: ['sourceId'], equals: snapshot.sourceId } },
+          { summary: { path: ['lineage', 'parentSessionId'], equals: snapshot.sessionId } },
+        ],
+      },
+      select: { summary: true, evidence: true },
+    });
+    const children = childRows.map((child) => {
+      const summary = child.summary as Summary;
+      const childEvidence = (child.evidence ?? null) as SessionEvidence | null;
+      const spawnEntryId = bySpawn(entries, summary.lineage);
+      return {
+        spawnEntryId,
+        organizations: evidencedOrganizations(childEvidence, routing, map),
+        evidence: evidenceByOrganization(childEvidence, routing, map),
+        description: (summary.lineage?.description ?? summary.session?.task ?? summary.title).slice(
+          0,
+          300,
+        ),
+      };
+    });
+    let parentReach: Set<string> | undefined;
+    let parentIssue: string | undefined;
+    let parent: { title: string; organizations: string[] } | undefined;
+    const lineage = snapshot.lineage;
+    if (lineage && lineage.kind !== 'part') {
+      const parentSession = await this.plannedSession(
+        this.relatedId(snapshot, lineage.parentSessionId),
+      );
+      if (!parentSession) parentIssue = 'its parent session is not in this Archive';
+      else if (!parentSession.plan) parentIssue = 'its parent session has no valid plan yet';
+      else {
+        const spawn = bySpawn(parentSession.snapshot.entries, lineage);
+        parentReach = planReach(parentSession.plan, parentSession.snapshot.entries, spawn);
+        parent = { title: parentSession.snapshot.title, organizations: [...parentReach] };
+      }
+    }
+    const root =
+      lineage?.kind === 'part'
+        ? snapshot.sessionId
+        : (lineage?.rootSessionId ?? snapshot.sessionId);
+    const foreign = new Map<string, Set<string> | null>();
+    const foreignLabel = new Map<string, string>();
+    const reachOf = new Map<string, Set<string> | null | 'own'>();
+    for (const entry of entries) {
+      if (entry.kind !== 'user' && entry.kind !== 'event') continue;
+      const origins =
+        snapshot.source === 'claude-code' ? quotedSessions(entry.text, root) : undefined;
+      if (!origins) continue;
+      let reach: Set<string> | null | undefined;
+      for (const origin of origins) {
+        if (!reachOf.has(origin)) {
+          if (origin === 'unknown') reachOf.set(origin, null);
+          else {
+            const other = await this.plannedSession(this.relatedId(snapshot, origin));
+            // A task notification naming no archived session is this session's own background task.
+            reachOf.set(
+              origin,
+              other
+                ? other.plan
+                  ? planReach(other.plan, other.snapshot.entries)
+                  : null
+                : entry.text.includes('<agent-message')
+                  ? null
+                  : 'own',
+            );
+          }
+        }
+        const found = reachOf.get(origin)!;
+        if (found === 'own') continue;
+        if (found === null) reach = null;
+        else if (reach !== null)
+          reach = reach ? new Set([...reach].filter((o) => found.has(o))) : new Set(found);
+      }
+      if (reach === undefined) continue;
+      foreign.set(entry.id, reach);
+      foreignLabel.set(
+        entry.id,
+        origins.includes('unknown') ? 'another session' : origins.join(', '),
+      );
+    }
+    return {
+      entries,
+      map,
+      evidence,
+      plan,
+      from,
+      overrides,
+      overrideTags,
+      children,
+      parentReach,
+      parentIssue,
+      parent,
+      foreign,
+      foreignLabel,
+    };
+  }
+  /**
+   * What the routing planner reads for one session: the entries since its plan (up to a budget,
+   * each clipped), with their evidence and whether they quote another session, and the context.
+   */
+  async routingInput(archiveId: string, routing: Routing): Promise<RoutingInput> {
+    const session = await this.plannedSession(archiveId);
+    if (!session) throw new Error('Archive unavailable');
+    const context = await this.routingContext(session, routing);
+    const { row, snapshot } = session;
+    const { entries, evidence, map, plan, from } = context;
+    const clip = (text: string, max: number) =>
+      text.length > max ? `${text.slice(0, max)}… [${text.length - max} more characters]` : text;
+    const show = (entry: (typeof entries)[number], index: number, max: number): RoutingEntry => {
+      const own = evidence?.anchors.some((a) => a.entryId === entry.id)
+        ? evidenceByOrganization(evidence, routing, map, new Set([entry.id]))
+        : undefined;
+      const foreign = context.foreignLabel.get(entry.id);
+      return {
+        index,
+        kind: entry.kind,
+        text: clip(entry.text.replace(/\s+\n/g, '\n'), max),
+        ...(foreign ? { foreign } : {}),
+        ...(own && Object.keys(own).length ? { evidence: own } : {}),
+      };
+    };
+    const window: RoutingEntry[] = [];
+    let used = 0;
+    for (let i = from; i < entries.length; i++) {
+      const shown = show(entries[i]!, i, ROUTE_ENTRY_CHARS);
+      if (window.length && used + shown.text.length > ROUTE_WINDOW_CHARS) break;
+      used += shown.text.length;
+      window.push(shown);
+    }
+    const index = new Map(entries.map((e, i) => [e.id, i]));
+    const last = plan?.parts.at(-1);
+    const startProject = evidence?.startProjectId;
+    return {
+      archiveId,
+      digest: row.digest,
+      session: {
+        title: snapshot.title,
+        source: snapshot.source,
+        ...(snapshot.projectId ? { projectId: snapshot.projectId } : {}),
+        ...(snapshot.lineage
+          ? {
+              lineage: {
+                kind: snapshot.lineage.kind,
+                ...(snapshot.lineage.agentType ? { agentType: snapshot.lineage.agentType } : {}),
+                ...(snapshot.lineage.description
+                  ? { description: snapshot.lineage.description }
+                  : {}),
+              },
+            }
+          : {}),
+        ...(startProject
+          ? {
+              startOrganization:
+                routing.organizations.find((o) => o.projects.includes(startProject))?.id ??
+                PERSONAL,
+            }
+          : {}),
+      },
+      organizations: routing.organizations.map((o) => ({
+        id: o.id,
+        projects: o.projects,
+        roster: o.roster ?? [],
+      })),
+      total: entries.length,
+      through: from + window.length - 1,
+      entries: window,
+      before: entries
+        .slice(Math.max(0, from - 3), from)
+        .map((e, i) => show(e, Math.max(0, from - 3) + i, 400)),
+      ...(plan
+        ? {
+            prior: {
+              ...(last
+                ? {
+                    lastPart: {
+                      from: index.get(last.firstEntryId) ?? 0,
+                      to: index.get(last.lastEntryId) ?? 0,
+                      organizations: last.organizations,
+                      rationale: last.rationale,
+                    },
+                  }
+                : {}),
+              sensitive: plan.parts
+                .filter((p) => p.sensitive)
+                .map((p) => ({
+                  from: index.get(p.firstEntryId) ?? 0,
+                  to: index.get(p.lastEntryId) ?? 0,
+                })),
+              redactions: plan.redactions.map((r) => ({
+                entry: index.get(r.entryId) ?? 0,
+                reason: r.reason,
+              })),
+            },
+          }
+        : {}),
+      evidence: evidenceByOrganization(evidence, routing, map),
+      children: context.children.map((c) => ({
+        description: c.description,
+        ...(c.spawnEntryId !== undefined && index.has(c.spawnEntryId)
+          ? { spawnedAt: index.get(c.spawnEntryId)! }
+          : {}),
+        evidence: c.evidence,
+      })),
+      ...(context.parent ? { parent: context.parent } : {}),
+      overrides: context.overrideTags,
+    };
+  }
+  /**
+   * Records the planner's answer for one session: validated in code (`validatePlan`), then, when
+   * valid, stored and applied (its parts written, the ones it dropped retired). A failed run or a
+   * plan that fails validation is held for review and changes nothing that publishes. A dry run
+   * returns what would publish and stores nothing.
+   */
+  async recordPlan(
+    body: RecordPlanBody,
+    routing: Routing,
+    now = Date.now(),
+  ): Promise<RecordPlanResult> {
+    const session = await this.plannedSession(body.archiveId);
+    if (!session) throw new Error('Archive unavailable');
+    const context = await this.routingContext(session, routing);
+    const { row, snapshot } = session;
+    const { entries, plan: prior } = context;
+    if (body.through < context.from || body.through >= entries.length) return { status: 'stale' };
+    const record = {
+      key: body.key,
+      by: body.by,
+      digest: row.digest,
+      entries: (row.summary as Summary).entries,
+      overrides: context.overrideTags,
+      at: now,
+    };
+    const hold = async (issues: string[], notes: string[] = []) => {
+      if (!body.dryRun) {
+        const attempt = (body.proposal ?? { failure: body.failure }) as Prisma.InputJsonValue;
+        const fields = { ...record, status: 'held', attempt, issues, notes, reviewedAt: null };
+        await this.db.routingPlan.upsert({
+          where: { archiveId: body.archiveId },
+          create: { archiveId: body.archiveId, ...fields },
+          update: fields,
+        });
+      }
+      return { status: 'held' as const, issues, notes };
+    };
+    if (context.parentIssue) return hold([context.parentIssue]);
+    if (!body.proposal) return hold([body.failure ?? 'no plan']);
+    const result = validatePlan(body.proposal, {
+      entries,
+      routing,
+      ...(context.map ? { map: context.map } : {}),
+      evidence: context.evidence,
+      ...(prior ? { prior } : {}),
+      from: context.from,
+      through: body.through,
+      overrides: context.overrides,
+      children: context.children,
+      ...(context.parentReach ? { parentReach: context.parentReach } : {}),
+      foreign: context.foreign,
+    });
+    if (result.status === 'held') return hold(result.issues, result.notes);
+    const published = publishedParts(
+      result.plan,
+      entries,
+      context.foreign,
+      sensitiveEntries(result.plan, entries),
+    );
+    const projectsOf = (organizations: string[]) =>
+      new Set(
+        routing.organizations
+          .filter((o) => organizations.includes(o.id))
+          .flatMap((o) => o.projects),
+      );
+    const parts = published.map((part) => ({
+      snapshot: partSnapshot(
+        snapshot,
+        { ...part, projects: projectsOf(part.organizations) },
+        result.plan.redactions,
+      ),
+      organizations: part.organizations,
+    }));
+    const outcome = {
+      notes: result.notes,
+      parts: parts.map((p) => ({
+        sessionId: p.snapshot.sessionId,
+        organizations: p.organizations,
+        entries: p.snapshot.entries.length,
+      })),
+    };
+    if (body.dryRun) return { status: 'valid', ...outcome };
+    const changed = JSON.stringify(prior) !== JSON.stringify(result.plan);
+    const version = (row.routingPlan?.version ?? 0) + (changed ? 1 : 0);
+    const fields = {
+      ...record,
+      status: 'valid',
+      plan: result.plan as Prisma.InputJsonValue,
+      attempt: Prisma.DbNull,
+      issues: [],
+      notes: result.notes,
+      version,
+      ...(changed ? { reviewedAt: null } : {}),
+    };
+    await this.db.routingPlan.upsert({
+      where: { archiveId: body.archiveId },
+      create: { archiveId: body.archiveId, ...fields },
+      update: fields,
+    });
+    const { retired } = await this.applyParts(body.archiveId, parts);
+    return { status: 'valid', version, ...outcome, retired };
+  }
+  /**
+   * Plans for review, most in need first: held ones, then ones with redactions or low confidence
+   * a person has not read since they changed. `all` lists every plan.
+   */
+  async routingPlans(input: { all?: boolean; limit: number }) {
+    const rows = await this.db.routingPlan.findMany({
+      include: { archive: { select: { summary: true } } },
+      orderBy: { at: 'desc' },
+    });
+    const items = rows.flatMap((row) => {
+      const plan = row.plan ? storedPlanSchema.parse(row.plan) : undefined;
+      const confidence = plan?.parts.length ? Math.min(...plan.parts.map((p) => p.confidence)) : 1;
+      const redactions = plan?.redactions.length ?? 0;
+      const due =
+        row.status === 'held' || (row.reviewedAt === null && (redactions > 0 || confidence < 0.6));
+      if (!input.all && !due) return [];
+      const summary = row.archive.summary as Summary;
+      return [
+        {
+          archiveId: row.archiveId,
+          title: summary.title,
+          sessionId: summary.sessionId,
+          status: row.status,
+          version: row.version,
+          issues: row.issues,
+          notes: row.notes,
+          redactions,
+          confidence,
+          reviewedAt: row.reviewedAt,
+          by: row.by,
+          at: row.at,
+          plan: plan ?? null,
+          attempt: row.attempt,
+        },
+      ];
+    });
+    items.sort(
+      (a, b) =>
+        Number(b.status === 'held') - Number(a.status === 'held') || a.confidence - b.confidence,
+    );
+    return items.slice(0, input.limit);
+  }
+  /** A person read this plan; it leaves the review queue until it changes. */
+  async reviewPlan(archiveId: string, now = Date.now()) {
+    return (
+      (await this.db.routingPlan.updateMany({ where: { archiveId }, data: { reviewedAt: now } }))
+        .count > 0
+    );
+  }
+  /**
+   * A person drops a session's plan, its sticky decisions with it: the session is planned afresh.
+   * Its parts stand until the next plan replaces them.
+   */
+  async resetPlan(archiveId: string) {
+    return (await this.db.routingPlan.deleteMany({ where: { archiveId } })).count > 0;
   }
   async close() {
     await this.db.$disconnect();

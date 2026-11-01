@@ -55,11 +55,12 @@ model Archive {
   /// (it is deleted here when no destination still holds it).
   routedTo         String[]  @default([])
 
-  revisions  Revision[]
-  tagEdits   TagEdit[]
-  suggestion Suggestion?
-  receipts   Receipt[]
-  outbox     Outbox[]
+  revisions   Revision[]
+  tagEdits    TagEdit[]
+  suggestion  Suggestion?
+  routingPlan RoutingPlan?
+  receipts    Receipt[]
+  outbox      Outbox[]
 
   @@index([projectId])
   @@index([partOf])
@@ -153,6 +154,37 @@ model Suggestion {
   archive Archive @relation(fields: [archiveId], references: [id], onDelete: Cascade)
 
   @@map("suggestions")
+}
+
+/// Where a session's parts publish: the routing planner's plan as code validated it (`plan`,
+/// whose sensitive personal parts, prunes and redactions are sticky across re-plans), and the
+/// latest attempt that failed validation (`attempt`, with its `issues`), held for review. Its own
+/// record, never the tagger's; only a valid plan routes.
+model RoutingPlan {
+  archiveId  String   @id
+  /// Bumps each time the valid plan changes.
+  version    Int      @default(0)
+  /// `valid`: the latest attempt passed; `held`: it failed, and `plan` (if any) still stands.
+  status     String
+  plan       Json?
+  attempt    Json?
+  issues     String[] @default([])
+  notes      String[] @default([])
+  /// The charter and model, hashed (`routeKey`).
+  key        String
+  by         String
+  /// The session's digest and stored entry count when planned: more entries make it due again.
+  digest     String
+  entries    Int
+  /// A person's `route:` decisions it was planned under; a change makes it due again.
+  overrides  String[] @default([])
+  at         Float
+  /// When a person read it in the review queue.
+  reviewedAt Float?
+
+  archive Archive @relation(fields: [archiveId], references: [id], onDelete: Cascade)
+
+  @@map("routing_plans")
 }
 
 /// A tag this archive offers: archive-wide (actorId "") or for one actor.

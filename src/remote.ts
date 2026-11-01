@@ -5,6 +5,7 @@ import type { ArchiveDestination, DescribedDestination, Organization } from './c
 import type { ProjectMap } from './evidence';
 import type { ArchiveChunk, ArchiveSnapshot } from './index';
 import { archiveKey, archiveSnapshotSchema } from './index';
+import type { RecordPlanBody, RecordPlanResult, RoutingInput } from './route';
 import type {
   ArchiveFilter,
   ArchiveSettings,
@@ -243,6 +244,24 @@ export class ArchiveClient {
   }
   settings() {
     return this.request<ArchiveSettings>('settings/read');
+  }
+  /** What the routing planner reads for one session (the delta since its plan, with context). */
+  routingInput(body: { archiveId: string }) {
+    return this.request<RoutingInput>('routing/input', body, { timeoutMs: 120_000 });
+  }
+  /** Records the planner's answer; the server validates it and, when valid, applies it. */
+  recordPlan(body: RecordPlanBody) {
+    return this.request<RecordPlanResult>('routing/record', body, { timeoutMs: 120_000 });
+  }
+  /** Plans for review (held, redacted, low confidence and unread), or every plan with `all`. */
+  routingPlans(body: { all?: boolean; limit?: number } = {}) {
+    return this.request<{ plans: unknown[] }>('routing/plans', body);
+  }
+  reviewPlan(archiveId: string) {
+    return this.request<{ reviewed: boolean }>('routing/review', { archiveId });
+  }
+  resetPlan(archiveId: string) {
+    return this.request<{ reset: boolean }>('routing/reset', { archiveId });
   }
   /** Sends the host's project map; captures from then on compute their evidence under it. */
   setProjectMap(map: ProjectMap) {
