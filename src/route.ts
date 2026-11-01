@@ -9,7 +9,7 @@ import {
   type ProjectMap,
   type SessionEvidence,
 } from './evidence';
-import type { ArchiveEntry } from './index';
+import type { ArchiveEntry, ArchiveSnapshot } from './index';
 import { REDACTION_REASONS, type Redaction } from './parts';
 import { pool, type SuggestModel, type TokenUsage } from './suggest';
 
@@ -550,6 +550,8 @@ export type RecordPlanBody = {
   proposal?: ProposedPlan;
   failure?: string;
   dryRun?: boolean;
+  /** A dry run only: also return each part as the snapshot it would publish (redacted, pruned). */
+  preview?: boolean;
   /**
    * A dry run only: where the parent's plan, itself a dry run, reaches, so a backfill can judge a
    * subagent before anything is stored. Ignored when the plan is applied.
@@ -566,6 +568,10 @@ export type RecordPlanResult = {
   retired?: string[];
   /** The organizations whose destinations hold this session or its parts now (receipts). */
   holds?: string[];
+  /** A valid dry run only: the plan as validated, which a person or a fixture run can read. */
+  plan?: StoredPlan;
+  /** A valid dry run with `preview`: each part as it would publish, in `parts` order. */
+  snapshots?: ArchiveSnapshot[];
 };
 
 /**

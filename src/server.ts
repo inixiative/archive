@@ -92,6 +92,7 @@ const recordPlanSchema = z.strictObject({
   proposal: proposedPlanSchema.optional(),
   failure: z.string().max(500).optional(),
   dryRun: z.boolean().optional(),
+  preview: z.boolean().optional(),
   assumeParentReach: z.array(z.string().min(1).max(64)).max(50).optional(),
 });
 const routingDueSchema = z.strictObject({

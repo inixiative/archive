@@ -104,7 +104,7 @@ The planner doesn't wait for a session to go idle. A host scheduler wakes every 
 | 01b0bda06a | UE with Vlad redacted; json-rules part → inixiative | no roster: one part → both, unredacted; with roster `Vlad, Grant`: one part → both, Vlad line redacted | partial: redacted only with a roster, not split |
 | 40b206fa84 | inixiative | UE + inixiative | no |
 
-A dry run plans the first window of a long session only (nothing is stored to continue from), and judges a subagent against its parent's whole dry-run reach, not the part at its spawn. The pass bar (every row, plus 30 UE-bound parts read whole) is not met: splitting and over-inclusion are charter work, to be tuned and measured before go-live.
+A dry run plans the first window of a long session only (nothing is stored to continue from), and judges a subagent against its parent's whole dry-run reach, not the part at its spawn. The pass bar (every row, plus 30 UE-bound parts read whole) is not met: splitting and over-inclusion are charter work, to be tuned and measured before go-live. Tuned 2026-11-01 in [ROUTING-TUNING.md](ROUTING-TUNING.md): no charter variant cleared the gates; the remaining failures trace to plan parsing, whole-plan holds on one bad redaction, and exact-span echo redaction.
 
 ## Code review fixes (2026-11-01, `docs/ROUTING.code-review.md`)
 

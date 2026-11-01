@@ -298,6 +298,39 @@ test('work for UserEvidence publishes there with the coworker lines redacted; th
   expect(await store.routingPlans({ limit: 10 })).toEqual([]);
 });
 
+test('a dry run returns the validated plan and, with preview, each part as it would publish; it stores nothing', async () => {
+  const { store } = await setup();
+  const s = session('preview', [
+    { kind: 'user', text: 'Review Zealot PR 4590; vlad deleted my work' },
+    call({ command: 'gh pr review 4590 --repo userevidence/zealot --approve' }, 'Bash'),
+    { kind: 'assistant', text: 'Reviewed. vlad deleted my work, so I restored it.' },
+  ]);
+  const { id } = await store.capture(s, { cwd: '/z' });
+  const input = await store.routingInput(id, routing);
+  const proposal = plan([{ from: 0, to: 1, organizations: ['userevidence'] }], {
+    redactions: [{ entry: 0, text: 'vlad deleted my work', reason: 'coworker' }],
+  });
+  const body = {
+    archiveId: id,
+    digest: input.digest,
+    through: input.through,
+    key: 'k',
+    by: 'test',
+    proposal,
+    dryRun: true,
+  };
+  const plain = await store.recordPlan(body, routing);
+  expect(plain.plan?.parts.map((p) => p.organizations)).toEqual([['userevidence']]);
+  expect(plain.snapshots).toBeUndefined();
+  const preview = await store.recordPlan({ ...body, preview: true }, routing);
+  expect(preview.snapshots).toHaveLength(1);
+  const text = preview.snapshots![0]!.entries.map((e) => e.text).join('\n');
+  // Every redaction is applied to every kept entry, its echoes included.
+  expect(text).not.toMatch(/vlad/i);
+  expect(await store.routingPlans({ limit: 10 })).toEqual([]);
+  expect(await parts(store)).toEqual([]);
+});
+
 test('text that asks to be routed cannot send a session anywhere its evidence does not reach (B1); a failed run holds it', async () => {
   const { store, archive } = await setup();
   const s = session('injected', [
