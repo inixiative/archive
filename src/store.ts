@@ -136,8 +136,11 @@ const TOOL_ACTIVITY_BATCH = 50;
 /** The settings row holding the host's project map (`projects/set`), for evidence at ingest. */
 const PROJECT_MAP = 'projectMap';
 /** What the routing planner reads per entry, and per request, in characters. */
-const ROUTE_ENTRY_CHARS = 8_000;
-const ROUTE_WINDOW_CHARS = 300_000;
+/**
+ * The planner sees whole entries, as many as fit a window; one longer than a whole window is shown
+ * cut, and a part holding it holds (`ValidationContext.clipped`).
+ */
+export const ROUTE_WINDOW_CHARS = 300_000;
 /** Advisory lock key: captures hold it shared, a settings change exclusively. */
 const SETTINGS_LOCK = 0x41524348;
 
@@ -1723,6 +1726,7 @@ export class ArchiveStore {
         kind: entry.kind,
         // Shown as stored, so a redaction quoting it matches byte for byte.
         text: clip(entry.text, max),
+        ...(entry.text.length > max ? { clipped: true } : {}),
         ...(foreign ? { foreign } : {}),
         ...(own && Object.keys(own).length ? { evidence: own } : {}),
       };
@@ -1730,7 +1734,7 @@ export class ArchiveStore {
     const window: RoutingEntry[] = [];
     let used = 0;
     for (let i = from; i < entries.length; i++) {
-      const shown = show(entries[i]!, i, ROUTE_ENTRY_CHARS);
+      const shown = show(entries[i]!, i, ROUTE_WINDOW_CHARS);
       if (window.length && used + shown.text.length > ROUTE_WINDOW_CHARS) break;
       used += shown.text.length;
       window.push(shown);
@@ -1871,6 +1875,12 @@ export class ArchiveStore {
       ...(prior ? { prior } : {}),
       from: context.from,
       through: body.through,
+      clipped: new Set(
+        entries
+          .slice(context.from, body.through + 1)
+          .filter((e) => e.text.length > ROUTE_WINDOW_CHARS)
+          .map((e) => e.id),
+      ),
       overrides: context.overrides,
       children: context.children,
       ...(context.parentReach ? { parentReach: context.parentReach } : {}),

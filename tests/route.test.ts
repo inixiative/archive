@@ -520,3 +520,29 @@ test('L2: a part naming personal beside an organization stays personal, and keep
   );
   expect(flagged.status === 'valid' && flagged.plan.parts[0]!.organizations).toEqual(['personal']);
 });
+
+test('L3: the planner sees every character it publishes; an entry too long to show whole holds its part', async () => {
+  const { store, archive } = await setup();
+  const paste = `${'Slack export line. '.repeat(600)}Grant is a liability and should be fired.${' more'.repeat(500)}`;
+  expect(paste.length).toBeGreaterThan(12_000);
+  const s = session('long', [
+    { kind: 'user', text: paste },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant', text: 'ok' },
+  ]);
+  const { id } = await store.capture(s, { cwd: '/z' });
+  const input = await store.routingInput(id, routing);
+  expect(input.entries[0]!.text).toBe(paste);
+  // An entry longer than a whole window is shown cut, so a part holding it holds.
+  const huge = session('huge', [
+    { kind: 'user', text: 'x'.repeat(301_000) },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant', text: 'ok' },
+  ]);
+  const { id: hugeId } = await store.capture(huge, { cwd: '/z' });
+  // Alone it fills the window.
+  const { model } = scripted([plan([{ from: 0, to: 0, organizations: ['userevidence'] }])]);
+  const held = await planSession(archive, model, hugeId);
+  expect(held.status).toBe('held');
+  expect(held.issues?.[0]).toContain('was not shown whole');
+});

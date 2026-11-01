@@ -129,6 +129,8 @@ export type RoutingEntry = {
   text: string;
   /** Another session's content quoted here (a message, a subagent's result): it follows that session. */
   foreign?: string;
+  /** Longer than a window, so shown cut: a part holding it holds unless it is pruned. */
+  clipped?: boolean;
   evidence?: OrganizationEvidence;
 };
 /** What the planner reads for one session: the delta since its plan, and the context around it. */
@@ -219,6 +221,7 @@ export function renderRoutingInput(input: RoutingInput) {
   for (const entry of input.entries) {
     const tags = [
       entry.foreign ? `quoted from ${entry.foreign}` : '',
+      entry.clipped ? 'cut: too long to show whole, so it cannot publish unless pruned' : '',
       entry.evidence ? `tools: ${evidenceLine(entry.evidence)}` : '',
     ].filter(Boolean);
     lines.push(
@@ -242,6 +245,8 @@ export type ValidationContext = {
   /** The first entry index the proposal plans, and the last. */
   from: number;
   through: number;
+  /** Entries the planner was shown cut: none may publish. */
+  clipped?: ReadonlySet<string>;
   /** A person's `route:` decisions: evidence for those organizations, or everything personal. */
   overrides: { organizations: ReadonlySet<string>; personal: boolean };
   children: ChildEvidence[];
@@ -341,6 +346,15 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
       issues.push(`redaction in E${r.entry} does not match the entry text byte for byte`);
     else redactions.push({ entryId: entry.id, text: r.text, reason });
   }
+  const proposedPrune = new Set(proposal.prune.map((p) => idAt(p.entry)));
+  for (const part of parts)
+    if (part.organizations.some((o) => o !== PERSONAL)) {
+      const from = entries.findIndex((e) => e.id === part.firstEntryId);
+      const to = entries.findIndex((e) => e.id === part.lastEntryId);
+      for (const entry of entries.slice(from, to + 1))
+        if (context.clipped?.has(entry.id) && !proposedPrune.has(entry.id))
+          issues.push(`part E${from}–E${to}: ${entry.id} was not shown whole to the planner`);
+    }
   if (issues.length) return { status: 'held', issues, notes };
   const prune = [...(context.prior?.prune ?? [])];
   for (const p of proposal.prune) {
