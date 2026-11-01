@@ -197,3 +197,44 @@ test('(3) echoes are redacted: case and whitespace variants, shared runs of four
   // A roster name the redactions never touched stays.
   expect(texts[3]).toBe('Grant reviewed the PR.');
 });
+
+test('P2: the roster clause fires only for coworker redactions and matches the name as written', () => {
+  const s = session('grant', [
+    { kind: 'user', text: 'I applied for a grant at UE' },
+    {
+      kind: 'assistant',
+      text: 'Issue the Signet grant to the Foundry. Revoke the grant on deletion.',
+    },
+    { kind: 'assistant', text: 'Grant broke the build again; fixed it.' },
+  ]);
+  const part = partSnapshot(
+    s,
+    {
+      firstEntryId: 'e0',
+      lastEntryId: 'e2',
+      entryIds: ['e0', 'e1', 'e2'],
+      projects: new Set(),
+      roster: ['Grant'],
+    },
+    [{ entryId: 'e0', text: 'I applied for a grant at UE', reason: 'career' }],
+  );
+  expect(part.entries[1]!.text).toBe(
+    'Issue the Signet grant to the Foundry. Revoke the grant on deletion.',
+  );
+  expect(part.entries[2]!.text).toBe('Grant broke the build again; fixed it.');
+  const coworker = partSnapshot(
+    s,
+    {
+      firstEntryId: 'e0',
+      lastEntryId: 'e2',
+      entryIds: ['e0', 'e1', 'e2'],
+      projects: new Set(),
+      roster: ['Grant'],
+    },
+    [{ entryId: 'e2', text: 'Grant broke the build again', reason: 'coworker' }],
+  );
+  expect(coworker.entries[1]!.text).toBe(
+    'Issue the Signet grant to the Foundry. Revoke the grant on deletion.',
+  );
+  expect(coworker.entries[2]!.text).not.toContain('Grant');
+});

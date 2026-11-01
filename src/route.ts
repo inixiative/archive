@@ -86,6 +86,7 @@ export const storedPlanSchema = z.strictObject({
         entryId: z.string().min(1).max(256),
         text: z.string().min(1).max(2_000),
         reason: z.enum(REDACTION_REASONS),
+        echoOnly: z.boolean().optional(),
       }),
     )
     .max(5_000),
@@ -97,6 +98,11 @@ export const storedPlanSchema = z.strictObject({
    * sticky, they never publish, and a work part over one holds.
    */
   sensitive: z.array(z.string().min(1).max(256)).max(50_000).default([]),
+  /**
+   * Entries of parts held for a redaction that failed: sticky like sensitive ones until a person
+   * reviews the plan (`route review`).
+   */
+  heldForReview: z.array(z.string().min(1).max(256)).max(50_000).default([]),
 });
 export type PlanPart = z.infer<typeof planPartSchema>;
 export type StoredPlan = z.infer<typeof storedPlanSchema>;
@@ -273,6 +279,8 @@ export type ValidationContext = {
   clipped?: ReadonlySet<string>;
   /** Sensitive entries of plans this one replaces (a rebuild's governing plan): sticky. */
   sensitive?: ReadonlySet<string>;
+  /** Entries those plans hold for review: sticky until a person reviews. */
+  held?: ReadonlySet<string>;
   /** A person's `route:` decisions: evidence for those organizations, or everything personal. */
   overrides: { organizations: ReadonlySet<string>; personal: boolean };
   children: ChildEvidence[];
@@ -316,10 +324,14 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
       context.overrides.organizations,
     );
   };
-  const stickySensitive = new Set([
+  // Sticky from earlier plans: sensitive entries (kept for good) and entries held for review
+  // (kept until a person reviews); a work part over either holds.
+  const priorSensitive = new Set([
     ...(context.sensitive ?? []),
-    ...sensitiveEntries(context.prior, entries),
+    ...sensitiveEntries(context.prior, entries, false),
   ]);
+  const priorHeld = new Set([...(context.held ?? []), ...(context.prior?.heldForReview ?? [])]);
+  const stickySensitive = new Set([...priorSensitive, ...priorHeld]);
   const parts: PlanPart[] = [];
   let previousEnd = context.from - 1;
   let continued: PlanPart | undefined;
@@ -344,9 +356,17 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
       redactions.push({ entryId: entry.id, text: r.text, reason: reason! });
       continue;
     }
+    // Its text still goes wherever an echo of it appears, in every part.
+    if (r.text && r.text.length <= 2_000)
+      redactions.push({
+        entryId: entry.id,
+        text: r.text,
+        reason: reason ?? 'other',
+        echoOnly: true,
+      });
     const holder = proposal.parts.findIndex((p) => p.from <= r.entry && r.entry <= p.to);
     if (holder >= 0 && !heldParts.has(holder)) heldParts.set(holder, problem);
-    else if (holder < 0) notes.push(`dropped: ${problem}, in no part`);
+    else if (holder < 0) notes.push(`${problem}, in no part: kept as an echo-only redaction`);
   }
   for (const [i, part] of proposal.parts.entries()) {
     const label = `part E${part.from}–E${part.to}`;
@@ -461,8 +481,14 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
     rationale: (proposal.rationale || context.prior?.rationale || '').slice(0, 1_000),
     throughEntryId: idAt(context.through)!,
     sensitive: [],
+    heldForReview: [],
   };
-  plan.sensitive = [...new Set([...stickySensitive, ...sensitiveEntries(plan, entries)])];
+  plan.sensitive = [...new Set([...priorSensitive, ...sensitiveEntries(plan, entries, false)])];
+  // A part held for a bad redaction stays personal until a person reviews the plan.
+  const held = proposal.parts.flatMap((p, i) =>
+    heldParts.has(i) ? entries.slice(p.from, p.to + 1).map((e) => e.id) : [],
+  );
+  plan.heldForReview = [...new Set([...priorHeld, ...held])];
   return { status: 'valid', plan, notes };
 }
 
@@ -521,8 +547,13 @@ export function publishedParts(
 export function sensitiveEntries(
   plan: StoredPlan | undefined,
   entries: Pick<ArchiveEntry, 'id'>[],
+  /** With the entries held for review (default): everything that may not publish yet. */
+  withHeld = true,
 ) {
-  const ids = new Set<string>(plan?.sensitive ?? []);
+  const ids = new Set<string>([
+    ...(plan?.sensitive ?? []),
+    ...(withHeld ? (plan?.heldForReview ?? []) : []),
+  ]);
   if (!plan) return ids;
   const index = new Map(entries.map((e, i) => [e.id, i]));
   for (const part of plan.parts) {

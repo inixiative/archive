@@ -13,7 +13,17 @@ export const REDACTION_REASONS = [
 ] as const;
 export type RedactionReason = (typeof REDACTION_REASONS)[number];
 /** A span of an entry, byte for byte, and why it is replaced. */
-export type Redaction = { entryId: string; text: string; reason: RedactionReason };
+/**
+ * A span of an entry, byte for byte, and why it is replaced. `echoOnly`: a redaction that failed
+ * validation (its text isn't the entry's byte for byte); its text is still removed wherever an echo
+ * of it appears, ignoring case and whitespace.
+ */
+export type Redaction = {
+  entryId: string;
+  text: string;
+  reason: RedactionReason;
+  echoOnly?: boolean;
+};
 
 /**
  * The text with every occurrence of every redaction's span replaced, the spans found on the
@@ -22,12 +32,12 @@ export type Redaction = { entryId: string; text: string; reason: RedactionReason
  */
 export function redactText(
   text: string,
-  redactions: readonly Pick<Redaction, 'text' | 'reason'>[],
+  redactions: readonly Pick<Redaction, 'text' | 'reason' | 'echoOnly'>[],
   options: { roster?: readonly string[] } = {},
 ) {
   const spans: { start: number; end: number; reasons: RedactionReason[] }[] = [];
   for (const r of redactions) {
-    if (!r.text) continue;
+    if (!r.text || r.echoOnly) continue;
     for (let at = text.indexOf(r.text); at >= 0; at = text.indexOf(r.text, at + 1))
       spans.push({ start: at, end: at + r.text.length, reasons: [r.reason] });
   }
@@ -98,10 +108,12 @@ function echoSpans(
     const run = words(r.text);
     // Any shared run of four or more words is a union of shared runs of four.
     for (let i = 0; i + 4 <= run.length; i++) find(run.slice(i, i + 4).join(' '), r.reason);
-    for (const name of roster) {
-      const named = new RegExp(`\\b${RegExp.escape(name)}\\b`, 'i');
-      if (!named.test(r.text)) continue;
-      for (const match of text.matchAll(new RegExp(`\\b${RegExp.escape(name)}\\b`, 'gi'))) {
+    // A remark about a coworker: the clause around their name, written as the roster writes it,
+    // wherever it appears. Only for coworker redactions, so a name that is also a word ("grant")
+    // never takes work text with it.
+    for (const name of r.reason === 'coworker' ? roster : []) {
+      if (!new RegExp(`\\b${RegExp.escape(name)}\\b`, 'i').test(r.text)) continue;
+      for (const match of text.matchAll(new RegExp(`\\b${RegExp.escape(name)}\\b`, 'g'))) {
         const start = Math.max(
           ...['.', '!', '?', ';', '\n'].map((b) => text.lastIndexOf(b, match.index) + 1),
         );

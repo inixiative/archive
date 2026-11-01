@@ -368,3 +368,21 @@ Ground truth: `4d15438`. `bun run typecheck` passes. `bun run lint` reports 0 er
 - **G1/G2 still hold (probe 3).** The reviewed copy is kept, and still kept after the session grows. The tool-activity copy and the redacted copy are deleted.
 - **`allowedOrganizations` doesn't widen.** It computes the same set the old inline code did (range evidence plus start organization, subagents spawned in the range, a person's `route:` organizations, never personal). `validatePlan` calls it per range, exactly as before. `planSession` calls it over the whole session, which is broader, but only to skip the model call. A broader set can only send a session to the model instead of holding it, never publish more.
 - **The mid-rebuild decision doesn't widen.** I didn't probe this one; this is from reading the code. A `route:` change during a rebuild re-applies the decision to the governing plan under the governing plan's key, and `rebuild` is kept so the rebuild resumes afterwards. Any new entries in that pass are validated the usual way against the governing plan. A held attempt clears `rebuild`, so the rebuild starts again; that is safe.
+
+---
+
+## PR #35 gate (2026-11-01, `fix/planner-robustness`, `7a6594f`, `308a928`)
+
+**Verdict: BLOCK on P1.** P2 should be fixed in the same PR.
+
+Ground truth: `308a928`. `bun run typecheck` passes. `bun run lint` reports 0 errors. `bun test` passed 179 of 179 against a throwaway Postgres on random port 32516, never 6132. The probe is `probe/pr35.ts` in the session scratchpad; it calls `validatePlan`, `publishedParts` and `redactText` directly.
+
+- **P1, blocking: a part held for a bad redaction leaks through its neighbour (proven).** The bad redaction is dropped (`route.ts:347`), so the echo redaction in other parts has nothing to echo.
+  **Probe:** part E0–E2 goes to UE, with the redaction misquoted in case (`vlad deleted my work again` against `Vlad deleted…`); part E3–E5 goes to UE. The plan is **valid**: E0–E2 is held personal, and E3–E5 publishes `sorry vlad deleted your work again, ported anyway` **unredacted**. With the redaction quoted correctly, the echo in E4 is caught (`[redacted: coworker]`). Before this PR the whole plan held, so this widens what publishes.
+  Fix: keep a failed redaction's text as an echo-only redaction for every other part (its normalized and 4-word forms), or hold every part containing such an echo. A failed redaction "in no part" has the same gap.
+- **P2, should fix: the roster clause over-redacts work text.** A redaction whose text contains a roster name as a plain word fires the clause rule, case-insensitively, for every clause containing that word (`parts.ts:101-115`).
+  **Probe:** with the roster `Grant` and the career redaction "I applied for a grant at UE", the text `Issue the Signet grant to the Foundry. Revoke the grant on deletion.` becomes all markers. "grant" is core vocabulary in these repos. Fix: match the name case-sensitively, as written in the roster, and only for `coworker` redactions.
+- **Echo redaction otherwise only removes text.** Spans come from the original text, are merged, and each is replaced by a marker, so nothing can widen and nothing can be silently inverted. Minor: a 4-word run of common phrasing ("I think we should") is cut wherever it appears (`[redacted: career] not merge the lock change`). A `.` inside a filename ends a clause early (`Vlad (see notes.md) deleted my work` leaves `.md) deleted my work`), but the exact span still applies wherever the redacted text appears byte for byte.
+- **Held part via a continuation or a subagent: no leak.** Parts are disjoint. A held part can't continue (`!held`), and the next plan's continuation requires the same organizations as a personal last part. A subagent spawned in the held part gets an empty reach at its spawn (`planReach`) and stays personal.
+  Two caveats. A held part is personal but not sticky, so a rebuild or `route reset` can route it with no redaction. And its review signal is the `held part` note, which the next delta's `notes` overwrite. Mark held parts sensitive (sticky) until reviewed.
+- **(1) `organizations: []` means personal.** No widening: it maps to `[PERSONAL]` before the evidence and `unsure` checks.

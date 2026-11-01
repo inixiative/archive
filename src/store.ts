@@ -2119,7 +2119,12 @@ export class ArchiveStore {
       children: context.children,
       ...(context.parentReach ? { parentReach: context.parentReach } : {}),
       foreign: context.foreign,
-      ...(rebuilding && governing ? { sensitive: sensitiveEntries(governing, entries) } : {}),
+      ...(rebuilding && governing
+        ? {
+            sensitive: sensitiveEntries(governing, entries, false),
+            held: new Set(governing.heldForReview),
+          }
+        : {}),
     });
     if (result.status === 'held') return { ...(await hold(result.issues, result.notes)), holds };
     // A re-plan keeps the decisions of the plan it replaces: its prunes, redactions and sensitive
@@ -2290,7 +2295,7 @@ export class ArchiveStore {
       const confidence = plan?.parts.length ? Math.min(...plan.parts.map((p) => p.confidence)) : 1;
       const redactions = plan?.redactions.length ?? 0;
       // A part held for a bad redaction keeps the plan valid but needs a person.
-      const heldPart = row.notes.some((n) => n.startsWith('held part'));
+      const heldPart = Boolean(plan?.heldForReview.length);
       const due =
         row.status === 'held' ||
         (row.reviewedAt === null && (redactions > 0 || confidence < 0.6 || heldPart));
@@ -2469,11 +2474,25 @@ export class ArchiveStore {
   }
   /** A person read this plan; it leaves the review queue until it changes. */
   async reviewPlan(archiveId: string, now = Date.now()) {
-    return (
-      (await this.db.routingPlan.updateMany({ where: { archiveId }, data: { reviewedAt: now } }))
-        .count > 0
-    );
+    // Reviewed: entries held for a bad redaction may be planned again.
+    const row = await this.db.routingPlan.findUnique({
+      where: { archiveId },
+      select: { plan: true },
+    });
+    if (!row) return false;
+    const plan = row.plan ? storedPlanSchema.parse(row.plan) : undefined;
+    await this.db.routingPlan.update({
+      where: { archiveId },
+      data: {
+        reviewedAt: now,
+        ...(plan?.heldForReview.length
+          ? { plan: { ...plan, heldForReview: [] } as Prisma.InputJsonValue }
+          : {}),
+      },
+    });
+    return true;
   }
+
   /**
    * A person drops a session's plan, its sticky decisions with it: the session is planned afresh.
    * Its parts stand until the next plan replaces them.
