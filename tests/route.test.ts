@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { publishArchive } from '../src/client';
 import type { Routing } from '../src/config';
 import { quotedOrigins } from '../src/import';
 import { type ArchiveEntry, archiveKey, archiveSnapshotSchema } from '../src/index';
@@ -1380,4 +1381,135 @@ test('hold on detect: a span the sensitivity pass finds holds the part too; in a
   const text = (await redact.store.read(part!.id))!.snapshot.entries.map((e) => e.text).join('\n');
   expect(text).toContain('Fix zealot');
   expect(text).not.toContain('day job');
+});
+
+test('Q1: in hold mode a part carrying personal-only talk holds on every record, prior parts included; switching the mode makes plans due', async () => {
+  const { store } = await setup();
+  const s = session('switched', [
+    { kind: 'user', text: 'Fix zealot. Vlad deleted my work again' },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant', text: 'Fixed' },
+  ]);
+  const { id } = await store.capture(s, { cwd: '/z' });
+  const record = async (config: Routing, proposal: ProposedPlan) => {
+    const input = await store.routingInput(id, config, 'k');
+    return store.recordPlan(
+      {
+        archiveId: id,
+        digest: input.digest,
+        through: input.through,
+        key: 'k',
+        by: 'claude-sonnet-5-5',
+        proposal,
+      },
+      config,
+    );
+  };
+  // Recorded under `redact`: the part publishes to UE with the remark redacted.
+  await record(
+    redacting,
+    plan([{ from: 0, to: 1, organizations: ['userevidence'] }], {
+      redactions: [{ entry: 0, text: 'Vlad deleted my work again', reason: 'coworker' }],
+    }),
+  );
+  expect((await parts(store))[0]?.routedTo).toEqual(['userevidence']);
+  // The switch to `hold` changes the context key, so the plan is due to re-validate.
+  expect(await store.routingContextKey(routing)).not.toBe(await store.routingContextKey(redacting));
+  // Re-applied under `hold` with nothing new: the prior part, which carries the coworker
+  // redaction, is held for review and publishes nowhere.
+  expect(await record(routing, plan([]))).toMatchObject({ status: 'valid' });
+  expect((await parts(store))[0]?.routedTo ?? []).toEqual([]);
+  const stored = await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } });
+  expect(storedPlanSchema.parse(stored.plan).heldForReview.length).toBeGreaterThan(0);
+});
+
+test('Q2: a part the sensitivity pass holds is sticky: a later plan without the pass cannot route it', async () => {
+  for (const [answer, sensitive] of [
+    ['{"hold": true, "redactions": []}', true],
+    ['not json', false],
+  ] as const) {
+    const { store, archive } = await setup();
+    const s = session(`pass-held-${sensitive}`, [
+      { kind: 'user', text: 'Fix zealot please' },
+      call({ file_path: '/z/a.ts' }),
+      { kind: 'assistant', text: 'Fixed' },
+    ]);
+    const { id } = await store.capture(s, { cwd: '/z' });
+    const ue = plan([{ from: 0, to: 1, organizations: ['userevidence'] }]);
+    const held = scripted([ue], [answer]);
+    expect((await planSession(archive, held.model, id)).parts ?? []).toEqual([]);
+    const row = await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } });
+    const stored = storedPlanSchema.parse(row.plan);
+    expect(stored.heldForReview.length).toBeGreaterThan(0);
+    // An explicit hold is sensitive (kept for good); an unreadable answer waits for review.
+    expect(stored.sensitive.length > 0).toBe(sensitive);
+    // A reset-free rebuild under a new model, run without the pass, proposes UE again: it holds.
+    const again = scripted([ue]);
+    const replanned = await planSession(archive, { ...again.model, model: 'claude-sonnet-6' }, id, {
+      sensitivity: false,
+    });
+    expect(replanned.parts ?? []).toEqual([]);
+    expect((await parts(store)).flatMap((p) => p.routedTo)).toEqual([]);
+  }
+});
+
+test('Q3: with publish on, a part publishes only when its plan records that the sensitivity pass ran', async () => {
+  const destination = {
+    kind: 'archive' as const,
+    organizationId: 'userevidence',
+    url: 'http://127.0.0.1:9/',
+    tokenEnv: 'ARCHIVE_Q3_TEST_TOKEN',
+  };
+  process.env.ARCHIVE_Q3_TEST_TOKEN = 'test-token';
+  const live: Routing = { ...routing, publish: 'on', destinations: [destination] };
+  for (const sensitivity of [false, true]) {
+    const store = await freshStore();
+    await store.updateSettings({ captureToolCallsAndResults: false });
+    await store.setProjectMap(map);
+    const archive: RoutingArchive = {
+      routingInput: (body) => store.routingInput(body.archiveId, live, body.key),
+      recordPlan: (body) => store.recordPlan(body, live),
+      routingDue: (body) => store.routingDue(body),
+    };
+    const { id } = await store.capture(
+      session(`checked-${sensitivity}`, [
+        { kind: 'user', text: 'Fix zealot please' },
+        call({ file_path: '/z/a.ts' }),
+        { kind: 'assistant', text: 'Fixed' },
+      ]),
+      { cwd: '/z' },
+    );
+    const { model } = scripted([plan([{ from: 0, to: 1, organizations: ['userevidence'] }])]);
+    await planSession(archive, model, id, { sensitivity });
+    const [part] = await store.list({ exempt: 'include', parts: 'only' });
+    expect(part?.routedTo).toEqual(['userevidence']);
+    const sent = publishArchive(store, part!.id, destination, live, (async () => {
+      throw new Error('reached the destination');
+    }) as unknown as typeof fetch);
+    await expect(sent).rejects.toThrow(
+      sensitivity ? /reached the destination/ : /sensitivity pass/,
+    );
+  }
+});
+
+test('the pass fails closed when the pre-check returns no snapshots', async () => {
+  const { store, archive } = await setup();
+  const { id } = await store.capture(
+    session('no-snapshots', [
+      { kind: 'user', text: 'Fix zealot please' },
+      call({ file_path: '/z/a.ts' }),
+      { kind: 'assistant', text: 'Fixed' },
+    ]),
+    { cwd: '/z' },
+  );
+  const blind: RoutingArchive = {
+    ...archive,
+    recordPlan: async (body) => {
+      const result = await archive.recordPlan(body);
+      return body.preview ? { ...result, snapshots: undefined } : result;
+    },
+  };
+  const { model } = scripted([plan([{ from: 0, to: 1, organizations: ['userevidence'] }])]);
+  await expect(planSession(blind, model, id)).rejects.toThrow();
+  expect(await parts(store)).toEqual([]);
 });

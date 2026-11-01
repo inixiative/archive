@@ -136,9 +136,19 @@ test('the router is a unit beside the collectors when declared, with the Claude 
     '/opt/claude',
     '--concurrency',
     '3',
+    // A wake plans at most this many sessions, so a large due set spreads across wakes.
+    '--limit',
+    '30',
     '--home',
     '/h',
   ]);
+  const [capped] = agentUnits(
+    { collectors: [], router: { limit: 50 } },
+    { home: '/h', execPath: '/bun', cliPath: '/cli.ts', claudeBin: '/opt/claude' },
+  );
+  expect(
+    capped?.args.slice(capped.args.indexOf('--limit'), capped.args.indexOf('--limit') + 2),
+  ).toEqual(['--limit', '50']);
   expect(agentUnits({ collectors: [] }, { home: '/h' })).toEqual([]);
 });
 

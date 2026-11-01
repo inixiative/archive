@@ -142,6 +142,9 @@ export async function publishArchive(
     throw new Error('Archive is outside the destination organization');
   // A raw capture its driver later stored itself stays local: the driver's version is the one that travels.
   if (archive.supersededBy) return { unchanged: true };
+  // Only a part whose plan the sensitivity pass checked publishes, whichever client recorded it.
+  if (!(await store.sensitivityChecked(id)))
+    throw new Error('Not checked by the sensitivity pass: its plan records no check');
   const receiptKey = destinationIdentity(destination);
   let sent = false;
   for (let attempt = 0; attempt < 8; attempt++) {
@@ -272,8 +275,21 @@ export async function syncArchives(
     routing.publish === 'on' && !options.dryRun
       ? await store.list({ exempt: 'include', parts: 'include' })
       : [];
-  for (const archive of archives)
-    for (const destination of sessionDestinations(routing, archive)) {
+  for (const archive of archives) {
+    const destinations = sessionDestinations(routing, archive);
+    // Parts the sensitivity pass didn't check wait, rather than fail and back off.
+    if (destinations.length && !(await store.sensitivityChecked(archive.id))) {
+      for (const destination of destinations) {
+        seen.add(JSON.stringify([archive.id, destinationIdentity(destination)]));
+        results.push({
+          id: archive.id,
+          destination: destination.url,
+          status: 'held: not checked by the sensitivity pass',
+        });
+      }
+      continue;
+    }
+    for (const destination of destinations) {
       const identity = destinationIdentity(destination);
       const key = JSON.stringify([archive.id, identity]);
       const down = JSON.stringify(['destination', identity]);
@@ -319,6 +335,7 @@ export async function syncArchives(
         });
       }
     }
+  }
   // What a destination holds from this Archive that routing doesn't send there goes (`copiesToKeep`):
   // a part a re-plan dropped, moved or superseded, every whole-session copy (bar a whole-routed
   // one under `cleanup: leaked` with publishing off), and copies whose session was deleted here.

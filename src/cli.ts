@@ -160,7 +160,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         "settings [--capture-tool-calls-and-results true|false] [--capture-run-sessions true|false] [--retention-days N|off]   (read, or change, this Archive's settings)\n" +
         'maintenance status | maintenance reclaim   (compaction left to do and table sizes; return freed space to the OS once compaction is done)\n' +
         'agents add-collector --name N --source codex|claude-code (--project-id ID --project-root DIR [--project-root ...] [--worktrees] [--subdirectories] [--former-root DIR ...] | --catch-all) [--directory HISTORY] [--atlas]   (former roots: where the checkouts used to live, for evidence only)\n' +
-        'agents router [--concurrency N] | agents router off   (install the routing scheduler beside the collectors)\n' +
+        'agents router [--concurrency N] [--limit N] | agents router off   (install the routing scheduler beside the collectors; --limit caps the sessions a wake plans, default 30)\n' +
         'agents remove-collector --name N | folders [--include GLOB ...] [--exclude GLOB ...] | server --url URL | install | uninstall | status\n' +
         `Data commands talk to the Archive server at --url (default ${DEFAULT_URL}) with the token in --token-file (default <home>/server.token) or ARCHIVE_TOKEN.\n`,
     );
@@ -443,10 +443,12 @@ export async function runCli(args = Bun.argv.slice(2)) {
             ? rest
             : {
                 ...rest,
-                router:
-                  v.concurrency !== '2'
+                router: {
+                  ...(v.concurrency !== '2'
                     ? { concurrency: whole(v.concurrency!, 'concurrency', 8) }
-                    : {},
+                    : {}),
+                  ...(v.limit ? { limit: whole(v.limit, 'limit', 10_000) } : {}),
+                },
               },
         ),
       );

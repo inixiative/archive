@@ -27,6 +27,7 @@ import {
 } from './index';
 import { partSnapshot } from './parts';
 import {
+  holdPersonalTalk,
   PERSONAL,
   planReach,
   publishedParts,
@@ -37,6 +38,7 @@ import {
   type RoutingInput,
   type StoredPlan,
   sensitiveEntries,
+  sensitivityKey,
   storedPlanSchema,
   validatePlan,
 } from './route';
@@ -2105,6 +2107,10 @@ export class ArchiveStore {
     const result = validatePlan(body.proposal, {
       entries,
       routing,
+      // The client's word that the pass ran, under this charter and the model it planned with.
+      ...(body.checked && body.checked === sensitivityKey(body.by)
+        ? { checked: body.checked }
+        : {}),
       ...(context.map ? { map: context.map } : {}),
       evidence: context.evidence,
       ...(prior ? { prior } : {}),
@@ -2142,6 +2148,8 @@ export class ArchiveStore {
           ]),
         ).values(),
       ];
+      // The governing plan's personal-only redactions hold the rebuilt parts that carry them.
+      result.notes.push(...holdPersonalTalk(result.plan, entries, routing));
     }
     const sticky = sensitiveEntries(result.plan, entries);
     // Until the re-plan reaches the last entry, it is stored aside and the old plan governs.
@@ -2438,7 +2446,10 @@ export class ArchiveStore {
   }
   /** What a plan is validated under: the organizations and the project map. */
   async routingContextKey(routing: Routing) {
-    return digest(JSON.stringify([routing.organizations, await this.projectMapKey()])).slice(0, 32);
+    // `personalSpans` too: a switch between hold and redact re-validates every plan's parts.
+    return digest(
+      JSON.stringify([routing.organizations, routing.personalSpans, await this.projectMapKey()]),
+    ).slice(0, 32);
   }
   /** Marks the plans of a session's parent and subagents due: a change to its plan moves theirs. */
   private async markRelatedDue(tx: Prisma.TransactionClient, archiveId: string) {
@@ -2472,6 +2483,23 @@ export class ArchiveStore {
       where: { archiveId: { in: related }, due: null },
       data: { due: 'related' },
     });
+  }
+  /**
+   * Whether a part may publish as far as the sensitivity pass goes: its session's plan records
+   * that the pass checked every window, under the pass's current charter and the plan's model.
+   */
+  async sensitivityChecked(partId: string) {
+    const row = await this.db.archive.findUnique({
+      where: { id: partId },
+      select: { partOf: true },
+    });
+    if (!row?.partOf) return false;
+    const source = await this.db.routingPlan.findUnique({
+      where: { archiveId: row.partOf },
+      select: { plan: true, by: true },
+    });
+    if (!source?.plan) return false;
+    return storedPlanSchema.parse(source.plan).checked === sensitivityKey(source.by);
   }
   /**
    * A person read this plan; it leaves the review queue until it changes. Entries held for a bad

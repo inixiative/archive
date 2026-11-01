@@ -46,7 +46,7 @@ Respond with JSON only:
 /** Plans are due again when the charter or model change. */
 export const routeKey = (model: string) =>
   createHash('sha256')
-    .update(JSON.stringify([ROUTE_PROMPT, ROUTE_BASE_INSTRUCTIONS, model]))
+    .update(JSON.stringify([ROUTE_PROMPT, ROUTE_BASE_INSTRUCTIONS, SENSITIVITY_PROMPT, model]))
     .digest('hex')
     .slice(0, 32);
 
@@ -104,6 +104,11 @@ export const storedPlanSchema = z.strictObject({
    * reviews the plan (`route review`).
    */
   heldForReview: z.array(z.string().min(1).max(256)).max(50_000).default([]),
+  /**
+   * `sensitivityKey` when the sensitivity pass checked every window of this plan; with publishing
+   * on, only a checked plan's parts publish.
+   */
+  checked: z.string().min(1).max(64).optional(),
 });
 export type PlanPart = z.infer<typeof planPartSchema>;
 export type StoredPlan = z.infer<typeof storedPlanSchema>;
@@ -118,6 +123,11 @@ export const proposedPlanSchema = z.object({
         /** Empty means personal. */
         organizations: z.array(z.string()).max(50),
         sensitive: z.boolean().optional(),
+        /**
+         * Set by the sensitivity pass: `personal` (it said hold) keeps the part personal and
+         * sensitive for good; `unreadable` (no answer it could read) keeps it held for review.
+         */
+        held: z.enum(['personal', 'unreadable']).optional(),
         continues: z.boolean().optional(),
         confidence: z.number().min(0).max(1).optional(),
         why: z.string().max(2_000).optional(),
@@ -291,6 +301,8 @@ export type ValidationContext = {
   parentReach?: ReadonlySet<string>;
   /** Entries quoting another session, and where that session's plan lets them go (null: unknown). */
   foreign: ReadonlyMap<string, ReadonlySet<string> | null>;
+  /** `sensitivityKey` when the sensitivity pass checked this proposal. */
+  checked?: string;
 };
 export type ValidationResult =
   | { status: 'valid'; plan: StoredPlan; notes: string[] }
@@ -382,6 +394,14 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
     if (holder >= 0 && !heldParts.has(holder)) heldParts.set(holder, problem);
     else if (holder < 0) notes.push(`${problem}, in no part: kept as an echo-only redaction`);
   }
+  for (const [i, part] of proposal.parts.entries())
+    if (part.held && !heldParts.has(i))
+      heldParts.set(
+        i,
+        part.held === 'personal'
+          ? 'the sensitivity pass held it as personal'
+          : 'the sensitivity pass could not check it',
+      );
   for (const [i, part] of proposal.parts.entries()) {
     const label = `part E${part.from}–E${part.to}`;
     if (part.from > part.to || !inWindow(part.from) || !inWindow(part.to)) {
@@ -411,7 +431,7 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
       firstEntryId: idAt(part.from)!,
       lastEntryId: idAt(part.to)!,
       organizations: unsure ? [PERSONAL] : organizations.filter((o) => known.has(o)),
-      sensitive: Boolean(part.sensitive),
+      sensitive: Boolean(part.sensitive) || part.held === 'personal',
       confidence: part.confidence ?? 0.5,
       rationale: (part.why ?? '').slice(0, 500),
     };
@@ -503,7 +523,47 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
     heldParts.has(i) ? entries.slice(p.from, p.to + 1).map((e) => e.id) : [],
   );
   plan.heldForReview = [...new Set([...priorHeld, ...held])];
+  notes.push(...holdPersonalTalk(plan, entries, context.routing));
+  // Checked only when every window was: the prior plan's, if there is one, and this one.
+  if (context.checked && (!context.prior || context.prior.checked === context.checked))
+    plan.checked = context.checked;
   return { status: 'valid', plan, notes };
+}
+
+/**
+ * With `personalSpans: hold`, a part to an organization that carries a personal-only redaction
+ * (career, investor, coworker), from this plan or any before it, goes personal and its entries to
+ * review. Runs on every record and re-apply, so a plan made under `redact` or before hold existed
+ * can't keep such a part routed. Returns its notes; changes `plan` in place.
+ */
+export function holdPersonalTalk(
+  plan: StoredPlan,
+  entries: Pick<ArchiveEntry, 'id'>[],
+  routing: Routing,
+) {
+  if (routing.personalSpans !== 'hold') return [];
+  const notes: string[] = [];
+  const index = new Map(entries.map((e, i) => [e.id, i]));
+  const talk = plan.redactions.filter((r) => PERSONAL_ONLY_REASONS.includes(r.reason));
+  const held = new Set(plan.heldForReview);
+  plan.parts = plan.parts.map((part) => {
+    if (part.organizations.every((o) => o === PERSONAL)) return part;
+    const from = index.get(part.firstEntryId);
+    const to = index.get(part.lastEntryId);
+    if (from === undefined || to === undefined) return part;
+    const found = talk.find((r) => {
+      const at = index.get(r.entryId);
+      return at !== undefined && at >= from && at <= to;
+    });
+    if (!found) return part;
+    notes.push(
+      `held part ${part.firstEntryId}–${part.lastEntryId}: it holds ${found.reason} talk, personal for every organization`,
+    );
+    for (const e of entries.slice(from, to + 1)) held.add(e.id);
+    return { ...part, organizations: [PERSONAL] };
+  });
+  plan.heldForReview = [...held];
+  return notes;
 }
 
 const dedupe = <T>(items: T[], key: (item: T) => string) => [
@@ -623,6 +683,8 @@ export type RecordPlanBody = {
    * subagent before anything is stored. Ignored when the plan is applied.
    */
   assumeParentReach?: string[];
+  /** `sensitivityKey` when the sensitivity pass checked this proposal (`planSession` sets it). */
+  checked?: string;
 };
 export type RecordPlanResult = {
   status: 'valid' | 'held' | 'stale';
@@ -670,6 +732,13 @@ export const sensitivityContext = (organizations: RoutingInput['organizations'])
     .map((o) => `- ${o.id}${o.roster.length ? `: coworkers ${o.roster.join(', ')}` : ''}`)
     .join('\n')}`;
 
+/** The sensitivity pass's charter and model, hashed: what a plan records when the pass ran. */
+export const sensitivityKey = (model: string) =>
+  createHash('sha256')
+    .update(JSON.stringify([SENSITIVITY_PROMPT, model]))
+    .digest('hex')
+    .slice(0, 32);
+
 /**
  * A second pass over a validated proposal: for each part that would publish to an organization,
  * a separate call reads that part's new entries, its organizations and their coworkers, and returns
@@ -684,8 +753,13 @@ async function sensitivityPass(
 ) {
   const tokens: Required<TokenUsage> = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   const pre = await archive.recordPlan({ ...body, dryRun: true, preview: true });
-  if (pre.status !== 'valid' || !pre.parts || !pre.snapshots)
+  // A proposal that doesn't validate (or a session that moved) publishes nothing when recorded.
+  if (pre.status !== 'valid')
     return { proposal: body.proposal, tokens, calls: 0, held: 0, unreadable: 0 };
+  // A valid pre-check always carries its parts as they would publish; without them the pass
+  // can't check anything, so nothing is recorded.
+  if (!pre.parts || !pre.snapshots || pre.snapshots.length !== pre.parts.length)
+    throw new Error('The sensitivity pass got no parts to check');
   const shown = new Map(input.entries.map((e) => [e.id, e]));
   const proposal: ProposedPlan = {
     ...body.proposal,
@@ -702,11 +776,13 @@ async function sensitivityPass(
     const holder = proposal.parts.find(
       (p) => p.from <= entries[0]!.index && entries[0]!.index <= p.to,
     );
-    const hold = () => {
-      if (holder) {
-        holder.organizations = [];
-        holder.continues = false;
-      }
+    // Every part the pre-check publishes comes from a proposal part; one that doesn't can't be held.
+    if (!holder) throw new Error('The sensitivity pass found no proposal part to hold');
+    const hold = (why: 'personal' | 'unreadable') => {
+      holder.organizations = [];
+      holder.continues = false;
+      // `personal` outranks `unreadable` when two checks fall in one proposal part.
+      if (holder.held !== 'personal') holder.held = why;
     };
     calls++;
     let answer: { hold?: unknown; redactions?: unknown } | undefined;
@@ -754,14 +830,14 @@ async function sensitivityPass(
           }
         : undefined;
     });
-    if (!answer || answer.hold === true) {
+    if (answer?.hold === true) {
       held++;
-      hold();
+      hold('personal');
       continue;
     }
-    if (answer.hold !== false || read.some((r) => r === undefined)) {
+    if (!answer || answer.hold !== false || read.some((r) => r === undefined)) {
       unreadable++;
-      hold();
+      hold('unreadable');
       continue;
     }
     for (const r of read) if (r) proposal.redactions.push(r);
@@ -785,7 +861,16 @@ export async function planSession(
 > {
   const key = routeKey(model.model);
   const input = await archive.routingInput({ archiveId, key });
-  const base = { archiveId, digest: input.digest, through: input.through, key, by: model.model };
+  // The sensitivity pass is on unless turned off; every record it covers says so.
+  const { sensitivity = true, ...recordOptions } = options;
+  const base = {
+    archiveId,
+    digest: input.digest,
+    through: input.through,
+    key,
+    by: model.model,
+    ...(sensitivity ? { checked: sensitivityKey(model.model) } : {}),
+  };
   // Nothing could reach an organization: no evidence, start directory, person's decision or
   // subagent for one. It holds as it is, and no tokens are spent on it.
   // The validator's own predicate, over the whole session.
@@ -801,7 +886,7 @@ export async function planSession(
       ...(await archive.recordPlan({
         ...base,
         failure: 'no evidence for any organization',
-        ...options,
+        ...recordOptions,
       })),
       input,
     };
@@ -809,7 +894,7 @@ export async function planSession(
     if (!input.prior) return { status: 'stale', input };
     // No new entries, yet due: a person's decision changed, so the plan is re-applied under it.
     const proposal = { parts: [], prune: [], redactions: [], rationale: '' };
-    return { ...(await archive.recordPlan({ ...base, proposal, ...options })), input };
+    return { ...(await archive.recordPlan({ ...base, proposal, ...recordOptions })), input };
   }
   let content: string;
   let tokens: TokenUsage | undefined;
@@ -827,10 +912,8 @@ export async function planSession(
       0,
       500,
     );
-    return { ...(await archive.recordPlan({ ...base, failure, ...options })), input };
+    return { ...(await archive.recordPlan({ ...base, failure, ...recordOptions })), input };
   }
-  // The sensitivity pass is on unless turned off.
-  const { sensitivity = true, ...recordOptions } = options;
   let proposal = parsePlan(content);
   let calls = 1;
   let sensitivityReport:

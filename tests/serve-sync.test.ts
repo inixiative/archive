@@ -10,6 +10,7 @@ import {
   readRouting,
 } from '../src/config';
 import { archiveSnapshotSchema } from '../src/index';
+import { sensitivityKey } from '../src/route';
 import { startArchiveServer } from '../src/server';
 import { freshStore, MIGRATED_DATABASE, testDatabaseUrl } from './db';
 import { routing } from './routing';
@@ -97,6 +98,8 @@ test('serve --sync publishes what it receives to its destinations from the same 
       through: input.through,
       key: 'k',
       by: 'test',
+      // Checked by the sensitivity pass, or it would never publish.
+      checked: sensitivityKey('test'),
       proposal: { parts: [{ from: 0, to: 0, organizations: ['inixiative'] }] },
     });
     expect(recorded.status).toBe('valid');
@@ -183,6 +186,7 @@ test('routes and sync run against the Archive server of the home, without DATABA
         through: 0,
         key: 'k',
         by: 'test',
+        checked: sensitivityKey('test'),
         proposal: {
           parts: [{ from: 0, to: 0, organizations: ['inixiative'] }],
           prune: [],
