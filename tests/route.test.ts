@@ -33,6 +33,7 @@ const routing: Routing = {
   ],
   destinations: [],
   publish: 'off',
+  cleanup: 'leaked',
 };
 const call = (input: object, name = 'Edit') => ({
   kind: 'tool-call' as const,

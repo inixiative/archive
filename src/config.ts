@@ -79,6 +79,13 @@ export const routingSchema = z
      * publishes to an organization. `on`: parts publish, and re-plans delete what they drop.
      */
     publish: z.enum(['off', 'on']).default('off'),
+    /**
+     * Which whole-session copies sync deletes while publishing is off. `leaked` (the default)
+     * keeps one only where the session's current valid plan sends the whole session to that
+     * organization unredacted and unpruned; `all` deletes every whole copy. With publishing on,
+     * every whole copy goes (parts carry the work).
+     */
+    cleanup: z.enum(['all', 'leaked']).default('leaked'),
   })
   .superRefine((routing, ctx) => {
     const ids = routing.organizations.map((o) => o.id);
@@ -93,7 +100,12 @@ export const routingSchema = z
   });
 export type Routing = z.output<typeof routingSchema>;
 export type Organization = z.infer<typeof organizationSchema>;
-const noRouting = (): Routing => ({ organizations: [], destinations: [], publish: 'off' });
+const noRouting = (): Routing => ({
+  organizations: [],
+  destinations: [],
+  publish: 'off',
+  cleanup: 'leaked',
+});
 
 /** Private regular file owned by this user; a symlink or group/world access is refused. */
 export function readTokenFile(path: string) {

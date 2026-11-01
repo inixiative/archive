@@ -406,6 +406,7 @@ test('token files: exactly one credential source, private regular file, read at 
         { organizationId: 'p', url: instance.server.url.href, tokenFile: file, kind: 'archive' },
       ],
       publish: 'off',
+      cleanup: 'leaked',
     });
   } finally {
     await instance.close();

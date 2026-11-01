@@ -127,3 +127,15 @@ A dry run plans the first window of a long session only (nothing is stored to co
 | Scheduler | one window a pass (`partial`), timeout 300 s from a measured window, due rows only, worktrees outside `projectMapKey` |
 
 Not done: S7 (asserting which account the default login is) and S8 (destination upgrades, Kingdom `sessions.delete`), which are operational.
+
+## Re-review fixes (2026-11-01)
+
+| Finding | Fix |
+|---|---|
+| R1 | the clip check runs on a continuing part |
+| R2 | a deleted or pruned session's tombstone keeps the destinations that held it (`pending`) until each confirms; a refusal (an old Kingdom pairing's 403) stays queued; a session that comes back gets them as receipts |
+| R3 | sync reconciles each destination's own listing of this `sourceId` every ten minutes (direct Archives page `list`; Kingdom's `documents.read` has no source or paging, so only ids this Archive knows are taken) and deletes what `copiesToKeep` doesn't keep; another Archive's copies are never touched |
+| cleanup | `routing.cleanup: all \| leaked` (default `leaked`): with publishing off, a whole copy is kept only where the current valid plan sends the whole session there unredacted and unpruned |
+| quote regression | an unclosed quoting tag is `unknown` to the end of the entry |
+| guard | `publishArchive` refuses while `routing.publish` is off |
+| `.pending-*` | the run sweep removes them |

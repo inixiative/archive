@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { z } from 'zod';
-import { destinationIdentity, type Routing } from './config';
+import { destinationIdentity, type Routing, sessionOrganizations } from './config';
 import {
   evidenceByOrganization,
   evidencedOrganizations,
@@ -321,6 +321,8 @@ export class ArchiveStore {
           throw new ArchiveConflict('Revision conflict');
         if (old && old.capturedAt > incoming.capturedAt) throw new ArchiveConflict('Stale capture');
         if (tombstone) await tx.archiveTombstone.delete({ where: { id } });
+        // A session that comes back still owes its old copies' deletes: they return as receipts.
+        const owed = tombstone?.pending ?? [];
         const stripped = stripOf();
         const { snapshot } = stripped;
         const changed = stripped.changed || unlifted !== incoming;
@@ -363,6 +365,15 @@ export class ArchiveStore {
           ...evidenceFields(evidenceOf(snapshot)),
         };
         await writeRevision(tx, id, snapshot, fields, old?.revision);
+        if (owed.length)
+          await tx.receipt.createMany({
+            data: [...new Set(owed)].map((destination) => ({
+              archiveId: id,
+              destination,
+              digest: '',
+            })),
+            skipDuplicates: true,
+          });
         // New content makes its plan due (the scheduler decides when).
         await tx.routingPlan.updateMany({
           where: { archiveId: id, due: null },
@@ -835,13 +846,94 @@ export class ArchiveStore {
    * revision go, and a retired part no destination holds any more is deleted here.
    */
   async forgetDelivery(id: string, destination: string) {
-    await this.db.$transaction([
-      this.db.receipt.deleteMany({ where: { archiveId: id, destination } }),
-      this.db.outbox.deleteMany({ where: { archiveId: id, destination } }),
-    ]);
+    await this.db.$transaction(async (tx) => {
+      await tx.receipt.deleteMany({ where: { archiveId: id, destination } });
+      await tx.outbox.deleteMany({ where: { archiveId: id, destination } });
+      const tombstone = await tx.archiveTombstone.findUnique({
+        where: { id },
+        select: { pending: true },
+      });
+      if (tombstone?.pending.includes(destination))
+        await tx.archiveTombstone.update({
+          where: { id },
+          data: { pending: tombstone.pending.filter((d) => d !== destination) },
+        });
+    });
     await this.db.archive.deleteMany({
       where: { id, partOf: { not: null }, routedTo: { isEmpty: true }, receipts: { none: {} } },
     });
+  }
+  /**
+   * Which of these copies a destination of `organizationId` may keep; every other id this Archive
+   * knows (`ids` are this Archive's own) goes:
+   * - a part, while its plan routes it there and it isn't superseded;
+   * - a whole session, only with publishing off, `cleanup: leaked`, and a current valid plan that
+   *   sends the whole session there unredacted and unpruned (its one part holds every entry);
+   * - an id with no row here (deleted, or never kept): never.
+   */
+  async copiesToKeep(ids: string[], organizationId: string, routing: Routing) {
+    const keep = new Set<string>();
+    const rows = await this.db.archive.findMany({
+      where: { id: { in: ids } },
+      select: {
+        id: true,
+        digest: true,
+        partOf: true,
+        routedTo: true,
+        supersededBy: true,
+        routingPlan: { select: { plan: true, digest: true, due: true } },
+      },
+    });
+    for (const row of rows) {
+      if (row.partOf) {
+        if (!row.supersededBy && sessionOrganizations(routing, row).includes(organizationId))
+          keep.add(row.id);
+        continue;
+      }
+      if (routing.publish === 'on' || routing.cleanup !== 'leaked' || row.supersededBy) continue;
+      const plan = row.routingPlan?.plan ? storedPlanSchema.parse(row.routingPlan.plan) : undefined;
+      if (!plan || row.routingPlan?.digest !== row.digest || row.routingPlan.due === 'partial')
+        continue;
+      const work = plan.parts.filter((p) => p.organizations.some((o) => o !== PERSONAL));
+      if (
+        work.length !== 1 ||
+        !work[0]!.organizations.includes(organizationId) ||
+        plan.prune.length ||
+        plan.redactions.length
+      )
+        continue;
+      const parts = await this.db.archive.findMany({
+        where: { partOf: row.id },
+        select: { routedTo: true, summary: true },
+      });
+      const session = await this.plannedSession(row.id);
+      if (
+        parts.length === 1 &&
+        parts[0]!.routedTo.includes(organizationId) &&
+        session &&
+        (parts[0]!.summary as Summary).entries === session.snapshot.entries.length
+      )
+        keep.add(row.id);
+    }
+    return keep;
+  }
+  /** Copies deleted here that a destination still holds: each tombstone's pending deletes. */
+  async pendingDeletes() {
+    const rows = await this.db.archiveTombstone.findMany({
+      where: { NOT: { pending: { isEmpty: true } } },
+      select: { id: true, pending: true },
+    });
+    return rows.flatMap((row) =>
+      [...new Set(row.pending)].map((destination) => ({ archiveId: row.id, destination })),
+    );
+  }
+  /** The ids among these this Archive knows: rows and tombstones. */
+  async knownIds(ids: string[]) {
+    const [rows, tombstones] = await Promise.all([
+      this.db.archive.findMany({ where: { id: { in: ids } }, select: { id: true } }),
+      this.db.archiveTombstone.findMany({ where: { id: { in: ids } }, select: { id: true } }),
+    ]);
+    return new Set([...rows, ...tombstones].map((r) => r.id));
   }
   /** Every receipt: which destinations hold which archives, with what routing those rows now have. */
   async deliveries() {
@@ -924,6 +1016,15 @@ export class ArchiveStore {
       }
       const parts = await tx.archive.findMany({ where: { partOf: id }, select: { id: true } });
       await retire(parts.map((p) => p.id));
+      // Its own copies' receipts go with the row; the tombstone keeps them until sync confirms.
+      const held = await tx.receipt.findMany({
+        where: { archiveId: id },
+        select: { destination: true },
+      });
+      await tx.archiveTombstone.update({
+        where: { id },
+        data: { pending: { push: held.map((r) => r.destination) } },
+      });
       await tx.archive.delete({ where: { id } });
       return true;
     });

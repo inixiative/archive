@@ -4,7 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { runCli } from '../src/cli';
-import { publishArchive, routingPreview, searchRemotes, syncArchives } from '../src/client';
+import {
+  publishArchive,
+  routingPreview,
+  type SyncBackoff,
+  searchRemotes,
+  syncArchives,
+} from '../src/client';
 import {
   type ArchiveDestination,
   connectDestination,
@@ -585,4 +591,138 @@ test('publishArchive itself refuses while routing.publish is off', async () => {
   await expect(
     publishArchive(local, part, destination, { ...routing([destination]), publish: 'off' }),
   ).rejects.toThrow('Publishing is off');
+});
+
+test('R2, R3, cleanup: deletes survive a local delete, reconciliation finds copies with no receipt, a foreign copy and a whole-routed copy stay', async () => {
+  const local = await freshStore();
+  const remote = await freshStore('remote');
+  process.env.ARCHIVE_R3_TEST_TOKEN = token;
+  let refuse = false;
+  const handler = createArchiveHandler(remote, token);
+  const server = Bun.serve({
+    port: 0,
+    fetch: (request) =>
+      refuse && new URL(request.url).pathname.endsWith('/delete')
+        ? Response.json({ error: 'Forbidden' }, { status: 403 })
+        : handler(request),
+  });
+  try {
+    const destination: ArchiveDestination = {
+      kind: 'archive',
+      organizationId: 'userevidence',
+      url: server.url.href,
+      tokenEnv: 'ARCHIVE_R3_TEST_TOKEN',
+    };
+    const identity = destinationIdentity(destination);
+    const sourceId = await local.sourceId();
+    const ours = (sessionId: string) => ({ ...snapshot('userevidence', sessionId), sourceId });
+    const send = async (s: ReturnType<typeof ours>) => remote.capture(s, { previousDigest: null });
+    // R2: a leaked copy whose session is deleted here while the destination refuses deletes.
+    const gone = await local.capture(ours('gone'));
+    await send(ours('gone'));
+    await local.delivered(gone.id, identity, gone.digest);
+    // R3: a copy the destination holds with no local row and no receipt, and another Archive's.
+    await send(ours('lost'));
+    const foreign = { ...snapshot('userevidence', 'foreign'), sourceId: crypto.randomUUID() };
+    await send(foreign);
+    // cleanup: leaked keeps a whole copy its valid plan sends there whole and unredacted.
+    const whole = await local.capture(ours('whole'));
+    await send(ours('whole'));
+    await local.delivered(whole.id, identity, whole.digest);
+    await local.setProjectMap({ projects: [] });
+    await local
+      .recordPlan(
+        {
+          archiveId: whole.id,
+          digest: whole.digest,
+          through: 0,
+          key: 'k',
+          by: 'test',
+          proposal: {
+            parts: [{ from: 0, to: 0, organizations: ['userevidence'] }],
+            prune: [],
+            redactions: [],
+            rationale: '',
+          },
+        },
+        routing([destination]),
+      )
+      .catch(() => undefined);
+    // The plan needs evidence; a person's decision stands in for it here.
+    await local.tag(whole.id, { add: ['route:userevidence'] });
+    const planned = await local.recordPlan(
+      {
+        archiveId: whole.id,
+        digest: whole.digest,
+        through: 0,
+        key: 'k',
+        by: 'test',
+        proposal: {
+          parts: [{ from: 0, to: 0, organizations: ['userevidence'] }],
+          prune: [],
+          redactions: [],
+          rationale: '',
+        },
+      },
+      routing([destination]),
+    );
+    expect(planned.status).toBe('valid');
+    refuse = true;
+    await local.delete(gone.id);
+    const off = { ...routing([destination]), publish: 'off' as const };
+    const backoff: SyncBackoff = new Map();
+    const statuses = async (r = off) =>
+      (await syncArchives(local, r, { backoff })).map(
+        (x) => `${x.id.slice(0, 6)}:${x.status.split(';')[0]}`,
+      );
+    // The refused delete stays queued on the tombstone.
+    expect((await statuses()).some((s) => s.endsWith('failed'))).toBe(true);
+    refuse = false;
+    backoff.clear();
+    await statuses();
+    const held = (await remote.list({ exempt: 'include' })).map((a) => a.sessionId).sort();
+    expect(held).toEqual(['foreign', 'whole']);
+    // cleanup all, or publishing on, deletes the whole copy too; the foreign one always stays.
+    backoff.clear();
+    await statuses({ ...off, cleanup: 'all' });
+    expect((await remote.list({ exempt: 'include' })).map((a) => a.sessionId)).toEqual(['foreign']);
+  } finally {
+    server.stop(true);
+    delete process.env.ARCHIVE_R3_TEST_TOKEN;
+  }
+});
+
+test('R3 through Kingdom: a listed copy this Archive knows is deleted; one it can’t attribute is left alone', async () => {
+  const local = await freshStore();
+  const { id: deleted } = await local.capture(snapshot('userevidence', 'deleted-locally'));
+  await local.delete(deleted);
+  const stranger = 'f'.repeat(64);
+  const directory = mkdtempSync(join(tmpdir(), 'archive-kingdom-reconcile-'));
+  chmodSync(directory, 0o700);
+  const integrationId = crypto.randomUUID();
+  const resourceId = crypto.randomUUID();
+  const kingdom = signetKingdom({
+    libraries: [{ integrationId, resourceId, name: 'UE Archive' }],
+    execute: (body) =>
+      body.operation === 'documents.read'
+        ? { documents: [{ id: deleted }, { id: stranger }] }
+        : { archiveId: deleted, deleted: true },
+  });
+  try {
+    const destination: ArchiveDestination = {
+      kind: 'kingdom',
+      organizationId: 'userevidence',
+      url: kingdom.origin,
+      credentialFile: await kingdom.hold(directory),
+      integrationId,
+      resourceId,
+    };
+    expect(await syncArchives(local, { ...routing([destination]), publish: 'off' })).toEqual([
+      { id: deleted, destination: kingdom.origin, status: 'deleted' },
+    ]);
+    expect(kingdom.executed.map((e) => e.operation)).toEqual(['documents.read', 'sessions.delete']);
+  } finally {
+    kingdom.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

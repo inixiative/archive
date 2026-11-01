@@ -80,6 +80,8 @@ model ArchiveTombstone {
   /// tagged. Null for a session captured before 0.23.0 (then only `digest` matches).
   transcriptDigest String?
   projectId        String?
+  /// Destinations that held a copy when it was deleted here: kept until each confirms its delete.
+  pending          String[] @default([])
   deletedAt        DateTime @default(now())
 
   @@map("archive_tombstones")

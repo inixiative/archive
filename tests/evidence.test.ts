@@ -25,6 +25,7 @@ const routing = {
   ],
   destinations: [],
   publish: 'off' as const,
+  cleanup: 'leaked' as const,
 };
 const call = (name: string, input: object) => ({
   kind: 'tool-call' as const,

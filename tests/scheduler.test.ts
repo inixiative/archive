@@ -10,6 +10,7 @@ const routing: Routing = {
   organizations: [{ id: 'inixiative', projects: ['template'] }],
   destinations: [],
   publish: 'off',
+  cleanup: 'leaked',
 };
 const map = { projects: [{ projectId: 'template', roots: ['/w/template'], repositories: [] }] };
 const session = (sessionId: string, n: number, extra: Record<string, unknown> = {}) =>
@@ -152,6 +153,7 @@ test('a backfill dry run plans every session, subagents against their parent’s
       },
     ],
     publish: 'off',
+    cleanup: 'leaked',
   };
   await store.setProjectMap({
     projects: [

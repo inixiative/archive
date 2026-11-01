@@ -15,6 +15,7 @@ export const routing = (
   ].map((id) => ({ id, projects: projects[id] ?? [id] })),
   destinations,
   publish: 'on',
+  cleanup: 'leaked',
 });
 
 /**

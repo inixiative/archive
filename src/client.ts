@@ -61,7 +61,7 @@ const kingdomSignet = async (destination: KingdomDestination) => {
 /** Runs one Archive operation on the destination's library through the paired Signet. */
 export async function kingdomArchiveOperation(
   destination: KingdomDestination,
-  operation: 'sessions.write' | 'sessions.delete' | 'documents.search',
+  operation: 'sessions.write' | 'sessions.delete' | 'documents.search' | 'documents.read',
   input: Record<string, unknown>,
 ) {
   const { result } = await (await kingdomSignet(destination)).execute(
@@ -206,10 +206,55 @@ const outage = (error: unknown) => {
   return typeof status !== 'number' || status >= 500;
 };
 
+const RECONCILE_MS = 10 * 60_000;
+const DELETES_PER_PASS = 100;
+
+/**
+ * The ids of this Archive's copies a destination holds. A direct Archive lists them, with their
+ * `sourceId`, page by page. Kingdom's `documents.read` gives the newest documents without one, so
+ * only ids this Archive knows (its rows and tombstones) are taken from it.
+ */
+async function heldCopies(store: ArchiveStore, destination: ArchiveDestination, sourceId: string) {
+  if (destination.kind === 'kingdom') {
+    const result = (await kingdomArchiveOperation(destination, 'documents.read', {
+      fields: ['id'],
+      limit: 100,
+    })) as { documents?: { id?: unknown }[] } | undefined;
+    const ids = (result?.documents ?? []).flatMap((d) => (typeof d.id === 'string' ? [d.id] : []));
+    return [...(await store.knownIds(ids))];
+  }
+  const ids: string[] = [];
+  let beforeId: string | undefined;
+  for (let page = 0; page < 1000; page++) {
+    const { data } = await archiveRequest(destination, 'list', {
+      limit: 100,
+      exempt: 'include',
+      ...(beforeId ? { beforeId } : {}),
+    });
+    const listed = data as {
+      archives: { id: string; sourceId?: string }[];
+      nextCursor: string | null;
+    };
+    for (const archive of listed.archives) if (archive.sourceId === sourceId) ids.push(archive.id);
+    if (!listed.nextCursor) break;
+    beforeId = listed.nextCursor;
+  }
+  return ids;
+}
+
 export async function syncArchives(
   store: ArchiveStore,
   routing: Routing,
-  options: { backoff?: SyncBackoff; now?: () => number } = {},
+  options: {
+    backoff?: SyncBackoff;
+    now?: () => number;
+    /** When each destination (by identity) is next listed for reconciliation; every call without it. */
+    reconciled?: Map<string, number>;
+    /** How often a destination's own listing is reconciled. Default 10 minutes. */
+    reconcileMs?: number;
+    /** Report what would be deleted; send and delete nothing. */
+    dryRun?: boolean;
+  } = {},
 ): Promise<SyncResult[]> {
   const now = options.now ?? Date.now;
   const backoff = options.backoff;
@@ -221,7 +266,9 @@ export async function syncArchives(
   await store.releaseOutbox(routing.destinations.map(destinationIdentity));
   // With publishing off, nothing new goes out; only the leaked whole-session copies are deleted.
   const archives =
-    routing.publish === 'on' ? await store.list({ exempt: 'include', parts: 'include' }) : [];
+    routing.publish === 'on' && !options.dryRun
+      ? await store.list({ exempt: 'include', parts: 'include' })
+      : [];
   for (const archive of archives)
     for (const destination of sessionDestinations(routing, archive)) {
       const identity = destinationIdentity(destination);
@@ -269,37 +316,67 @@ export async function syncArchives(
         });
       }
     }
-  // What a destination holds that routing no longer sends there goes: a part a re-plan dropped or
-  // moved, or a superseded part (publishing on), and any whole session, whatever its plan, since a
-  // whole session never routes: each such copy is a leak. A removed destination can't be reached;
-  // its copies go once it is configured again (publishing may stay off meanwhile).
-  const configured = new Map(routing.destinations.map((d) => [destinationIdentity(d), d]));
-  for (const held of await store.deliveries()) {
-    const destination = configured.get(held.destination);
-    // A removed route keeps its receipts: nothing is sent there to delete.
-    if (!destination) continue;
-    const row = held.archive;
-    const routed =
-      !row.supersededBy && sessionOrganizations(routing, row).includes(destination.organizationId);
-    // Deleting never widens, so it runs with publishing off too.
-    if (row.partOf && routed) continue;
-    const key = JSON.stringify(['delete', held.archiveId, held.destination]);
-    seen.add(key);
-    const waiting = backoff?.get(key);
-    if (waiting && now() < waiting.until) continue;
-    try {
-      await deleteRemote(destination, held.archiveId);
-      await store.forgetDelivery(held.archiveId, held.destination);
-      backoff?.delete(key);
-      results.push({ id: held.archiveId, destination: destination.url, status: 'deleted' });
-    } catch (error) {
-      const failures = (waiting?.failures ?? 0) + 1;
-      backoff?.set(key, { failures, until: now() + delay(failures) });
-      results.push({
-        id: held.archiveId,
-        destination: destination.url,
-        status: `failed; delete retried later: ${error instanceof Error ? error.message : String(error)}`,
-      });
+  // What a destination holds from this Archive that routing doesn't send there goes (`copiesToKeep`):
+  // a part a re-plan dropped, moved or superseded, every whole-session copy (bar a whole-routed
+  // one under `cleanup: leaked` with publishing off), and copies whose session was deleted here.
+  // Candidates are this Archive's receipts, its tombstones' pending deletes and, every
+  // `reconcileMs`, the destination's own listing of this Archive's copies, so a copy with no
+  // receipt here is found too. Another Archive's copies are never touched. Deleting never widens,
+  // so it runs with publishing off. A removed destination can't be reached until configured again.
+  const sourceId = await store.sourceId();
+  const receipts = await store.deliveries();
+  const pending = await store.pendingDeletes();
+  for (const destination of routing.destinations) {
+    const identity = destinationIdentity(destination);
+    const candidates = new Set([
+      ...receipts.filter((r) => r.destination === identity).map((r) => r.archiveId),
+      ...pending.filter((p) => p.destination === identity).map((p) => p.archiveId),
+    ]);
+    const listedUntil = options.reconciled?.get(identity) ?? 0;
+    const circuit = backoff?.get(JSON.stringify(['destination', identity]));
+    // A destination down for publishing is down for listing too.
+    if (now() >= listedUntil && !(circuit && now() < circuit.until))
+      try {
+        for (const id of await heldCopies(store, destination, sourceId)) candidates.add(id);
+        options.reconciled?.set(identity, now() + (options.reconcileMs ?? RECONCILE_MS));
+      } catch (error) {
+        options.reconciled?.set(identity, now() + BACKOFF_BASE_MS);
+        results.push({
+          id: '',
+          destination: destination.url,
+          status: `failed; listing for reconciliation retried later: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    if (!candidates.size) continue;
+    const keep = await store.copiesToKeep([...candidates], destination.organizationId, routing);
+    let deletes = 0;
+    for (const archiveId of candidates) {
+      if (keep.has(archiveId)) continue;
+      // Rate-limited: the rest wait for the next pass.
+      if (++deletes > DELETES_PER_PASS) break;
+      const key = JSON.stringify(['delete', archiveId, identity]);
+      seen.add(key);
+      const waiting = backoff?.get(key);
+      if (waiting && now() < waiting.until) continue;
+      if (options.dryRun) {
+        results.push({ id: archiveId, destination: destination.url, status: 'would delete' });
+        continue;
+      }
+      try {
+        await deleteRemote(destination, archiveId);
+        await store.forgetDelivery(archiveId, identity);
+        backoff?.delete(key);
+        results.push({ id: archiveId, destination: destination.url, status: 'deleted' });
+      } catch (error) {
+        // A refusal (an old Kingdom pairing without sessions.delete) stays queued, like an outage.
+        const failures = (waiting?.failures ?? 0) + 1;
+        backoff?.set(key, { failures, until: now() + delay(failures) });
+        results.push({
+          id: archiveId,
+          destination: destination.url,
+          status: `failed; delete retried later: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
     }
   }
   // Archives that were deleted, or routes that were removed, leave no entries behind.

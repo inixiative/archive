@@ -186,6 +186,7 @@ test('destination endpoints list delivery, libraries, connect and remove through
       organizations: [{ id: 'inixiative', projects: ['inixiative'] }],
       destinations: [],
       publish: 'off',
+      cleanup: 'leaked',
     });
     await expect(
       archive.request('destinations/remove', { ...route, organizationId: undefined }),
@@ -220,6 +221,8 @@ test('a failed delivery backs off, doubling per failure, and clears once deliver
   const server = Bun.serve({
     port: 0,
     fetch: async (request) => {
+      if (new URL(request.url).pathname.endsWith('/list'))
+        return Response.json({ data: { archives: [], nextCursor: null } });
       if (!accept) return Response.json({ error: 'Invalid archive request' }, { status: 400 });
       const { snapshot: sent } = JSON.parse(
         Buffer.from(Bun.gunzipSync(await request.arrayBuffer())).toString('utf8'),
@@ -290,7 +293,9 @@ test('an unreachable destination is skipped for every archive until it is due; a
   let calls = 0;
   const server = Bun.serve({
     port: 0,
-    fetch: () => {
+    fetch: (request) => {
+      if (new URL(request.url).pathname.endsWith('/list'))
+        return Response.json({ data: { archives: [], nextCursor: null } });
       calls++;
       return Response.json({ error: 'Invalid archive request' }, { status: 400 });
     },

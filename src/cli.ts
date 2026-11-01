@@ -239,10 +239,15 @@ export async function runCli(args = Bun.argv.slice(2)) {
     // One process owns the database connection: the server and its sync share it.
     // Failed deliveries back off across cycles instead of being re-sent every 30 seconds.
     const backoff: SyncBackoff = new Map();
+    // Each destination's own listing is reconciled every ten minutes, not every cycle.
+    const reconciled = new Map<string, number>();
     const sync = (async () => {
       while (v.sync && !stopped) {
         try {
-          const results = await syncArchives(instance.store, readRouting(config), { backoff });
+          const results = await syncArchives(instance.store, readRouting(config), {
+            backoff,
+            reconciled,
+          });
           const failed = results.filter((r) => r.status.startsWith('failed'));
           if (failed.length) console.error(JSON.stringify({ sync: 'failed', archives: failed }));
         } catch {
