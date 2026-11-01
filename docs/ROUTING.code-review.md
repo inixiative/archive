@@ -354,3 +354,17 @@ Two small duplications. The `evidenceOnly` branch re-implements the `stripOf` / 
 2. **B2:** an evidence-only capture can delete the row through the run-drop path. Fix in this PR.
 3. **Operational:** don't set `leaked` before a router pass has re-applied the plans, or genuine UE whole copies are deleted.
 4. **Deferred decision:** a person's `route:personal` waits for a multi-window rebuild to finish. Low.
+
+---
+
+## PR #33 re-gate (2026-11-01, `4d15438`)
+
+**Verdict: MERGE.** B1 and B2 are fixed, and nothing in the new code widens routing.
+
+Ground truth: `4d15438`. `bun run typecheck` passes. `bun run lint` reports 0 errors and 216 warnings. `bun test` passed 174 of 174 against a throwaway Postgres on random port 24979, never 6132. I re-ran four probes from `probe/pr33.test.ts`: (1a), (1b), (2a) and (3).
+
+- **B1, fixed (probe 2a).** Plan B re-plans E0–E3 as one UE part over A's sensitive E0–E1, and that proposal now **holds** ("covers entries kept personal as sensitive"). Plan A keeps governing. After the session grows, the next delta's UE part holds `fix zealot bug, fixed, more zealot, done`, with no career entries, and `wholeTo` is `[]`. `StoredPlan.sensitive` accumulates across plan generations, rebuilds included; `sensitiveEntries` reads it; and any work part over a sticky entry holds. The fix fails closed.
+- **B2, fixed (probe 1b).** An evidence-only capture whose tags carry `run:oracle`, with `captureRunSessions` off, keeps the row (revision 1, 1 receipt). The `evidenceOnly` branch now runs before the drop check and reuses `evidenceOf` / `stripOf`. The drop path itself now goes through `deleteIn`, so a dropped session is tombstoned with its pending deletes queued. That also closes the pre-existing orphan path. Probe (1a) is unchanged: only evidence moves.
+- **G1/G2 still hold (probe 3).** The reviewed copy is kept, and still kept after the session grows. The tool-activity copy and the redacted copy are deleted.
+- **`allowedOrganizations` doesn't widen.** It computes the same set the old inline code did (range evidence plus start organization, subagents spawned in the range, a person's `route:` organizations, never personal). `validatePlan` calls it per range, exactly as before. `planSession` calls it over the whole session, which is broader, but only to skip the model call. A broader set can only send a session to the model instead of holding it, never publish more.
+- **The mid-rebuild decision doesn't widen.** I didn't probe this one; this is from reading the code. A `route:` change during a rebuild re-applies the decision to the governing plan under the governing plan's key, and `rebuild` is kept so the rebuild resumes afterwards. Any new entries in that pass are validated the usual way against the governing plan. A held attempt clears `rebuild`, so the rebuild starts again; that is safe.
