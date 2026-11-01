@@ -469,12 +469,14 @@ if (v.out) {
   mkdirSync(resolve(v.out, '..'), { recursive: true });
   writeFileSync(v.out, `${JSON.stringify(output, null, 2)}\n`);
 }
-// The published text of every case with sensitive markers, for reading them for meaning (private).
+// The published text of every case and planned parent, for reading it for meaning (private).
 if (v.texts) {
   const texts: Record<string, { organizations: string[]; entries: string[] }[]> = {};
-  for (const c of cases.cases.filter((c) => c.expect.sensitive && (!only || only.has(c.label)))) {
-    const result = results.get(sessionOf(c).id);
-    texts[c.label] = (result?.parts ?? []).map((p, i) => ({
+  const labels = new Map(cases.cases.map((c) => [sessionOf(c).id, c.label]));
+  for (const [id, result] of results) {
+    const label = labels.get(id) ?? `parent ${id.slice(0, 10)}`;
+    if (only && labels.has(id) && !only.has(label)) continue;
+    texts[label] = (result?.parts ?? []).map((p, i) => ({
       organizations: p.organizations,
       entries: (result?.snapshots?.[i]?.entries ?? []).map((e) => e.text),
     }));
