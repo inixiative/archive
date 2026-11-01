@@ -11,6 +11,7 @@ import {
   defaultHistoryDirectory,
   defaultHome,
   installAgents,
+  machineProjectMap,
   readAgents,
   uninstallAgents,
   upsertCollector,
@@ -25,6 +26,7 @@ import {
   excludeGlob,
   type FolderFilters,
   folderGlob,
+  sessionMetadata,
   UNROUTED,
 } from './collector';
 import {
@@ -529,8 +531,12 @@ export async function runCli(args = Bun.argv.slice(2)) {
           });
     const run = stampedRun();
     snapshot.tags = [...new Set([...(run ? [run] : []), ...(v.tag ?? [])])];
+    const cwd =
+      v.source === 'chatgpt'
+        ? undefined
+        : sessionMetadata(v.file, v.source as 'codex' | 'claude-code')?.cwd;
     output({
-      ...(await archive.capture(snapshot)),
+      ...(await archive.capture(snapshot, cwd ? { cwd } : {})),
       entries: snapshot.entries.length,
       coverage: snapshot.coverage,
     });
@@ -630,6 +636,8 @@ export async function runCli(args = Bun.argv.slice(2)) {
     const config = readAgents(agentsFile);
     if (!config) throw new Error('No agents.json; declare agents first');
     const names = v.agent ? [v.agent] : config.collectors.map((c) => c.name);
+    // Sessions whose evidence predates the machine's projects are re-sent, so evidence is current.
+    await archive.setProjectMap(machineProjectMap(config));
     const results = [];
     for (const name of names) {
       const { collector, peers, filters, projects, server } = collectorPlan(config, name);

@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { defaultHome } from './agents';
 import type { ArchiveDestination, DescribedDestination, Organization } from './config';
+import type { ProjectMap } from './evidence';
 import type { ArchiveChunk, ArchiveSnapshot } from './index';
 import { archiveKey, archiveSnapshotSchema } from './index';
 import type {
@@ -127,6 +128,8 @@ export class ArchiveClient {
       digest: string;
       revision: number;
       projectId: string | null;
+      /** The project map this row's evidence was computed under. */
+      evidenceKey?: string | null;
       /** A tombstone: the session was deleted here; `digest` is the writer's last one. */
       deleted?: true;
     }>('head', { archiveId: id }).catch((error) => {
@@ -134,8 +137,11 @@ export class ArchiveClient {
       throw error;
     });
   }
-  /** Captures a snapshot as the next revision, retrying when another writer got there first. */
-  async capture(input: unknown) {
+  /**
+   * Captures a snapshot as the next revision, retrying when another writer got there first. `cwd`
+   * is the session's working directory, for the evidence the server computes at ingest.
+   */
+  async capture(input: unknown, context: { cwd?: string } = {}) {
     const snapshot = archiveSnapshotSchema.parse(input);
     const id = archiveKey(snapshot);
     for (let attempt = 0; ; attempt++) {
@@ -148,7 +154,11 @@ export class ArchiveClient {
           changed: boolean;
           /** The run tag a session was dropped for (`captureRunSessions` off); nothing was stored. */
           dropped?: string;
-        }>('ingest', { snapshot, previousDigest: head?.digest ?? null });
+        }>('ingest', {
+          snapshot,
+          previousDigest: head?.digest ?? null,
+          ...(context.cwd ? { cwd: context.cwd } : {}),
+        });
       } catch (error) {
         const conflict =
           error instanceof ArchiveRequestError &&
@@ -233,6 +243,14 @@ export class ArchiveClient {
   }
   settings() {
     return this.request<ArchiveSettings>('settings/read');
+  }
+  /** Sends the host's project map; captures from then on compute their evidence under it. */
+  setProjectMap(map: ProjectMap) {
+    return this.request<{ key: string }>('projects/set', map);
+  }
+  /** The project map's key the server computes evidence under, null until a host sent one. */
+  async projectMapKey() {
+    return (await this.request<{ key: string | null }>('projects/read')).key;
   }
   updateSettings(change: Partial<ArchiveSettings>) {
     return this.request<ArchiveSettings>('settings/update', change);

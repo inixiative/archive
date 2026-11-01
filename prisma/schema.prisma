@@ -41,6 +41,11 @@ model Archive {
   supersededBy String?
   /// The incoming transcript without collector additions (`transcriptDigest`), for tombstones.
   transcriptDigest String?
+  /// What the session wrote and read where (`SessionEvidence`), computed at ingest before the
+  /// tool-activity strip. Local to this row: never in a snapshot, so it never travels.
+  evidence    Json?
+  /// The project map the evidence was computed under; another key makes a capture recompute it.
+  evidenceKey String?
 
   revisions  Revision[]
   tagEdits   TagEdit[]

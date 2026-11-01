@@ -1,4 +1,5 @@
 import { timingSafeEqual } from 'node:crypto';
+import { isAbsolute } from 'node:path';
 import { z } from 'zod';
 import { routingPreview, syncArchives } from './client';
 import {
@@ -13,6 +14,7 @@ import {
   sessionOrganizations,
   setOrganization,
 } from './config';
+import { projectMapKey, projectMapSchema } from './evidence';
 import { archiveReferenceSchema, archiveSnapshotSchema, selectChunks } from './index';
 import { KingdomGrantMissing, pairedDestination, pairedLibraries } from './kingdom';
 import { CLAIM_SOURCES } from './schemas';
@@ -33,6 +35,8 @@ const ingestSchema = z.strictObject({
     .string()
     .regex(/^[a-f0-9]{64}$/)
     .nullable(),
+  /** The session's working directory, for evidence; never stored in the snapshot. */
+  cwd: z.string().max(4096).refine(isAbsolute).optional(),
 });
 const archiveId = z.string().regex(/^[a-f0-9]{64}$/);
 const filterFields = {
@@ -150,8 +154,17 @@ export function createArchiveHandler(
         return json({ data: { sourceId: await store.sourceId(), protocol: 2 } });
       }
       if (path === '/api/v1/archive/ingest') {
-        const { snapshot, previousDigest } = ingestSchema.parse(body);
-        return json({ data: await store.capture(snapshot, { previousDigest }) });
+        const { snapshot, previousDigest, cwd } = ingestSchema.parse(body);
+        return json({
+          data: await store.capture(snapshot, { previousDigest, ...(cwd ? { cwd } : {}) }),
+        });
+      }
+      if (path === '/api/v1/archive/projects/set')
+        return json({ data: await store.setProjectMap(projectMapSchema.parse(body)) });
+      if (path === '/api/v1/archive/projects/read') {
+        z.strictObject({}).parse(body);
+        const map = await store.projectMap();
+        return json({ data: map ? { key: projectMapKey(map), ...map } : { key: null } });
       }
       if (path === '/api/v1/archive/head') {
         const head = await store.head(readSchema.pick({ archiveId: true }).parse(body).archiveId);

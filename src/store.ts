@@ -1,6 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { type Prisma, PrismaClient } from '@prisma/client';
 import { z } from 'zod';
+import {
+  type ProjectMap,
+  projectMapKey,
+  projectMapSchema,
+  type SessionEvidence,
+  sessionEvidence,
+} from './evidence';
 import { droppableRun, exemptRun, identityRunTags, RUN_TAGS } from './exemption';
 import {
   type ArchiveChunk,
@@ -107,6 +114,8 @@ const COMPACTION_BATCH = 100;
 /** The trigram index on chunk text (prisma/schema.prisma) that search uses. */
 const SEARCH_INDEX = 'chunks_text_idx';
 const TOOL_ACTIVITY_BATCH = 50;
+/** The settings row holding the host's project map (`projects/set`), for evidence at ingest. */
+const PROJECT_MAP = 'projectMap';
 /** Advisory lock key: captures hold it shared, a settings change exclusively. */
 const SETTINGS_LOCK = 0x41524348;
 
@@ -206,10 +215,12 @@ export class ArchiveStore {
    * snapshot as its writer sent it, so a writer's unchanged session stays unchanged; the stored
    * snapshot (and `storedDigest`) leave out tool activity when the setting says so.
    */
-  async capture(input: unknown, expected?: { previousDigest: string | null }) {
+  async capture(input: unknown, options: CaptureOptions = {}) {
     const incoming = archiveSnapshotSchema.parse(input);
     const id = archiveKey(incoming);
     const digest = snapshotDigest(incoming);
+    const expected =
+      options.previousDigest === undefined ? undefined : { previousDigest: options.previousDigest };
     return this.db.$transaction(
       async (tx) => {
         // Serializes concurrent captures of one session.
@@ -227,7 +238,31 @@ export class ArchiveStore {
           return { id, digest, revision: 0, changed: false, dropped: RUN_TAGS[run] };
         }
         const old = await tx.archive.findUnique({ where: { id } });
-        if (old?.digest === digest) return { id, digest, revision: old.revision, changed: false };
+        const map = await this.projectMap(tx);
+        // Evidence comes from the snapshot as its writer sent it, before the strip drops tool calls.
+        const evidenceOf = (kept: ArchiveSnapshot) =>
+          map
+            ? sessionEvidence(unlifted, new Set(kept.entries.map((e) => e.id)), map, options.cwd)
+            : null;
+        const evidenceFields = (evidence: SessionEvidence | null) => ({
+          evidence: (evidence ?? undefined) as Prisma.InputJsonValue | undefined,
+          evidenceKey: evidence?.key ?? null,
+        });
+        const stale = (row: { evidenceKey: string | null }) =>
+          map !== undefined && row.evidenceKey !== projectMapKey(map);
+        const stripOf = () =>
+          settings.captureToolCallsAndResults
+            ? { snapshot: unlifted, changed: 0 }
+            : withoutToolActivity(unlifted, settings.integrations);
+        if (old?.digest === digest) {
+          // The same session under a new project map: only its evidence is recomputed.
+          if (stale(old))
+            await tx.archive.update({
+              where: { id },
+              data: evidenceFields(evidenceOf(stripOf().snapshot)),
+            });
+          return { id, digest, revision: old.revision, changed: false };
+        }
         // A session deleted here stays deleted while its transcript is unchanged, however a
         // collector tags it; the tombstone takes the writer's digest so `head` matches it.
         const transcript = transcriptDigest(incoming);
@@ -246,9 +281,7 @@ export class ArchiveStore {
           throw new ArchiveConflict('Revision conflict');
         if (old && old.capturedAt > incoming.capturedAt) throw new ArchiveConflict('Stale capture');
         if (tombstone) await tx.archiveTombstone.delete({ where: { id } });
-        const stripped = settings.captureToolCallsAndResults
-          ? { snapshot: unlifted, changed: 0 }
-          : withoutToolActivity(unlifted, settings.integrations);
+        const stripped = stripOf();
         const { snapshot } = stripped;
         const changed = stripped.changed || unlifted !== incoming;
         const storedDigest = changed ? snapshotDigest(snapshot) : digest;
@@ -256,7 +289,12 @@ export class ArchiveStore {
         if (old?.storedDigest === storedDigest) {
           await tx.archive.update({
             where: { id },
-            data: { digest, transcriptDigest: transcript, capturedAt: snapshot.capturedAt },
+            data: {
+              digest,
+              transcriptDigest: transcript,
+              capturedAt: snapshot.capturedAt,
+              ...evidenceFields(evidenceOf(snapshot)),
+            },
           });
           return { id, digest, revision: old.revision, changed: false };
         }
@@ -282,6 +320,7 @@ export class ArchiveStore {
           accessPath: snapshot.runtime?.accessPath ?? null,
           capturedAt: snapshot.capturedAt,
           summary: summarize(snapshot, settings) as Prisma.InputJsonValue,
+          ...evidenceFields(evidenceOf(snapshot)),
         };
         await tx.archive.upsert({ where: { id }, create: { id, ...fields }, update: fields });
         await tx.revision.create({
@@ -323,6 +362,7 @@ export class ArchiveStore {
         revision: true,
         projectId: true,
         supersededBy: true,
+        evidenceKey: true,
       },
     });
     if (row) return row;
@@ -335,6 +375,7 @@ export class ArchiveStore {
           revision: 0,
           projectId: tombstone.projectId,
           supersededBy: null,
+          evidenceKey: null,
           deleted: true as const,
         }
       : undefined;
@@ -1082,6 +1123,25 @@ export class ArchiveStore {
       await this.ensureSearchIndex(true);
     }
   }
+  /** The host's project map, which evidence is computed under; undefined until a host sends one. */
+  async projectMap(db: Prisma.TransactionClient | PrismaClient = this.db) {
+    const row = await db.setting.findUnique({ where: { key: PROJECT_MAP } });
+    return row ? projectMapSchema.parse(row.value) : undefined;
+  }
+  async projectMapKey() {
+    const map = await this.projectMap();
+    return map ? projectMapKey(map) : null;
+  }
+  /** Saves the host's project map; captures from then on compute evidence under it. */
+  async setProjectMap(input: ProjectMap) {
+    const map = projectMapSchema.parse(input);
+    await this.db.setting.upsert({
+      where: { key: PROJECT_MAP },
+      create: { key: PROJECT_MAP, value: map },
+      update: { value: map },
+    });
+    return { key: projectMapKey(map) };
+  }
   async settings(db: Prisma.TransactionClient | PrismaClient = this.db): Promise<ArchiveSettings> {
     const row = await db.setting.findUnique({ where: { key: 'archive' } });
     // A setting added after the row was saved takes its default.
@@ -1384,6 +1444,13 @@ const dropRevision = (
     AND r."revision" < (SELECT a."revision" FROM "archives" a WHERE a."id" = r."archiveId")
     AND NOT EXISTS (SELECT 1 FROM "outbox" o
       WHERE o."archiveId" = r."archiveId" AND o."revision" = r."revision")`;
+
+/**
+ * How a capture is checked and what comes with it: `previousDigest` (the writer's last known
+ * digest; checked when given), `cwd` (the session's working directory, for evidence), `restore`
+ * (lift this session's tombstone: the writer means to bring a deleted session back).
+ */
+export type CaptureOptions = { previousDigest?: string | null; cwd?: string; restore?: boolean };
 
 /** A capture that lost a race or arrived out of order; the server answers 409. */
 export class ArchiveConflict extends Error {}

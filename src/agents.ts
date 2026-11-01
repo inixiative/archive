@@ -24,8 +24,11 @@ import {
   excludeGlob,
   type FolderFilters,
   folderGlob,
+  git,
   UNROUTED,
 } from './collector';
+import type { ProjectMap } from './evidence';
+import { provenanceReferences } from './tags';
 
 export const defaultHome = () => join(homedir(), '.local/share/archive');
 export const AGENT_LABEL_PREFIX = 'com.inixiative.archive.';
@@ -152,6 +155,37 @@ export function machineProjects(config: AgentsConfig) {
   return config.collectors
     .filter((c) => !c.catchAll)
     .map((c) => ({ projectId: c.projectId, roots: collectionRoots(source(c)) }));
+}
+
+/**
+ * The project map the server computes evidence under (`projects/set`): every project's roots and
+ * worktrees, read now, and the GitHub repositories its checkouts' `origin` points at.
+ */
+export function machineProjectMap(config: AgentsConfig): ProjectMap {
+  const roots = new Map<string, Set<string>>();
+  for (const { projectId, roots: found } of machineProjects(config)) {
+    const set = roots.get(projectId) ?? new Set<string>();
+    for (const root of found) set.add(root);
+    roots.set(projectId, set);
+  }
+  const remotes = new Map<string, string | undefined>();
+  return {
+    projects: [...roots]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([projectId, set]) => {
+        const sorted = [...set].sort();
+        const repositories = new Set<string>();
+        for (const root of sorted) {
+          if (!remotes.has(root)) {
+            const url = git(root, 'remote', 'get-url', 'origin');
+            remotes.set(root, url ? provenanceReferences({ repository: url })[0]?.ref : undefined);
+          }
+          const repository = remotes.get(root);
+          if (repository) repositories.add(repository);
+        }
+        return { projectId, roots: sorted, repositories: [...repositories].sort() };
+      }),
+  };
 }
 
 /**
