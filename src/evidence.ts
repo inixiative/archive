@@ -220,15 +220,23 @@ export function evidencedOrganizations(
   map: ProjectMap | undefined,
   entryIds?: ReadonlySet<string>,
 ) {
+  const start = evidence?.startProjectId;
+  return organizationsWithEvidence(
+    evidenceByOrganization(evidence, routing, map, entryIds),
+    start ? routing.organizations.find((o) => o.projects.includes(start))?.id : undefined,
+  );
+}
+
+/** The organizations evidence by organization allows, with the start directory's: never personal. */
+export function organizationsWithEvidence(
+  byOrganization: OrganizationEvidence,
+  startOrganization?: string,
+) {
   const found = new Set(
-    Object.entries(evidenceByOrganization(evidence, routing, map, entryIds))
+    Object.entries(byOrganization)
       .filter(([, e]) => e.writes || e.reads || e.references)
       .map(([organization]) => organization),
   );
-  const start = evidence?.startProjectId;
-  const startOrganization = start
-    ? routing.organizations.find((o) => o.projects.includes(start))?.id
-    : undefined;
   if (startOrganization) found.add(startOrganization);
   found.delete('personal');
   return found;

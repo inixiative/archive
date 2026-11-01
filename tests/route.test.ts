@@ -11,6 +11,7 @@ import {
   planSession,
   publishedParts,
   type RoutingArchive,
+  routeKey,
   validatePlan,
 } from '../src/route';
 import type { SuggestModel } from '../src/suggest';
@@ -493,6 +494,7 @@ test('L1: continuing the last part cannot sweep entries no part names into it', 
     redactions: [],
     rationale: '',
     throughEntryId: 'e2',
+    sensitive: [],
   };
   const context = leakContext(prior);
   const result = validatePlan(
@@ -687,6 +689,7 @@ test('S4: prior parts are re-validated on every plan: an organization that lost 
     redactions: [],
     rationale: '',
     throughEntryId: 'e1',
+    sensitive: [],
   };
   const result = validatePlan(plan([]), {
     entries,
@@ -736,6 +739,7 @@ test('R1: a continuing part is held to the clip check too', () => {
     redactions: [],
     rationale: '',
     throughEntryId: 'e2',
+    sensitive: [],
   };
   const result = validatePlan(
     plan([{ from: 3, to: 4, organizations: ['userevidence'], continues: true }]),
@@ -787,4 +791,139 @@ test('a session with no evidence for any organization holds without a model call
     issues: ['no evidence for any organization'],
   });
   expect(seen).toEqual([]);
+});
+
+test('B1: sensitive personal decisions survive a rebuild and every later delta; no UE part ever holds them', async () => {
+  const { store } = await setup();
+  const s = session('career', [
+    { kind: 'user', text: 'I am interviewing elsewhere' },
+    { kind: 'assistant', text: 'career advice' },
+    { kind: 'user', text: 'Now fix zealot' },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant', text: 'Fixed' },
+  ]);
+  const { id } = await store.capture(s, { cwd: '/z' });
+  const record = async (key: string, parts: ProposedPlan['parts']) => {
+    const input = await store.routingInput(id, routing, key);
+    return store.recordPlan(
+      {
+        archiveId: id,
+        digest: input.digest,
+        through: input.total - 1,
+        key,
+        by: key,
+        proposal: plan(parts),
+      },
+      routing,
+    );
+  };
+  // A: E0–E1 sensitive personal, E2–E3 to UE.
+  expect(
+    await record('A', [
+      { from: 0, to: 1, organizations: ['personal'], sensitive: true },
+      { from: 2, to: 3, organizations: ['userevidence'] },
+    ]),
+  ).toMatchObject({ status: 'valid' });
+  // B rebuilds and tries to send everything to UE: held; A stands.
+  expect(await record('B', [{ from: 0, to: 3, organizations: ['userevidence'] }])).toMatchObject({
+    status: 'held',
+  });
+  // A held rebuild ends there: A stands. A later charter, C, keeps E0–E1 personal: the swap.
+  expect(
+    await record('C', [
+      { from: 0, to: 1, organizations: ['personal'] },
+      { from: 2, to: 3, organizations: ['userevidence'] },
+    ]),
+  ).toMatchObject({ status: 'valid' });
+  // The session grows; C's delta continues the UE part and must not reach back into E0–E1.
+  await store.capture(
+    {
+      ...s,
+      capturedAt: 2,
+      entries: [
+        ...s.entries,
+        { id: 'career-5', kind: 'user', text: 'and the tests', timestamp: 5, sourceRef: 'l5' },
+      ],
+    },
+    { cwd: '/z' },
+  );
+  expect(
+    await record('C', [{ from: 4, to: 4, organizations: ['userevidence'], continues: true }]),
+  ).toMatchObject({
+    status: 'valid',
+  });
+  const parts = await store.list({ exempt: 'include', parts: 'only' });
+  const held = (
+    await Promise.all(
+      parts.map(async (p) => (await store.read(p.id))!.snapshot.entries.map((e) => e.id)),
+    )
+  ).flat();
+  expect(held).not.toContain('career-0');
+  expect(held).not.toContain('career-1');
+  const row = await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } });
+  expect(row.wholeTo).toEqual([]);
+});
+
+test('B2: an evidence-only capture never drops the row; the run drop path tombstones and queues remote deletes', async () => {
+  const { store } = await setup();
+  await store.updateSettings({ captureRunSessions: false });
+  const s = session('held-run', [
+    { kind: 'user', text: 'work' },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant', text: 'done' },
+  ]);
+  const { id, digest } = await store.capture(s, { cwd: '/z' });
+  await store.delivered(id, 'dest', digest);
+  // Another collector's copy carries its own run stamp.
+  await store.capture({ ...s, tags: ['run:oracle'] }, { cwd: '/z', evidenceOnly: true });
+  expect(await store.head(id)).toMatchObject({ id });
+  expect(await store.receipt(id, 'dest')).toBe(digest);
+  // The real drop: a session newly stamped a run goes through delete(), so its copy is owed a delete.
+  expect(
+    (await store.capture({ ...s, tags: ['run:oracle'], capturedAt: 2 }, { cwd: '/z' })).dropped,
+  ).toBe('run:oracle');
+  expect(await store.db.archiveTombstone.findUnique({ where: { id } })).toMatchObject({
+    pending: ['dest'],
+  });
+});
+
+test('a person’s route: decision during a rebuild applies to the governing plan at once', async () => {
+  const { store, archive } = await setup();
+  const long = session('rebuilding', [
+    { kind: 'user', text: `${'first window words '.repeat(11_000)}` },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant', text: 'second window words '.repeat(11_000) },
+  ]);
+  const { id } = await store.capture(long, { cwd: '/z' });
+  const planner = (name: string): SuggestModel => ({
+    model: name,
+    async decide({ input }) {
+      const range = input.match(/## New entries \(E(\d+)–E(\d+)/)!;
+      const from = Number(range[1]);
+      return {
+        content: JSON.stringify({
+          parts: [
+            { from, to: Number(range[2]), organizations: ['userevidence'], continues: from > 0 },
+          ],
+        }),
+      };
+    },
+  });
+  await planSession(archive, planner('old'), id);
+  await planSession(archive, planner('old'), id);
+  expect((await store.list({ exempt: 'include', parts: 'only' }))[0]?.routedTo).toEqual([
+    'userevidence',
+  ]);
+  // A new charter starts a rebuild: one window stored aside.
+  await planSession(archive, planner('new'), id);
+  expect(
+    (await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } })).rebuild,
+  ).not.toBeNull();
+  // The person keeps the session here: the next pass applies it to what publishes now.
+  await store.tag(id, { add: ['route:personal'] });
+  await planSession(archive, planner('new'), id);
+  expect((await store.list({ exempt: 'include', parts: 'only' }))[0]?.routedTo ?? []).toEqual([]);
+  const row = await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } });
+  expect(row.key).toBe(routeKey('old'));
+  expect(row.rebuild).not.toBeNull();
 });
