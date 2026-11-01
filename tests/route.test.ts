@@ -1238,3 +1238,41 @@ test('UNDER EXPERIMENT: the sensitivity pass adds redactions per work part and i
   expect(text).not.toContain('day job');
   expect(text).toContain('Fix zealot');
 });
+
+test('UNDER EXPERIMENT: a sensitivity answer the pass cannot read holds its part; an E-labelled entry is read', async () => {
+  const { store, archive } = await setup();
+  const s = session('malformed', [
+    { kind: 'user', text: 'Fix zealot; I am interviewing next week' },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant', text: 'Fixed' },
+    { kind: 'user', text: 'Now the docs' },
+    call({ file_path: '/z/d.md' }),
+    { kind: 'assistant', text: 'Docs done' },
+  ]);
+  const { id } = await store.capture(s, { cwd: '/z' });
+  const route = JSON.stringify(
+    plan([
+      { from: 0, to: 1, organizations: ['userevidence'] },
+      { from: 2, to: 3, organizations: ['userevidence'] },
+    ]),
+  );
+  const answers = [
+    JSON.stringify({
+      hold: false,
+      redactions: [{ entry: 'E0', text: 'I am interviewing next week', reason: 'career' }],
+    }),
+    JSON.stringify({ hold: 'no', redactions: [] }),
+  ];
+  const model: SuggestModel = {
+    model: 'claude-sonnet-5-5',
+    async decide({ key }) {
+      return { content: key === 'archive-route' ? route : answers.shift()! };
+    },
+  };
+  const result = await planSession(archive, model, id, { sensitivity: true });
+  expect(result.sensitivity).toMatchObject({ calls: 2, held: 0, unreadable: 1 });
+  expect(result.parts?.map((p) => p.organizations)).toEqual([['userevidence']]);
+  const [part] = await store.list({ exempt: 'include', parts: 'only' });
+  const text = (await store.read(part!.id))!.snapshot.entries.map((e) => e.text).join('\n');
+  expect(text).not.toContain('interviewing');
+});

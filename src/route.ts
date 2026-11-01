@@ -667,7 +667,7 @@ async function sensitivityPass(
   const tokens: Required<TokenUsage> = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   const pre = await archive.recordPlan({ ...body, dryRun: true, preview: true });
   if (pre.status !== 'valid' || !pre.parts || !pre.snapshots)
-    return { proposal: body.proposal, tokens, calls: 0 };
+    return { proposal: body.proposal, tokens, calls: 0, held: 0, unreadable: 0 };
   const shown = new Map(input.entries.map((e) => [e.id, e]));
   const proposal: ProposedPlan = {
     ...body.proposal,
@@ -675,6 +675,8 @@ async function sensitivityPass(
     redactions: [...body.proposal.redactions],
   };
   let calls = 0;
+  let held = 0;
+  let unreadable = 0;
   for (const [i, part] of pre.parts.entries()) {
     const organizations = part.organizations.filter((o) => o !== PERSONAL);
     const entries = (pre.snapshots[i]?.entries ?? []).flatMap((e) => shown.get(e.id) ?? []);
@@ -711,26 +713,42 @@ async function sensitivityPass(
     } catch {
       answer = undefined;
     }
+    // Anything but an explicit `hold: false` with well-formed redactions holds the part: an answer
+    // the pass can't read is a redaction it can't apply.
+    const indices = new Set(entries.map((e) => e.index));
+    const items = answer && Array.isArray(answer.redactions) ? answer.redactions : answer ? [] : [];
+    const read = items.map((r) => {
+      const redaction = (r ?? {}) as { entry?: unknown; text?: unknown; reason?: unknown };
+      const entry =
+        typeof redaction.entry === 'number'
+          ? redaction.entry
+          : typeof redaction.entry === 'string' && /^E?\d+$/.test(redaction.entry)
+            ? Number(redaction.entry.replace(/^E/, ''))
+            : undefined;
+      return entry !== undefined &&
+        indices.has(entry) &&
+        typeof redaction.text === 'string' &&
+        redaction.text
+        ? {
+            entry,
+            text: redaction.text,
+            reason: typeof redaction.reason === 'string' ? redaction.reason : 'other',
+          }
+        : undefined;
+    });
     if (!answer || answer.hold === true) {
+      held++;
       hold();
       continue;
     }
-    const indices = new Set(entries.map((e) => e.index));
-    for (const r of Array.isArray(answer.redactions) ? answer.redactions : []) {
-      const redaction = r as { entry?: unknown; text?: unknown; reason?: unknown };
-      if (
-        typeof redaction.entry === 'number' &&
-        indices.has(redaction.entry) &&
-        typeof redaction.text === 'string'
-      )
-        proposal.redactions.push({
-          entry: redaction.entry,
-          text: redaction.text,
-          reason: typeof redaction.reason === 'string' ? redaction.reason : 'other',
-        });
+    if (answer.hold !== false || read.some((r) => r === undefined)) {
+      unreadable++;
+      hold();
+      continue;
     }
+    for (const r of read) if (r) proposal.redactions.push(r);
   }
-  return { proposal, tokens, calls };
+  return { proposal, tokens, calls, held, unreadable };
 }
 
 export async function planSession(
@@ -788,6 +806,9 @@ export async function planSession(
   const { sensitivity, ...recordOptions } = options;
   let proposal = parsePlan(content);
   let calls = 1;
+  let sensitivityReport:
+    | { calls: number; held: number; unreadable: number; tokens: Required<TokenUsage> }
+    | undefined;
   if (proposal && sensitivity) {
     const checked = await sensitivityPass(archive, model, input, {
       ...base,
@@ -796,6 +817,12 @@ export async function planSession(
     });
     proposal = checked.proposal;
     calls += checked.calls;
+    sensitivityReport = {
+      calls: checked.calls,
+      held: checked.held,
+      unreadable: checked.unreadable,
+      tokens: checked.tokens,
+    };
     tokens = {
       input: (tokens?.input ?? 0) + checked.tokens.input,
       output: (tokens?.output ?? 0) + checked.tokens.output,
@@ -808,7 +835,13 @@ export async function planSession(
       ? { ...base, proposal, ...recordOptions }
       : { ...base, failure: 'unparseable answer', ...recordOptions },
   );
-  return { ...recorded, ...(tokens ? { tokens } : {}), input, calls };
+  return {
+    ...recorded,
+    ...(tokens ? { tokens } : {}),
+    input,
+    calls,
+    ...(sensitivityReport ? { sensitivity: sensitivityReport } : {}),
+  };
 }
 
 export type RoutingReport = {

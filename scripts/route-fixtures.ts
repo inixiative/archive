@@ -186,24 +186,42 @@ const recorded = v.replay
   : undefined;
 /** In a replay (concurrency 1), the session whose input was read last: the one being planned. */
 let replaying: string | undefined;
+// A replay answers the planner from the recorded run; the sensitivity pass, when on, is live.
+const live =
+  !recorded || v.sensitivity
+    ? await claudeRouteModel({ home: resolve(v.home), concurrency: Number(v.concurrency) })
+    : undefined;
 const base: SuggestModel & { close(): Promise<void> } = recorded
   ? {
-      model: 'replay',
+      model: live?.model ?? 'replay',
       async decide(request) {
-        if (request.key !== 'archive-route') throw new Error('A replay makes no other call');
-        const proposal = replaying ? recorded[replaying] : undefined;
+        if (request.key !== 'archive-route') {
+          if (!live) throw new Error('A replay without --sensitivity makes no other call');
+          return live.decide(request);
+        }
+        if (!replaying || !(replaying in recorded))
+          throw new Error(`No recorded proposal for ${replaying ?? 'an unknown session'}`);
+        const proposal = recorded[replaying];
         // A recorded failure replays as an answer that does not parse, which holds as it did.
         return {
           content: proposal && typeof proposal === 'object' ? JSON.stringify(proposal) : 'no plan',
         };
       },
-      async close() {},
+      async close() {
+        await live?.close();
+      },
     }
-  : await claudeRouteModel({ home: resolve(v.home), concurrency: Number(v.concurrency) });
+  : live!;
 /** Answers the plan parser refused, kept whole so a parse failure can be told from a bad plan. */
 const unparseable: { session: string; content: string }[] = [];
 /** Every planner answer and sanitizer answer, by the session title line, for offline re-scoring. */
-const answers: { key: string; session: string; content: string }[] = [];
+const answers: {
+  key: string;
+  session: string;
+  archiveId?: string;
+  content: string;
+  tokens?: unknown;
+}[] = [];
 const model: SuggestModel = {
   model: base.model,
   decide: async (request) => {
@@ -213,7 +231,9 @@ const model: SuggestModel = {
       answers.push({
         key: request.key,
         session: request.input.split('\n')[0] ?? '',
+        ...(replaying ? { archiveId: replaying } : {}),
         content: checked.content,
+        ...(checked.tokens ? { tokens: checked.tokens } : {}),
       });
       return checked;
     }
@@ -223,7 +243,9 @@ const model: SuggestModel = {
     answers.push({
       key: request.key,
       session: request.input.split('\n')[1] ?? '',
+      ...(replaying ? { archiveId: replaying } : {}),
       content: answer.content,
+      ...(answer.tokens ? { tokens: answer.tokens } : {}),
     });
     return answer;
   },
