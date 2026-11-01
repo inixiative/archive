@@ -128,6 +128,8 @@ export async function publishArchive(
   transport: typeof fetch = fetch,
 ) {
   const destination = archiveDestinationSchema.parse(input);
+  // The go-live switch guards every publish, whoever calls.
+  if (routing.publish !== 'on') throw new Error('Publishing is off (routing.publish)');
   const archive = await store.head(id);
   const listed = await store.listing(id);
   if (

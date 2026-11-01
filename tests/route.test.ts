@@ -431,6 +431,11 @@ test('decision runs that died leave nothing behind: their directories and primed
     const transcripts = join(config, 'projects', realpathSync(dead).replace(/[^a-zA-Z0-9]/g, '-'));
     mkdirSync(transcripts, { recursive: true });
     writeFileSync(join(transcripts, 'primed.jsonl'), '{}\n');
+    // A run that died before naming itself leaves a pending directory; it is swept too.
+    const pending = join(parent, '.pending-00000000-0000-4000-8000-000000000003');
+    mkdirSync(pending);
+    writeFileSync(join(pending, '.owner'), '999999999\n');
+    expect(sweepDecisionRuns(parent, config, 'suggest')).toEqual([pending]);
     // A role sweeps only its own runs.
     expect(sweepDecisionRuns(parent, config, 'suggest')).toEqual([]);
     expect(sweepDecisionRuns(parent, config, 'route')).toEqual([dead]);
@@ -707,4 +712,58 @@ test('S5: restore lifts a tombstone only for a part; a received part is never pl
   });
   await store.capture(received, { cwd: '/z' });
   expect(await store.routingDue({ limit: 10 })).toEqual([]);
+});
+
+test('R1: a continuing part is held to the clip check too', () => {
+  const entries = ['work', 'work', 'work', 'long', 'more'].map((text, i) => ({
+    id: `e${i}`,
+    text,
+  }));
+  const prior = {
+    parts: [
+      {
+        firstEntryId: 'e0',
+        lastEntryId: 'e2',
+        organizations: ['userevidence'],
+        sensitive: false,
+        confidence: 1,
+        rationale: '',
+      },
+    ],
+    prune: [],
+    redactions: [],
+    rationale: '',
+    throughEntryId: 'e2',
+  };
+  const result = validatePlan(
+    plan([{ from: 3, to: 4, organizations: ['userevidence'], continues: true }]),
+    {
+      entries,
+      routing,
+      map,
+      evidence: {
+        key: 'k',
+        anchors: entries.map((e) => ({ entryId: e.id, writes: { zealot: 1 } })),
+        unattributedWrites: 0,
+      },
+      prior,
+      from: 3,
+      through: 4,
+      clipped: new Set(['e3']),
+      overrides: { organizations: new Set(), personal: false },
+      children: [],
+      foreign: new Map(),
+    },
+  );
+  expect(result.status).toBe('held');
+});
+
+test('an unclosed quoting tag is foreign to the end of the entry, never the session’s own', () => {
+  expect(quotedOrigins('mine <cross-session-message from="uds:x">cut off here', 'r')).toEqual([
+    'unknown',
+  ]);
+  expect(
+    quotedOrigins('<task-notification><task-id>a1</task-id><result>still running', 'r'),
+  ).toEqual(['unknown']);
+  expect(quotedOrigins('<agent-message from="a7">no close', 'r')).toEqual(['unknown']);
 });

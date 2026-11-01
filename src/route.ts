@@ -352,7 +352,7 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
     else redactions.push({ entryId: entry.id, text: r.text, reason });
   }
   const proposedPrune = new Set(proposal.prune.map((p) => idAt(p.entry)));
-  for (const part of parts)
+  for (const part of continued ? [continued, ...parts] : parts)
     if (part.organizations.some((o) => o !== PERSONAL)) {
       const from = entries.findIndex((e) => e.id === part.firstEntryId);
       const to = entries.findIndex((e) => e.id === part.lastEntryId);

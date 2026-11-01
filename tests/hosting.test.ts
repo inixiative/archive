@@ -571,3 +571,18 @@ test('L7: deleting or pruning a session deletes its parts’ copies first; a par
     delete process.env.ARCHIVE_L7_TEST_TOKEN;
   }
 });
+
+test('publishArchive itself refuses while routing.publish is off', async () => {
+  const local = await freshStore();
+  const { id } = await local.capture(snapshot('userevidence', 'guarded'));
+  const part = await routeWhole(local, id, ['userevidence']);
+  const destination: ArchiveDestination = {
+    kind: 'archive',
+    organizationId: 'userevidence',
+    url: 'http://127.0.0.1:9/',
+    tokenEnv: 'NO_TOKEN',
+  };
+  await expect(
+    publishArchive(local, part, destination, { ...routing([destination]), publish: 'off' }),
+  ).rejects.toThrow('Publishing is off');
+});

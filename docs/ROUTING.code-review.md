@@ -155,3 +155,71 @@ What holds:
 - Superseded parts are deleted.
 - The router is opt-in.
 - Plans are their own record, and evidence never travels.
+
+---
+
+## Re-review (2026-11-01, commits `6cdedd9..dd713e6`)
+
+**Verdict: ship with publish off, after two small fixes (R1, R2) and one pre-flight count (R3).** This assumes Aron accepts that genuine UE work published whole before is deleted from UE, and that some of it won't come back on its own (R4). With publish off, no change in this range can publish anything new; I checked every remote write path. Every leak I reported either now fails closed or is unreachable while publish is off. Two new gaps are left. One could publish once publish is on (R1). The other can leave a leaked copy at UE, which defeats the point of shipping now (R2).
+
+Ground truth: `dd713e6`. `bun run typecheck` passes. `bun run lint` reports 0 errors and 200 warnings. `bun test` passed 159 of 159 against a throwaway `pgvector:pg17` on random port 38401, not 6132. Probes are in `probe/rereview.test.ts` in the session scratchpad: nine tests that call `validatePlan`, `redactText`, `ArchiveStore`, `syncArchives`, an in-process destination Archive and the test Kingdom fake. Nothing live was touched, and no secrets were printed.
+
+### (1) The original leaks
+| Finding | Probe | Result |
+|---|---|---|
+| L1 gap plus `continues` | proposal `[{from:6,to:7,continues:true}]` after a plan through E2 | **held**: "continues the last part but does not start at E3" |
+| L2 personal beside an organization | `['personal','userevidence']`, sensitive | **valid, kept personal**; only the prior E0–E2 part publishes |
+| L4 overlapping redactions | "interviewing at another company" plus "company; Vlad is useless" | `I am [redacted: career, coworker]`: fixed |
+| L3 unseen text | a clipped entry in a new UE part, not pruned | **held**. **But see R1**: a *continuing* part bypasses the check |
+| L6 leaked whole copies | builder's test (unplanned, held, superseded, exempt) plus my Kingdom probe | all deleted with publish off; nothing ingested |
+| L7 orphaned parts | builder's test (a source deleted, a source pruned, a part deleted) | parts' copies deleted, and a deleted part isn't re-cut. **But see R2**: the source's *own* whole copy is orphaned |
+| S1 digest | capture, `routingInput`, capture with more entries, `recordPlan` with the old digest | **stale**; plan and parts now write in one transaction under the session lock (`underSessionLock`) |
+
+The other fixes read correctly:
+- **S2:** a subagent whose spawn isn't found now holds; plan changes mark the parent and subagents due.
+- **S3:** `quotedOrigins` sits beside `injectedTags` and runs for every source; an unknown origin is excluded.
+- **S4:** every prior part is narrowed again under today's evidence.
+- **S5:** `restore` is honored only for kind `part`, and received parts are never planned.
+- **S6:** part metadata is scoped to the part.
+
+### (2) `routing.publish off`
+**Nothing new publishes. Confirmed.**
+- The only remote writes are `publishArchive` (an ingest or `sessions.write`) and `deleteRemote`.
+- `publishArchive` has one caller, `syncArchives`. That covers both the `serve --sync` loop (`cli.ts:245`) and `/api/v1/archive/sync` (`server.ts:393`).
+- With publish off, `syncArchives` builds no publish list (`client.ts:220-222`). That is independent of destination kind.
+- The Kingdom probe executed only `sessions.delete`, while a leaked whole copy and a planned part were both present.
+- `readRouting` defaults a missing key to `off`, and every config writer spreads the existing routing. So an upgrade, or a writer that drops the key, lands on off, never on.
+- Defense in depth: `publishArchive` itself doesn't check `publish`. Add the guard there too, so a future caller can't bypass it.
+
+**What it deletes.** Every receipt on a non-part row, at every configured destination (`client.ts:283`), plus parts no longer routed. That includes **inixiative's Kingdom library**, not only UE: every whole session there is deleted until parts publish. Nothing else is deleted: routed parts are skipped, and the destination ids are this Archive's own `archiveKey`s. Kingdom refuses with 403 any document written by another Archive.
+
+**R1, a new leak (once publish is on).** A clipped entry inside a continuing part publishes. The clip check loops over `parts` only (`route.ts:355`), and a continuation is never pushed into `parts`; it becomes `continued`.
+**Probe:** a prior UE part through E2, then `{from:3,to:7,continues:true}` with E4 clipped. Result: **valid**, and the published entries are `e0…e7`. It takes an entry over 300k characters as the first new entry, so it's rare, but it's exactly L3 again. Run the clip check over `continued` too. With publish off this is unreachable.
+
+**R2, a whole copy is orphaned when its session is deleted or pruned locally.**
+- `Receipt` still cascades with its archive. For a whole session with no parts, `store.delete` (`store.ts:927`) and the retention `prune` remove its receipt, and the copy at UE is never deleted.
+- **Probe:** a leaked whole copy at a destination, its receipt held here; the session is deleted locally. Sync returns `[]`, and the remote still holds 1.
+- Normally sync deletes within 30 s. But it stays open whenever that delete is failing or backing off: an outage, or a Kingdom pair made before `sessions.delete` that gets 403s until it's re-paired.
+- Fix: retire the source's own receipts the same way parts are retired (keep the row, or keep a tombstone holding the pending deletes), or refuse `delete` and `prune` while receipts remain.
+
+**R3, receipts are the only inventory.** The deletion pass finds leaks only through this store's receipts. A copy at UE with no receipt here can't be found. That happens for sessions deleted locally before this branch, when receipts cascaded away; for copies sent from another machine; and for a destination whose identity changed (`destinationIdentity`: the URL origin and path, or the Kingdom ids). The "158 on UE" figure came from a routing preview, not from receipts. Before relying on publish off to clean UE, compare this store's receipt count for the UE destination with UE's own listing of documents carrying this Archive's `sourceId`. Delete the difference by id, or add a reconcile pass that lists the destination. I didn't run that count; it reads the live database.
+
+**R4, genuine UE work: is deleting it acceptable?** It is deleted at once, whatever its plan. It comes back only as **parts**, only after `publish on`, and only for sessions with a valid plan. New part ids mean UE's tombstones on the whole-session ids don't block them; the builder's L6 test shows a planned part publishing once publish is on.
+Rows captured before a project map existed have `evidence: null`. When their transcript is gone from disk (Claude's 30-day cleanup), the collector can't recompute it. Their UE plans hold with "no evidence for userevidence" (probe), so **that UE work never returns on its own**. The way back is a person's `route:userevidence` tag, which counts as evidence.
+Aron should accept this gap explicitly: older genuine UE sessions disappear from UE's Archive, along with anything there that reads them. The alternative is a backfill with publish on for UE-only plans, after review.
+
+### (3) Parallel machinery and regressions in the fixes
+- **Resolved:** `projectTags` is now a reduction of `sessionEvidence` over one `projectPaths`, with `containers` exposed. There's one `repositorySlug` and one `pool`, exported from `suggest.ts`. Capture and `applyParts` share `writeRevision` instead of duplicating it. `transcriptsOf` still mirrors agent-session's folder naming, with a stated reason (agent-session's sweep is private and needs a live host). That's acceptable; the cleaner fix is an exported helper in agent-session.
+- **A regression in quote detection.** `quotedBlock` (`import.ts:72`) now needs the closing tag. The old checks matched the opening tag alone. An unclosed `<cross-session-message …>` (cut by the harness, or a block that runs to the end of the entry) is now treated as the session's own text. Match an opening tag with no close as `unknown`.
+- **Minor:**
+  - A crash between `mkdirSync` and `renameSync` leaves `.pending-*` directories that the sweep never matches. They hold only `.owner`.
+  - Every Codex subagent now holds: fail-closed, but none of it reaches an organization until lineage carries the spawn.
+  - `routingContextKey` includes the roster, so any roster edit marks every plan due. It's a re-apply without a model call when nothing is new, but each due session with new entries costs a planner call.
+  - Tests: the builder added L6 and L7 tests (`hosting.test.ts`) and validator tests. Still missing: R1, R2, the unclosed-quote case, and a test that `publishArchive` refuses when publish is off.
+
+### Ranked
+1. **R2:** a local delete or prune orphans a whole copy at UE. Fix before shipping, because it's the leak the switch exists to remove.
+2. **R3:** reconcile receipts against UE's own listing before trusting the cleanup. Operational, read-only.
+3. **R4:** Aron accepts that UE loses older genuine work, or a reviewed UE re-publish follows.
+4. **R1:** clip check on continuations. Must be fixed before `publish on`.
+5. The quote-detection regression; the `publishArchive` guard; `.pending-*` directories.

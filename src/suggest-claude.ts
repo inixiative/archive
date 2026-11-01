@@ -93,7 +93,9 @@ export function sweepDecisionRuns(parent: string, configDir?: string, role?: 'su
   const swept: string[] = [];
   for (const name of readdirSync(parent)) {
     // A role sweeps its own runs: another role's transcripts live under its own login.
-    if (!RUN_DIRECTORY.test(name) || (role && !name.startsWith(`${role}-`))) continue;
+    // A run that died between creating and naming its directory leaves it pending, whatever its role.
+    const pending = /^\.pending-[0-9a-f-]{36}$/.test(name);
+    if (!pending && (!RUN_DIRECTORY.test(name) || (role && !name.startsWith(`${role}-`)))) continue;
     const dir = join(parent, name);
     let pid = 0;
     try {

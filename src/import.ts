@@ -69,6 +69,7 @@ const quotedTags = [
   'agent-message',
   'task-notification',
 ];
+const quotedOpening = new RegExp(`<(${quotedTags.join('|')})(?:\\s[^>]*)?>`, 'g');
 const quotedBlock = new RegExp(`<(${quotedTags.join('|')})(\\s[^>]*)?>([\\s\\S]*?)</\\1>`, 'g');
 
 /**
@@ -77,6 +78,10 @@ const quotedBlock = new RegExp(`<(${quotedTags.join('|')})(\\s[^>]*)?>([\\s\\S]*
  */
 export function quotedOrigins(text: string, rootSessionId: string): string[] | undefined {
   const found = new Set<string>();
+  // An opening tag with no close (cut by the harness, or running to the end) quotes to the end of
+  // the entry from someone this can't name.
+  for (const [opening, tag] of text.matchAll(quotedOpening))
+    if (!text.includes(`</${tag}>`, text.indexOf(opening))) found.add('unknown');
   for (const [, tag, attributes = '', body = ''] of text.matchAll(quotedBlock)) {
     if (tag === 'cross-session-message' || tag === 'teammate-message') found.add('unknown');
     else if (tag === 'agent-message') {
