@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { z } from 'zod';
-import { cleanupFor, destinationIdentity, type Routing, sessionOrganizations } from './config';
+import {
+  alwaysPersonal,
+  cleanupFor,
+  destinationIdentity,
+  type Routing,
+  sessionOrganizations,
+} from './config';
 import {
   evidenceByOrganization,
   evidencedOrganizations,
@@ -913,15 +919,23 @@ export class ArchiveStore {
         partOf: true,
         routedTo: true,
         supersededBy: true,
+        source: true,
+        provider: true,
         routingPlan: { select: { plan: true, wholeTo: true, wholeDigests: true } },
       },
     });
     for (const row of rows) {
+      const routed = {
+        ...row,
+        runtime: row.provider ? { provider: row.provider } : null,
+      };
       if (row.partOf) {
-        if (!row.supersededBy && sessionOrganizations(routing, row).includes(organizationId))
+        if (!row.supersededBy && sessionOrganizations(routing, routed).includes(organizationId))
           keep.add(row.id);
         continue;
       }
+      // A Muse session's copy is never kept anywhere.
+      if (alwaysPersonal(routed)) continue;
       if (
         routing.publish === 'on' ||
         cleanupFor(routing, organizationId) !== 'leaked' ||
@@ -2048,6 +2062,7 @@ export class ArchiveStore {
       session: {
         title: snapshot.title,
         source: snapshot.source,
+        ...(snapshot.runtime ? { runtime: { provider: snapshot.runtime.provider } } : {}),
         ...(snapshot.projectId ? { projectId: snapshot.projectId } : {}),
         ...(snapshot.lineage
           ? {

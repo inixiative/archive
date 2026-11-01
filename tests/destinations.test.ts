@@ -342,15 +342,19 @@ test('routing is per organization: a part publishes to every organization its pl
     );
     const routed = readRouting(file);
     const urls = (session: { partOf?: string | null; routedTo?: string[] }) =>
-      sessionDestinations(routed, session).map((d) => d.url);
+      sessionDestinations(routed, { source: 'claude-code', ...session }).map((d) => d.url);
     // Parts publish to the organizations their plan gives them, several at once.
     expect(urls({ partOf: 'session', routedTo: ['inixiative', 'userevidence'] })).toEqual([
       'https://inixiative.example/',
       'https://userevidence.example/',
     ]);
-    expect(sessionOrganizations(routed, { partOf: 'session', routedTo: ['userevidence'] })).toEqual(
-      ['userevidence'],
-    );
+    expect(
+      sessionOrganizations(routed, {
+        source: 'claude-code',
+        partOf: 'session',
+        routedTo: ['userevidence'],
+      }),
+    ).toEqual(['userevidence']);
     // A session itself, a part routed nowhere, or to an undeclared organization, publishes nowhere.
     expect(urls({ partOf: null, routedTo: ['inixiative'] })).toEqual([]);
     expect(urls({ partOf: 'session', routedTo: [] })).toEqual([]);

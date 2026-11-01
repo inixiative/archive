@@ -155,14 +155,27 @@ export function readRouting(file: string): Routing {
 }
 
 /** What routing reads of an archive: a part, and its plan's organizations. */
-export type RoutedArchive = { partOf?: string | null; routedTo?: readonly string[] };
+export type RoutedArchive = {
+  partOf?: string | null;
+  routedTo?: readonly string[];
+  source: string;
+  runtime?: { provider: string } | null;
+};
+
+/**
+ * Muse (Meta's Muse Spark) is for personal use only (Aron, 2026-11-01: "its 100% personal stuff"):
+ * a session Muse ran, collected (`muse`) or driven by Foundry (provider `meta`), reaches no
+ * organization, whatever its plan, evidence or a person's `route:` tag says.
+ */
+export const alwaysPersonal = (session: Pick<RoutedArchive, 'source' | 'runtime'>) =>
+  session.source === 'muse' || session.runtime?.provider === 'meta';
 
 /**
  * The organizations an archive publishes to: a part's, from its session's validated plan, among
  * those the routing declares. A session (not a part) publishes to none.
  */
 export function sessionOrganizations(routing: Routing, session: RoutedArchive): string[] {
-  if (!session.partOf) return [];
+  if (!session.partOf || alwaysPersonal(session)) return [];
   const routed = new Set(session.routedTo ?? []);
   return routing.organizations.filter((o) => routed.has(o.id)).map((o) => o.id);
 }

@@ -83,6 +83,10 @@ Why hold and not redact: redaction depends on finding every span, and both the p
 
 Open for Aron: Tribe (remote owner `tribeutils`) is in the inixiative org map. Inixiative?
 
+## Muse is personal only (Aron, 2026-11-01)
+
+A session Muse ran (Meta's Muse Spark: collector source `muse`, or a Foundry thread whose runtime provider is `meta`) never reaches an organization: "its 100% personal stuff". `alwaysPersonal` (`src/config.ts`) is checked where every publish is decided (`sessionOrganizations`) and where reconciliation decides what a destination may keep, so no plan, evidence or person's `route:` tag overrides it. The planner records such a session as one personal part without a model call.
+
 ## Cadence (Aron, 2026-11-01; replaces "after ~30 min idle")
 
 The planner doesn't wait for a session to go idle. A host scheduler wakes every couple of minutes. It looks for sessions with new entries since their last plan, picks the ones due (each session at most about once an hour, with due times staggered so not everything runs at once), and spawns one planner run per due session. That run owns the session's plan. Each pass is a **delta**: the prior plan plus the entries added since it. A session that has paused, with no new entries for ~30 minutes, gets its pending delta planned at once, and the plan's version bumps. Published parts change version only when their plan changes.
