@@ -32,8 +32,9 @@ You get entries E<n> (only those not planned yet), the evidence of where each en
 Cut the new entries into parts, contiguous ranges, and give each part the organizations whose work it is:
 - Work for an organization means the session was doing that organization's work: changing its repositories, reviewing its pull requests, debugging its systems. Where files changed is strong evidence; reading or mentioning something is weak. A session started in one folder can be another organization's work.
 - A part may go to several organizations when it is truly work for each. Use "personal" for anything that is not clearly some organization's work, and whenever you are unsure.
-- Mark a personal part "sensitive": true when it is personal because of what it says: career or job plans, complaints about or judgments of coworkers, personal life, investor or advisor talk, health, money.
-- Inside a work part, prune entries irrelevant to that work, and redact spans that must not reach the organization: remarks about coworkers (see the roster), career plans, personal life, investor talk, secrets (tokens, passwords, keys). A redaction quotes the exact text from one entry, character for character, as short as covers it; it is replaced with a marker.
+- Some talk is personal whatever organization it is about, even the person's own company: career or job talk (job searches, interviews, a day job, leaving, compensation), investor or advisor talk (fundraising, investors, advisors, the person's other companies), and complaints about or disparaging remarks on coworkers (see the roster: blame, judgments, who broke or deleted what). It never reaches any organization. A part that is mostly such talk is personal; inside a work part, redact it.
+- Mark a personal part "sensitive": true when it is personal because of what it says: the talk above, personal life, health, money.
+- Inside a work part, prune entries irrelevant to that work, and redact spans that must not reach the organization: the always-personal talk above, personal life, secrets (tokens, passwords, keys). A redaction quotes the exact text from one entry, character for character, as short as covers it; it is replaced with a marker.
 - To continue the plan's last part with the first new entries, set "continues": true on your first part (same organizations).
 
 Respond with JSON only:
@@ -635,12 +636,18 @@ export type RecordPlanResult = {
  */
 export const SENSITIVITY_PROMPT = `You check one part of a coding-agent session before it is published to an organization the person works for. You get the organization, its coworkers, and the part's new entries (E<n>).
 
-Return only what that organization must not see, quoted exactly from one entry, character for character, as short as covers it:
-- remarks about coworkers: complaints, blame, judgments of them, who broke or deleted what;
-- career or job plans: job searches, interviews, leaving, a day job, compensation;
+Return only what must not be published, quoted exactly from one entry, character for character, as short as covers it.
+
+These never reach any organization, whichever it is, even the person's own company and even when the talk is about that organization's business:
+- complaints about or disparaging remarks on coworkers: blame, judgments of them, who broke or deleted what;
+- career or job talk: job searches, interviews, leaving, a day job, compensation;
+- investor or advisor talk: fundraising, investors, advisors, the person's other companies.
+Find every such span in the part, not only the first: check each entry.
+
+Also remove:
 - personal life, health, money;
-- investor or advisor talk, fundraising, the person's other companies;
 - secrets: tokens, passwords, keys.
+
 The work itself stays. If the part is mostly such talk rather than work, hold it.
 
 Respond with JSON only:
