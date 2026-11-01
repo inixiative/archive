@@ -108,7 +108,8 @@ export const proposedPlanSchema = z.object({
       z.object({
         from: z.number().int().nonnegative(),
         to: z.number().int().nonnegative(),
-        organizations: z.array(z.string()).min(1).max(50),
+        /** Empty means personal. */
+        organizations: z.array(z.string()).max(50),
         sensitive: z.boolean().optional(),
         continues: z.boolean().optional(),
         confidence: z.number().min(0).max(1).optional(),
@@ -323,6 +324,30 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
   let previousEnd = context.from - 1;
   let continued: PlanPart | undefined;
   const priorParts = context.prior?.parts ?? [];
+  // A redaction that doesn't match its entry holds the part holding that entry, nothing else: that
+  // part stays personal and goes to review. One outside the entries planned holds the plan.
+  const heldParts = new Map<number, string>();
+  const redactions: Redaction[] = [...(context.prior?.redactions ?? [])];
+  for (const r of proposal.redactions) {
+    const entry = entries[r.entry];
+    const reason = REDACTION_REASONS.find((x) => x === r.reason);
+    if (!entry || !inWindow(r.entry)) {
+      issues.push(`redaction in E${r.entry} is outside the entries planned`);
+      continue;
+    }
+    const problem = !reason
+      ? `its redaction in E${r.entry} has no listed reason (${r.reason})`
+      : !r.text || r.text.length > 2_000 || !entry.text.includes(r.text)
+        ? `its redaction in E${r.entry} does not match the entry text byte for byte`
+        : undefined;
+    if (!problem) {
+      redactions.push({ entryId: entry.id, text: r.text, reason: reason! });
+      continue;
+    }
+    const holder = proposal.parts.findIndex((p) => p.from <= r.entry && r.entry <= p.to);
+    if (holder >= 0 && !heldParts.has(holder)) heldParts.set(holder, problem);
+    else if (holder < 0) notes.push(`dropped: ${problem}, in no part`);
+  }
   for (const [i, part] of proposal.parts.entries()) {
     const label = `part E${part.from}–E${part.to}`;
     if (part.from > part.to || !inWindow(part.from) || !inWindow(part.to)) {
@@ -331,7 +356,13 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
     }
     if (part.from <= previousEnd) issues.push(`${label} overlaps the part before it`);
     previousEnd = Math.max(previousEnd, part.to);
-    const organizations = [...new Set(part.organizations)];
+    const held = heldParts.get(i);
+    if (held) notes.push(`held part E${part.from}–E${part.to}: ${held}`);
+    const organizations = held
+      ? [PERSONAL]
+      : part.organizations.length
+        ? [...new Set(part.organizations)]
+        : [PERSONAL];
     const unknown = organizations.filter((o) => !known.has(o));
     if (unknown.length) issues.push(`${label} names unknown organizations: ${unknown.join(', ')}`);
     const allowed = allowedFor(entries.slice(part.from, part.to + 1));
@@ -365,6 +396,7 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
     if (
       i === 0 &&
       part.continues &&
+      !held &&
       part.from === context.from &&
       last &&
       context.from > 0 &&
@@ -377,17 +409,6 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
       continue;
     }
     parts.push(stored);
-  }
-  const redactions: Redaction[] = [...(context.prior?.redactions ?? [])];
-  for (const r of proposal.redactions) {
-    const entry = entries[r.entry];
-    const reason = REDACTION_REASONS.find((x) => x === r.reason);
-    if (!entry || !inWindow(r.entry))
-      issues.push(`redaction in E${r.entry} is outside the entries planned`);
-    else if (!reason) issues.push(`redaction in E${r.entry} has no listed reason (${r.reason})`);
-    else if (!r.text || r.text.length > 2_000 || !entry.text.includes(r.text))
-      issues.push(`redaction in E${r.entry} does not match the entry text byte for byte`);
-    else redactions.push({ entryId: entry.id, text: r.text, reason });
   }
   const proposedPrune = new Set(proposal.prune.map((p) => idAt(p.entry)));
   for (const part of continued ? [continued, ...parts] : parts)

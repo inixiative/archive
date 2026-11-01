@@ -168,3 +168,32 @@ test('S6: a part carries only its organizations’ project tags and no whole-ses
   expect(part.goalIds).toEqual([]);
   expect(part.runIds).toEqual([]);
 });
+
+test('(3) echoes are redacted: case and whitespace variants, shared runs of four words, and a roster name’s clause', () => {
+  const s = session('echo', [
+    { kind: 'user', text: 'ugh, vlad deleted a bunch of my work again. Ship the fix.' },
+    {
+      kind: 'assistant',
+      text: 'Sorry Vlad deleted a bunch of your work; restored it. Ship the fix.',
+    },
+    { kind: 'assistant', text: 'UGH,  VLAD deleted a bunch of my\nwork again' },
+    { kind: 'assistant', text: 'Grant reviewed the PR.' },
+  ]);
+  const part = partSnapshot(
+    s,
+    {
+      firstEntryId: 'e0',
+      lastEntryId: 'e3',
+      entryIds: ['e0', 'e1', 'e2', 'e3'],
+      projects: new Set(),
+      roster: ['Vlad', 'Grant'],
+    },
+    [{ entryId: 'e0', text: 'vlad deleted a bunch of my work again', reason: 'coworker' }],
+  );
+  const texts = part.entries.map((e) => e.text);
+  for (const text of texts.slice(0, 3)) expect(text.toLowerCase()).not.toContain('vlad');
+  expect(texts[0]).toContain('Ship the fix.');
+  expect(texts[1]).toContain('Ship the fix.');
+  // A roster name the redactions never touched stays.
+  expect(texts[3]).toBe('Grant reviewed the PR.');
+});

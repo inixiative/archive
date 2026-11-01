@@ -2162,7 +2162,13 @@ export class ArchiveStore {
     const parts = published.map((part) => ({
       snapshot: partSnapshot(
         snapshot,
-        { ...part, projects: projectsOf(part.organizations) },
+        {
+          ...part,
+          projects: projectsOf(part.organizations),
+          roster: routing.organizations
+            .filter((o) => part.organizations.includes(o.id))
+            .flatMap((o) => o.roster ?? []),
+        },
         result.plan.redactions,
       ),
       organizations: part.organizations,
@@ -2283,8 +2289,11 @@ export class ArchiveStore {
       const plan = row.plan ? storedPlanSchema.parse(row.plan) : undefined;
       const confidence = plan?.parts.length ? Math.min(...plan.parts.map((p) => p.confidence)) : 1;
       const redactions = plan?.redactions.length ?? 0;
+      // A part held for a bad redaction keeps the plan valid but needs a person.
+      const heldPart = row.notes.some((n) => n.startsWith('held part'));
       const due =
-        row.status === 'held' || (row.reviewedAt === null && (redactions > 0 || confidence < 0.6));
+        row.status === 'held' ||
+        (row.reviewedAt === null && (redactions > 0 || confidence < 0.6 || heldPart));
       if (!input.all && !due) return [];
       const summary = row.archive.summary as Summary;
       return [
