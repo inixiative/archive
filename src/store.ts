@@ -2109,7 +2109,14 @@ export class ArchiveStore {
         redacted: p.snapshot.entries.filter((e) => e.text.includes('[redacted: ')).length,
       })),
     };
-    if (body.dryRun) return { status: 'valid', ...outcome, holds };
+    if (body.dryRun)
+      return {
+        status: 'valid',
+        ...outcome,
+        plan: result.plan,
+        ...(body.preview ? { snapshots: parts.map((p) => p.snapshot) } : {}),
+        holds,
+      };
     // A delta that only moves `through` changes nothing a person reviewed.
     const decisions = (plan?: StoredPlan) =>
       plan && JSON.stringify([plan.parts, plan.prune, plan.redactions]);
