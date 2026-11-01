@@ -35,6 +35,7 @@ import {
   ROUTE_TAG_PREFIX,
   type RoutingEntry,
   type RoutingInput,
+  type StoredPlan,
   sensitiveEntries,
   storedPlanSchema,
   validatePlan,
@@ -360,29 +361,10 @@ export class ArchiveStore {
           summary: summarize(snapshot, settings) as Prisma.InputJsonValue,
           ...evidenceFields(evidenceOf(snapshot)),
         };
-        await tx.archive.upsert({ where: { id }, create: { id, ...fields }, update: fields });
+        await writeRevision(tx, id, snapshot, fields, old?.revision);
         // A superseded session's parts are superseded with it, so they never publish.
         if (supersededBy && supersededBy !== old?.supersededBy)
           await tx.archive.updateMany({ where: { partOf: id }, data: { supersededBy } });
-        await tx.revision.create({
-          data: {
-            archiveId: id,
-            revision,
-            digest: storedDigest,
-            snapshot: snapshot as Prisma.InputJsonValue,
-          },
-        });
-        const chunks = chunkArchive(snapshot);
-        for (let offset = 0; offset < chunks.length; offset += 1000)
-          await tx.chunk.createMany({
-            data: chunks.slice(offset, offset + 1000).map(({ encoding: _, ...chunk }, i) => ({
-              archiveId: id,
-              revision,
-              position: offset + i,
-              ...chunk,
-            })),
-          });
-        if (old) await dropRevision(tx, id, old.revision);
         return { id, digest, revision, changed: true };
         // A 64 MB session writes tens of thousands of chunks.
       },
@@ -767,35 +749,76 @@ export class ArchiveStore {
     archiveId: string,
     parts: { snapshot: ArchiveSnapshot; organizations: string[] }[],
   ) {
-    const source = await this.db.archive.findUnique({
+    return this.db.$transaction(
+      async (tx) => {
+        // The lock a capture of the session takes: plans and captures of one session serialize.
+        await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${archiveId}))`;
+        return this.applyPartsIn(tx, archiveId, parts);
+      },
+      { timeout: 120_000, maxWait: 30_000 },
+    );
+  }
+  private async applyPartsIn(
+    tx: Prisma.TransactionClient,
+    archiveId: string,
+    parts: { snapshot: ArchiveSnapshot; organizations: string[] }[],
+  ) {
+    const source = await tx.archive.findUnique({
       where: { id: archiveId },
       select: { supersededBy: true, partOf: true },
     });
     if (!source || source.partOf) throw new Error('Archive unavailable');
+    const settings = await this.settings(tx);
     const kept: string[] = [];
     for (const part of parts) {
+      const id = archiveKey(part.snapshot);
       // A part a person deleted here is never cut again.
-      if (await this.db.archiveTombstone.findUnique({ where: { id: archiveKey(part.snapshot) } }))
-        continue;
-      const { id } = await this.capture(part.snapshot, { restore: true });
-      await this.db.archive.update({
+      if (await tx.archiveTombstone.findUnique({ where: { id } })) continue;
+      const old = await tx.archive.findUnique({
         where: { id },
-        data: {
-          partOf: archiveId,
-          routedTo: [...new Set(part.organizations)].sort(),
-          supersededBy: source.supersededBy,
-        },
+        select: { partOf: true, revision: true, storedDigest: true },
       });
+      if (old && old.partOf === null)
+        throw new ArchiveConflict(`A session another writer sent holds part id ${id}`);
+      const fields = {
+        partOf: archiveId,
+        routedTo: [...new Set(part.organizations)].sort(),
+        supersededBy: source.supersededBy,
+      };
+      const storedDigest = snapshotDigest(part.snapshot);
+      if (old?.storedDigest === storedDigest)
+        await tx.archive.update({ where: { id }, data: fields });
+      else
+        await writeRevision(
+          tx,
+          id,
+          part.snapshot,
+          {
+            ...fields,
+            digest: storedDigest,
+            storedDigest,
+            transcriptDigest: transcriptDigest(part.snapshot),
+            revision: (old?.revision ?? 0) + 1,
+            source: part.snapshot.source,
+            projectId: part.snapshot.projectId ?? null,
+            actorId: part.snapshot.actor?.id ?? null,
+            provider: part.snapshot.runtime?.provider ?? null,
+            accessPath: part.snapshot.runtime?.accessPath ?? null,
+            capturedAt: part.snapshot.capturedAt,
+            summary: summarize(part.snapshot, settings) as Prisma.InputJsonValue,
+          },
+          old?.revision,
+        );
       kept.push(id);
     }
-    const retired = await this.db.archive.findMany({
+    const retired = await tx.archive.findMany({
       where: { partOf: archiveId, id: { notIn: kept } },
       select: { id: true, receipts: { select: { destination: true } } },
     });
     for (const part of retired)
       if (part.receipts.length)
-        await this.db.archive.update({ where: { id: part.id }, data: { routedTo: [] } });
-      else await this.db.archive.deleteMany({ where: { id: part.id } });
+        await tx.archive.update({ where: { id: part.id }, data: { routedTo: [] } });
+      else await tx.archive.deleteMany({ where: { id: part.id } });
     return { kept, retired: retired.map((r) => r.id) };
   }
   /**
@@ -1881,6 +1904,8 @@ export class ArchiveStore {
     const context = await this.routingContext(session, routing);
     const { row, snapshot } = session;
     const { entries, plan: prior } = context;
+    // The planner's indices describe the session as it read it.
+    if (row.digest !== body.digest) return { status: 'stale' };
     // Nothing new to plan re-applies the plan as it stands (a person's decision changed).
     const reapply =
       body.through === context.from - 1 && Boolean(prior) && !body.proposal?.parts.length;
@@ -1899,11 +1924,14 @@ export class ArchiveStore {
       if (!body.dryRun) {
         const attempt = (body.proposal ?? { failure: body.failure }) as Prisma.InputJsonValue;
         const fields = { ...record, status: 'held', attempt, issues, notes, reviewedAt: null };
-        await this.db.routingPlan.upsert({
-          where: { archiveId: body.archiveId },
-          create: { archiveId: body.archiveId, ...fields },
-          update: fields,
-        });
+        const recorded = await this.underSessionLock(body.archiveId, body.digest, (tx) =>
+          tx.routingPlan.upsert({
+            where: { archiveId: body.archiveId },
+            create: { archiveId: body.archiveId, ...fields },
+            update: fields,
+          }),
+        );
+        if (!recorded) return { status: 'stale' as const };
       }
       return { status: 'held' as const, issues, notes };
     };
@@ -1964,7 +1992,10 @@ export class ArchiveStore {
       })),
     };
     if (body.dryRun) return { status: 'valid', ...outcome, holds };
-    const changed = JSON.stringify(prior) !== JSON.stringify(result.plan);
+    // A delta that only moves `through` changes nothing a person reviewed.
+    const decisions = (plan?: StoredPlan) =>
+      plan && JSON.stringify([plan.parts, plan.prune, plan.redactions]);
+    const changed = decisions(prior) !== decisions(result.plan);
     const version = (row.routingPlan?.version ?? 0) + (changed ? 1 : 0);
     const fields = {
       ...record,
@@ -1976,13 +2007,39 @@ export class ArchiveStore {
       version,
       ...(changed ? { reviewedAt: null } : {}),
     };
-    await this.db.routingPlan.upsert({
-      where: { archiveId: body.archiveId },
-      create: { archiveId: body.archiveId, ...fields },
-      update: fields,
+    // The plan and its parts are stored together, against the digest the planner read.
+    const applied = await this.underSessionLock(body.archiveId, body.digest, async (tx) => {
+      await tx.routingPlan.upsert({
+        where: { archiveId: body.archiveId },
+        create: { archiveId: body.archiveId, ...fields },
+        update: fields,
+      });
+      return this.applyPartsIn(tx, body.archiveId, parts);
     });
-    const { retired } = await this.applyParts(body.archiveId, parts);
-    return { status: 'valid', version, ...outcome, retired, holds };
+    if (!applied) return { status: 'stale' };
+    return { status: 'valid', version, ...outcome, retired: applied.retired, holds };
+  }
+  /**
+   * Runs `work` in one transaction under the session's advisory lock (the one its captures take),
+   * only while the session is still at `digest`; undefined when it moved on.
+   */
+  private async underSessionLock<T>(
+    archiveId: string,
+    digest: string,
+    work: (tx: Prisma.TransactionClient) => Promise<T>,
+  ) {
+    return this.db.$transaction(
+      async (tx) => {
+        await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${archiveId}))`;
+        const row = await tx.archive.findUnique({
+          where: { id: archiveId },
+          select: { digest: true },
+        });
+        if (row?.digest !== digest) return undefined;
+        return work(tx);
+      },
+      { timeout: 120_000, maxWait: 30_000 },
+    );
   }
   /** The organizations whose destinations hold this session or one of its parts (receipts). */
   private async heldBy(archiveId: string, routing: Routing) {
@@ -2157,6 +2214,42 @@ export class ArchiveStore {
  * Deletes one earlier revision (its chunks cascade) unless it is current or an outbox row names it.
  * Returns how many went (0 or 1).
  */
+/**
+ * Stores a snapshot as an archive's revision: the row's fields, the revision and its chunks, and
+ * the revision it replaces compacted.
+ */
+async function writeRevision(
+  tx: Prisma.TransactionClient,
+  id: string,
+  snapshot: ArchiveSnapshot,
+  fields: Omit<Prisma.ArchiveUncheckedCreateInput, 'id'> & {
+    revision: number;
+    storedDigest: string;
+  },
+  oldRevision?: number,
+) {
+  await tx.archive.upsert({ where: { id }, create: { id, ...fields }, update: fields });
+  await tx.revision.create({
+    data: {
+      archiveId: id,
+      revision: fields.revision,
+      digest: fields.storedDigest,
+      snapshot: snapshot as Prisma.InputJsonValue,
+    },
+  });
+  const chunks = chunkArchive(snapshot);
+  for (let offset = 0; offset < chunks.length; offset += 1000)
+    await tx.chunk.createMany({
+      data: chunks.slice(offset, offset + 1000).map(({ encoding: _, ...chunk }, i) => ({
+        archiveId: id,
+        revision: fields.revision,
+        position: offset + i,
+        ...chunk,
+      })),
+    });
+  if (oldRevision !== undefined) await dropRevision(tx, id, oldRevision);
+}
+
 const dropRevision = (
   db: Prisma.TransactionClient | PrismaClient,
   archiveId: string,

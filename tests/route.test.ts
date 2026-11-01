@@ -547,3 +547,47 @@ test('L3: the planner sees every character it publishes; an entry too long to sh
   expect(held.status).toBe('held');
   expect(held.issues?.[0]).toContain('was not shown whole');
 });
+
+test('S1: a plan is recorded only against the digest it read, and stored with its parts in one transaction', async () => {
+  const { store } = await setup();
+  const first = [
+    { kind: 'user' as const, text: 'Fix zealot' },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant' as const, text: 'Fixed' },
+  ];
+  const { id } = await store.capture(session('race', first), { cwd: '/z' });
+  const input = await store.routingInput(id, routing);
+  // A capture lands while the planner runs: the plan it returns describes entries that moved.
+  await store.capture(
+    session('race', [...first, { kind: 'user', text: 'and more' }], { capturedAt: 2 }),
+    {
+      cwd: '/z',
+    },
+  );
+  const body = {
+    archiveId: id,
+    digest: input.digest,
+    through: input.through,
+    key: 'k',
+    by: 'test',
+    proposal: plan([{ from: 0, to: 1, organizations: ['userevidence'] }]),
+  };
+  expect((await store.recordPlan(body, routing)).status).toBe('stale');
+  expect(await store.db.routingPlan.count()).toBe(0);
+  // A failure while applying leaves neither the plan nor any part: here the second part's id is
+  // already a session another writer sent.
+  const fresh = await store.routingInput(id, routing);
+  await store.capture({ ...session('race#part-race-3', [{ kind: 'user', text: 'squatter' }]) });
+  const failing = {
+    ...body,
+    digest: fresh.digest,
+    through: fresh.through,
+    proposal: plan([
+      { from: 0, to: 1, organizations: ['userevidence'] },
+      { from: 2, to: 2, organizations: ['userevidence'] },
+    ]),
+  };
+  await expect(store.recordPlan(failing, routing)).rejects.toThrow();
+  expect(await store.db.routingPlan.count()).toBe(0);
+  expect(await store.list({ exempt: 'include', parts: 'only' })).toEqual([]);
+});
