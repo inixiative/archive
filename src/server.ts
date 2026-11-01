@@ -88,6 +88,10 @@ const recordPlanSchema = z.strictObject({
   failure: z.string().max(500).optional(),
   dryRun: z.boolean().optional(),
 });
+const routingDueSchema = z.strictObject({
+  limit: z.number().int().min(1).max(10_000).default(500),
+  now: z.number().optional(),
+});
 const routingPlansSchema = z.strictObject({
   all: z.boolean().optional(),
   limit: z.number().int().min(1).max(500).default(50),
@@ -340,6 +344,8 @@ export function createArchiveHandler(
             readRouting(config.destinationsFile),
           ),
         });
+      if (path === '/api/v1/archive/routing/due')
+        return json({ data: { due: await store.routingDue(routingDueSchema.parse(body)) } });
       if (path === '/api/v1/archive/routing/plans')
         return json({ data: { plans: await store.routingPlans(routingPlansSchema.parse(body)) } });
       if (path === '/api/v1/archive/routing/review')

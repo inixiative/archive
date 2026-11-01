@@ -360,7 +360,7 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
     parts: narrowed,
     prune: dedupe(prune, (p) => p.entryId),
     redactions: dedupe(redactions, (r) => JSON.stringify([r.entryId, r.text])),
-    rationale: proposal.rationale.slice(0, 1_000),
+    rationale: (proposal.rationale || context.prior?.rationale || '').slice(0, 1_000),
     throughEntryId: idAt(context.through)!,
   };
   return { status: 'valid', plan, notes };
@@ -469,6 +469,7 @@ export function quotedSessions(text: string, rootSessionId: string): string[] | 
 export interface RoutingArchive {
   routingInput(body: { archiveId: string }): Promise<RoutingInput>;
   recordPlan(body: RecordPlanBody): Promise<RecordPlanResult>;
+  routingDue(body: { limit: number }): Promise<{ archiveId: string; reason: string }[]>;
 }
 export type RecordPlanBody = {
   archiveId: string;
@@ -505,7 +506,12 @@ export async function planSession(
   const input = await archive.routingInput({ archiveId });
   const key = routeKey(model.model);
   const base = { archiveId, digest: input.digest, through: input.through, key, by: model.model };
-  if (!input.entries.length) return { status: 'stale', input };
+  if (!input.entries.length) {
+    if (!input.prior) return { status: 'stale', input };
+    // No new entries, yet due: a person's decision changed, so the plan is re-applied under it.
+    const proposal = { parts: [], prune: [], redactions: [], rationale: '' };
+    return { ...(await archive.recordPlan({ ...base, proposal, ...options })), input };
+  }
   let content: string;
   let tokens: TokenUsage | undefined;
   try {
@@ -531,6 +537,93 @@ export async function planSession(
       : { ...base, failure: 'unparseable answer', ...options },
   );
   return { ...recorded, ...(tokens ? { tokens } : {}), input };
+}
+
+export type RoutingReport = {
+  model: string;
+  due: number;
+  planned: number;
+  valid: number;
+  held: number;
+  calls: number;
+  tokens: Required<TokenUsage>;
+  sessions: {
+    archiveId: string;
+    reason: string;
+    status: string;
+    issues?: string[];
+    parts?: RecordPlanResult['parts'];
+  }[];
+};
+
+/**
+ * One pass of the scheduler: plans every due session (`routingDue`), at most `concurrency` at
+ * once, each one run owning its session's plan. A session longer than one window is planned window
+ * after window in the same pass. `limit` caps the sessions taken.
+ */
+export async function runRouting(
+  archive: RoutingArchive,
+  model: SuggestModel,
+  options: {
+    concurrency?: number;
+    limit?: number;
+    dryRun?: boolean;
+    progress?: (line: string) => void;
+  } = {},
+): Promise<RoutingReport> {
+  const due = await archive.routingDue({ limit: options.limit ?? 500 });
+  const report: RoutingReport = {
+    model: model.model,
+    due: due.length,
+    planned: 0,
+    valid: 0,
+    held: 0,
+    calls: 0,
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    sessions: [],
+  };
+  let next = 0;
+  const work = async () => {
+    while (next < due.length) {
+      const item = due[next++]!;
+      let result: Awaited<ReturnType<typeof planSession>>;
+      try {
+        for (let window = 0; ; window++) {
+          result = await planSession(
+            archive,
+            model,
+            item.archiveId,
+            options.dryRun ? { dryRun: true } : {},
+          );
+          report.calls++;
+          for (const field of ['input', 'output', 'cacheRead', 'cacheWrite'] as const)
+            report.tokens[field] += result.tokens?.[field] ?? 0;
+          const more = result.input && result.input.through < result.input.total - 1;
+          if (result.status !== 'valid' || !more || options.dryRun || window >= 50) break;
+        }
+      } catch (error) {
+        result = {
+          status: 'held',
+          issues: [error instanceof Error ? error.message : String(error)],
+        };
+      }
+      report.planned++;
+      if (result.status === 'valid') report.valid++;
+      if (result.status === 'held') report.held++;
+      report.sessions.push({
+        archiveId: item.archiveId,
+        reason: item.reason,
+        status: result.status,
+        ...(result.issues?.length ? { issues: result.issues } : {}),
+        ...(result.parts ? { parts: result.parts } : {}),
+      });
+      options.progress?.(
+        `${report.planned}/${report.due} planned · ${report.valid} valid · ${report.held} held`,
+      );
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(options.concurrency ?? 2, due.length) }, work));
+  return report;
 }
 
 export { evidenceByOrganization };

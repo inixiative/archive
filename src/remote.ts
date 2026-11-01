@@ -249,6 +249,14 @@ export class ArchiveClient {
   routingInput(body: { archiveId: string }) {
     return this.request<RoutingInput>('routing/input', body, { timeoutMs: 120_000 });
   }
+  /** Sessions due for a routing plan, in the order to plan them. */
+  async routingDue(body: { limit: number }) {
+    return (
+      await this.request<{ due: { archiveId: string; reason: string }[] }>('routing/due', body, {
+        timeoutMs: 120_000,
+      })
+    ).due;
+  }
   /** Records the planner's answer; the server validates it and, when valid, applies it. */
   recordPlan(body: RecordPlanBody) {
     return this.request<RecordPlanResult>('routing/record', body, { timeoutMs: 120_000 });

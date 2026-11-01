@@ -18,6 +18,7 @@ import {
   archiveKey,
   archiveSnapshotSchema,
   chunkArchive,
+  digest,
   selectChunks,
   snapshotDigest,
   transcriptDigest,
@@ -1816,12 +1817,17 @@ export class ArchiveStore {
     const context = await this.routingContext(session, routing);
     const { row, snapshot } = session;
     const { entries, plan: prior } = context;
-    if (body.through < context.from || body.through >= entries.length) return { status: 'stale' };
+    // Nothing new to plan re-applies the plan as it stands (a person's decision changed).
+    const reapply =
+      body.through === context.from - 1 && Boolean(prior) && !body.proposal?.parts.length;
+    if ((body.through < context.from && !reapply) || body.through >= entries.length)
+      return { status: 'stale' };
     const record = {
       key: body.key,
       by: body.by,
       digest: row.digest,
-      entries: (row.summary as Summary).entries,
+      // A plan that covers only part of the session (a window) leaves it due.
+      entries: body.through === entries.length - 1 ? (row.summary as Summary).entries : -1,
       overrides: context.overrideTags,
       at: now,
     };
@@ -1943,6 +1949,96 @@ export class ArchiveStore {
         Number(b.status === 'held') - Number(a.status === 'held') || a.confidence - b.confidence,
     );
     return items.slice(0, input.limit);
+  }
+  /**
+   * Sessions due for a routing plan, in the order to plan them: a tree's parents before their
+   * subagents, oldest change first. A session is due when it has no plan yet, or new entries since
+   * its plan (or a person changed its `route:` tags), and either it paused (no capture for
+   * `pausedMs`) or its plan is older than `intervalMs` plus a stagger of up to `staggerMs` from its
+   * id, so sessions are not all planned at once. A held plan is retried only when the session
+   * changed or its parent has been planned since. Exempt runs, parts and superseded raw captures
+   * are never planned, and a subagent waits for its parent's plan.
+   */
+  async routingDue(input: {
+    now?: number;
+    limit: number;
+    intervalMs?: number;
+    pausedMs?: number;
+    staggerMs?: number;
+  }) {
+    const now = input.now ?? Date.now();
+    const interval = input.intervalMs ?? 60 * 60_000;
+    const paused = input.pausedMs ?? 30 * 60_000;
+    const stagger = input.staggerMs ?? 10 * 60_000;
+    const rows = await this.db.archive.findMany({
+      where: { partOf: null, supersededBy: null },
+      select: {
+        id: true,
+        revision: true,
+        digest: true,
+        capturedAt: true,
+        summary: true,
+        tagEdits: true,
+        routingPlan: {
+          select: {
+            status: true,
+            plan: true,
+            entries: true,
+            digest: true,
+            overrides: true,
+            at: true,
+            issues: true,
+          },
+        },
+      },
+    });
+    const planned = new Set(rows.filter((r) => r.routingPlan?.plan).map((r) => r.id));
+    const due: { archiveId: string; capturedAt: number; depth: number; reason: string }[] = [];
+    for (const row of rows) {
+      const view = listing({ ...row, suggestion: null }, { exempt: 'include' })[0]!;
+      if (exemptRun(view.tags)) continue;
+      const summary = row.summary as Summary;
+      const lineage = summary.lineage;
+      if (lineage && lineage.kind !== 'part') {
+        const parent = archiveKey({
+          sourceId: summary.sourceId,
+          source: summary.source,
+          sessionId: lineage.parentSessionId,
+        });
+        if (!planned.has(parent)) continue;
+      }
+      const plan = row.routingPlan;
+      const overrides = row.tagEdits
+        .filter((e) => e.added && e.tag.startsWith(ROUTE_TAG_PREFIX))
+        .map((e) => e.tag)
+        .sort();
+      let reason: string | undefined;
+      if (!plan) reason = 'unplanned';
+      else if (JSON.stringify(overrides) !== JSON.stringify(plan.overrides)) reason = 'decision';
+      else if (plan.status === 'held')
+        reason =
+          plan.digest !== row.digest
+            ? 'changed'
+            : plan.issues.some((i) => i.includes('parent session'))
+              ? 'parent planned'
+              : undefined;
+      else if (summary.entries > plan.entries) reason = 'new entries';
+      if (!reason) continue;
+      if (plan && reason !== 'decision') {
+        const offset = Number.parseInt(digest(row.id).slice(0, 8), 16) % (stagger + 1);
+        const pausedNow = now - row.capturedAt >= paused;
+        if (!pausedNow && now < plan.at + interval + offset) continue;
+        if (pausedNow) reason = `${reason}, paused`;
+      }
+      due.push({
+        archiveId: row.id,
+        capturedAt: row.capturedAt,
+        depth: lineage?.depth ?? (lineage ? 1 : 0),
+        reason,
+      });
+    }
+    due.sort((a, b) => a.depth - b.depth || a.capturedAt - b.capturedAt);
+    return due.slice(0, input.limit).map(({ archiveId, reason }) => ({ archiveId, reason }));
   }
   /** A person read this plan; it leaves the review queue until it changes. */
   async reviewPlan(archiveId: string, now = Date.now()) {

@@ -88,6 +88,7 @@ const setup = async () => {
   const archive: RoutingArchive = {
     routingInput: (body) => store.routingInput(body.archiveId, routing),
     recordPlan: (body) => store.recordPlan(body, routing),
+    routingDue: (body) => store.routingDue(body),
   };
   return { store, archive };
 };
