@@ -138,6 +138,8 @@ const SEARCH_INDEX = 'chunks_text_idx';
 const TOOL_ACTIVITY_BATCH = 50;
 /** The settings row holding the host's project map (`projects/set`), for evidence at ingest. */
 const PROJECT_MAP = 'projectMap';
+/** The evidence key's prefix for evidence computed from a stored snapshot, not a transcript. */
+const STORED_EVIDENCE = 'stored:';
 /** What the routing planner reads per entry, and per request, in characters. */
 /**
  * The planner sees whole entries, as many as fit a window; one longer than a whole window is shown
@@ -1462,7 +1464,49 @@ export class ArchiveStore {
       create: { key: PROJECT_MAP, value: map },
       update: { value: map },
     });
-    return { key: projectMapKey(map) };
+    return { key: projectMapKey(map), storedEvidence: await this.evidenceFromStored(map) };
+  }
+  /**
+   * Evidence for sessions no writer sends again (a transcript the harness cleaned up, an import,
+   * a thread captured before the map existed), from the stored snapshot: its start project and the
+   * links in its text, never the tool activity the strip dropped. Its key is `stored:<map key>`, so
+   * a transcript that does come back recomputes it from the tool calls, and a new map recomputes
+   * it here. A filled row's plan is due: what it may reach changed.
+   */
+  private async evidenceFromStored(map: ProjectMap) {
+    const key = `${STORED_EVIDENCE}${projectMapKey(map)}`;
+    const rows = await this.db.archive.findMany({
+      where: {
+        partOf: null,
+        OR: [{ evidenceKey: null }, { evidenceKey: { startsWith: STORED_EVIDENCE, not: key } }],
+      },
+      select: { id: true, evidenceKey: true },
+    });
+    let filled = 0;
+    for (const { id, evidenceKey } of rows) {
+      const stored = await this.read(id);
+      if (!stored) continue;
+      const { snapshot } = stored;
+      const evidence = {
+        ...sessionEvidence(snapshot, new Set(snapshot.entries.map((e) => e.id)), map),
+        key,
+      };
+      await this.db.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
+        // A writer's capture since the read wins: only the row as it was read is filled.
+        const { count } = await tx.archive.updateMany({
+          where: { id, evidenceKey, revision: stored.revision },
+          data: { evidence: evidence as Prisma.InputJsonValue, evidenceKey: key },
+        });
+        if (!count) return;
+        filled++;
+        await tx.routingPlan.updateMany({
+          where: { archiveId: id, due: null },
+          data: { due: 'evidence' },
+        });
+      });
+    }
+    return filled;
   }
   async settings(db: Prisma.TransactionClient | PrismaClient = this.db): Promise<ArchiveSettings> {
     const row = await db.setting.findUnique({ where: { key: 'archive' } });

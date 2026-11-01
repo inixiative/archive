@@ -8,6 +8,7 @@ import {
   evidenceByOrganization,
   evidencedOrganizations,
   projectMapKey,
+  type SessionEvidence,
   sessionEvidence,
 } from '../src/evidence';
 import { type ArchiveEntry, archiveSnapshotSchema } from '../src/index';
@@ -300,4 +301,54 @@ test('formerRoots resolve a project’s old checkout paths for evidence, and mov
       },
     ]),
   ).toBeUndefined();
+});
+
+test('a session no writer can send again gets evidence from its stored snapshot, which a transcript later replaces', async () => {
+  const store = await freshStore();
+  await store.updateSettings({ captureToolCallsAndResults: false });
+  // Captured before the host sent a map, and its transcript is gone since.
+  const session = snapshot(
+    [
+      { kind: 'user', text: 'Review https://github.com/userevidence/zealot/pull/12 please' },
+      call('Edit', { file_path: '/z/a.ts' }),
+      { kind: 'tool-result', text: 'ok' },
+      { kind: 'assistant', text: 'Reviewed' },
+    ],
+    { projectId: 'template' },
+  );
+  const { id } = await store.capture(session);
+  expect((await store.db.archive.findUniqueOrThrow({ where: { id } })).evidence).toBeNull();
+  // Held for lack of evidence: the fill makes it due.
+  await store.db.routingPlan.create({
+    data: { archiveId: id, status: 'held', key: 'k', by: 'm', digest: 'd', entries: 2, at: 1 },
+  });
+
+  await store.setProjectMap(map);
+  let row = await store.db.archive.findUniqueOrThrow({ where: { id } });
+  // What the stored copy still shows: the project it started in and the link, never the edit.
+  expect(row.evidence).toMatchObject({
+    startProjectId: 'template',
+    anchors: [{ entryId: 'e0', references: { 'userevidence/zealot': 1 } }],
+  });
+  expect(JSON.stringify(row.evidence)).not.toContain('writes');
+  expect(row.evidenceKey).toBe(`stored:${projectMapKey(map)}`);
+  expect((await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } })).due).toBe(
+    'evidence',
+  );
+  expect(evidenceByOrganization(row.evidence as SessionEvidence, routing, map)).toMatchObject({
+    userevidence: { references: 1 },
+  });
+
+  // Sending the map again changes nothing.
+  await store.db.routingPlan.update({ where: { archiveId: id }, data: { due: null } });
+  await store.setProjectMap(map);
+  expect(
+    (await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } })).due,
+  ).toBeNull();
+
+  // The transcript comes back: its tool calls replace the stored copy's evidence.
+  await store.capture(session, { cwd: '/w/template' });
+  row = await store.db.archive.findUniqueOrThrow({ where: { id } });
+  expect(row.evidenceKey).toBe(projectMapKey(map));
+  expect(row.evidence).toMatchObject({ anchors: [{ entryId: 'e0', writes: { zealot: 1 } }] });
 });

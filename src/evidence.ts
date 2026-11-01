@@ -81,7 +81,8 @@ export type EntryEvidence = {
  * the tool-activity strip, and kept on this row only: never in the snapshot, so it never travels.
  */
 export type SessionEvidence = {
-  /** The project map it was computed under (`projectMapKey`). */
+  /** The project map it was computed under (`projectMapKey`), `stored:`-prefixed when computed
+   * from the stored snapshot because no transcript could be sent. */
   key: string;
   cwd?: string;
   startProjectId?: string;
