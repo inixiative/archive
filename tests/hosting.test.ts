@@ -726,3 +726,41 @@ test('R3 through Kingdom: a listed copy this Archive knows is deleted; one it ca
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('cleanup off (the default) deletes nothing at a destination; a per-organization override turns it on there only', async () => {
+  const local = await freshStore();
+  const remote = await freshStore('remote');
+  process.env.ARCHIVE_CLEANUP_TEST_TOKEN = token;
+  const server = Bun.serve({ port: 0, fetch: createArchiveHandler(remote, token) });
+  try {
+    const ue: ArchiveDestination = {
+      kind: 'archive',
+      organizationId: 'userevidence',
+      url: server.url.href,
+      tokenEnv: 'ARCHIVE_CLEANUP_TEST_TOKEN',
+    };
+    const inixiative: ArchiveDestination = {
+      ...ue,
+      organizationId: 'inixiative',
+      url: `${server.url.href}ini/`,
+    };
+    const leak = async (sessionId: string, destination: ArchiveDestination) => {
+      const { id, digest } = await local.capture(snapshot('userevidence', sessionId));
+      await remote.capture((await local.read(id))!.snapshot, { previousDigest: null });
+      await local.delivered(id, destinationIdentity(destination), digest);
+      return id;
+    };
+    const ueCopy = await leak('ue-copy', ue);
+    const iniCopy = await leak('ini-copy', inixiative);
+    const off = { ...routing([ue, inixiative]), publish: 'off' as const, cleanup: 'off' as const };
+    expect(await syncArchives(local, off)).toEqual([]);
+    expect(await remote.list({ exempt: 'include' })).toHaveLength(2);
+    // userevidence leaked; inixiative stays off.
+    const results = await syncArchives(local, { ...off, cleanupFor: { userevidence: 'leaked' } });
+    expect(results.map((r) => [r.id, r.status])).toEqual([[ueCopy, 'deleted']]);
+    expect(await local.receipt(iniCopy, destinationIdentity(inixiative))).not.toBeNull();
+  } finally {
+    server.stop(true);
+    delete process.env.ARCHIVE_CLEANUP_TEST_TOKEN;
+  }
+});

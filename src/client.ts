@@ -2,6 +2,7 @@ import { kingdomUrl, SignetClient } from '@inixiative/signet';
 import {
   type ArchiveDestination,
   archiveDestinationSchema,
+  cleanupFor,
   destinationIdentity,
   destinationToken,
   destinationUrl,
@@ -327,6 +328,8 @@ export async function syncArchives(
   const receipts = await store.deliveries();
   const pending = await store.pendingDeletes();
   for (const destination of routing.destinations) {
+    // Cleanup off: nothing is deleted or listed there; pending deletes stay queued.
+    if (cleanupFor(routing, destination.organizationId) === 'off') continue;
     const identity = destinationIdentity(destination);
     const candidates = new Set([
       ...receipts.filter((r) => r.destination === identity).map((r) => r.archiveId),

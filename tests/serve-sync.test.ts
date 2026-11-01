@@ -2,7 +2,13 @@ import { expect, test } from 'bun:test';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { connectDestination, destinationsFile, kingdomDirectory, readRouting } from '../src/config';
+import {
+  connectDestination,
+  destinationIdentity,
+  destinationsFile,
+  kingdomDirectory,
+  readRouting,
+} from '../src/config';
 import { archiveSnapshotSchema } from '../src/index';
 import { startArchiveServer } from '../src/server';
 import { freshStore, MIGRATED_DATABASE, testDatabaseUrl } from './db';
@@ -46,6 +52,7 @@ test('serve --sync publishes what it receives to its destinations from the same 
         ],
         publish: 'on',
         cleanup: 'leaked',
+        cleanupFor: {},
       }),
     );
     const reader = local.stdout.getReader();
@@ -198,6 +205,31 @@ test('routes and sync run against the Archive server of the home, without DATABA
         { kind: 'archive', organizationId: 'inixiative', url: hosted.server.url.href },
       ],
     });
+    expect(await cli('cleanup')).toEqual({ cleanup: 'off', cleanupFor: {} });
+    expect(await cli('cleanup inixiative leaked')).toEqual({
+      cleanup: 'off',
+      cleanupFor: { inixiative: 'leaked' },
+    });
+    // A whole copy the destination holds from before routing: the dry run names it, sends nothing.
+    await hosted.store.capture((await local.store.read(captured.id))!.snapshot, {
+      previousDigest: null,
+    });
+    await local.store.delivered(
+      captured.id,
+      destinationIdentity(readRouting(destinationsFile(home)).destinations[0]!),
+      captured.digest,
+    );
+    expect(await cli('sync --dry-run')).toEqual({
+      dryRun: true,
+      destinations: { [hosted.server.url.href]: { wouldDelete: 1, ids: [captured.id] } },
+      other: [],
+    });
+    expect((await hosted.store.list()).map((a) => a.sessionId)).toEqual(['routed']);
+    await hosted.store.delete(captured.id);
+    await local.store.forgetDelivery(
+      captured.id,
+      destinationIdentity(readRouting(destinationsFile(home)).destinations[0]!),
+    );
     expect(await cli('sync')).toEqual([
       { id: part.id, destination: hosted.server.url.href, status: 'published' },
     ]);

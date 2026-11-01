@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { z } from 'zod';
-import { destinationIdentity, type Routing, sessionOrganizations } from './config';
+import { cleanupFor, destinationIdentity, type Routing, sessionOrganizations } from './config';
 import {
   evidenceByOrganization,
   evidencedOrganizations,
@@ -890,7 +890,12 @@ export class ArchiveStore {
           keep.add(row.id);
         continue;
       }
-      if (routing.publish === 'on' || routing.cleanup !== 'leaked' || row.supersededBy) continue;
+      if (
+        routing.publish === 'on' ||
+        cleanupFor(routing, organizationId) !== 'leaked' ||
+        row.supersededBy
+      )
+        continue;
       const plan = row.routingPlan?.plan ? storedPlanSchema.parse(row.routingPlan.plan) : undefined;
       if (!plan || row.routingPlan?.digest !== row.digest || row.routingPlan.due === 'partial')
         continue;

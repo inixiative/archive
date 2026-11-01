@@ -331,9 +331,12 @@ export class ArchiveClient {
   routes() {
     return this.request<RoutingPreview>('destinations/routes');
   }
-  /** Publishes every archive to its organizations' destinations once. */
-  sync() {
-    return this.request<SyncResult[]>('destinations/sync', {}, { timeoutMs: 600_000 });
+  /**
+   * Publishes every archive to its organizations' destinations once. A dry run sends and deletes
+   * nothing, and reports each copy cleanup would delete under the current settings.
+   */
+  sync(options: { dryRun?: boolean } = {}) {
+    return this.request<SyncResult[]>('destinations/sync', options, { timeoutMs: 600_000 });
   }
   /** Organizations and the projects each owns (routing is per organization, projects are tags). */
   organizations() {

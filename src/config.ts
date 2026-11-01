@@ -20,6 +20,7 @@ const projectId = z
   .min(1)
   .max(256)
   .refine((id) => id !== UNROUTED, `${UNROUTED} sessions stay on this machine`);
+const cleanupMode = z.enum(['off', 'leaked', 'all']);
 /** An organization: the owner a set of projects belongs to, and where its sessions publish. */
 const organizationId = z
   .string()
@@ -80,12 +81,13 @@ export const routingSchema = z
      */
     publish: z.enum(['off', 'on']).default('off'),
     /**
-     * Which whole-session copies sync deletes while publishing is off. `leaked` (the default)
-     * keeps one only where the session's current valid plan sends the whole session to that
-     * organization unredacted and unpruned; `all` deletes every whole copy. With publishing on,
-     * every whole copy goes (parts carry the work).
+     * What sync deletes at destinations. `off` (the default): nothing; pending deletes stay
+     * queued. `leaked`: what routing doesn't send there, keeping (with publishing off) a whole copy
+     * whose current valid plan sends the whole session there unredacted and unpruned. `all`: the
+     * same, keeping no whole copy. `cleanupFor` overrides it per organization.
      */
-    cleanup: z.enum(['all', 'leaked']).default('leaked'),
+    cleanup: cleanupMode.default('off'),
+    cleanupFor: z.record(organizationId, cleanupMode).default({}),
   })
   .superRefine((routing, ctx) => {
     const ids = routing.organizations.map((o) => o.id);
@@ -104,7 +106,8 @@ const noRouting = (): Routing => ({
   organizations: [],
   destinations: [],
   publish: 'off',
-  cleanup: 'leaked',
+  cleanup: 'off',
+  cleanupFor: {},
 });
 
 /** Private regular file owned by this user; a symlink or group/world access is refused. */
@@ -267,6 +270,20 @@ export function removeOrganization(file: string, id: string) {
     destinations: routing.destinations.filter((d) => d.organizationId !== id),
   });
   return true;
+}
+
+/** The cleanup mode at an organization's destinations: its override, else the default. */
+export const cleanupFor = (routing: Routing, organizationId: string) =>
+  routing.cleanupFor[organizationId] ?? routing.cleanup;
+
+/** Sets cleanup for every organization, or overrides it for one. */
+export function setCleanup(file: string, mode: Routing['cleanup'], organizationId?: string) {
+  const routing = readRouting(file);
+  const next = organizationId
+    ? { ...routing, cleanupFor: { ...routing.cleanupFor, [organizationId]: mode } }
+    : { ...routing, cleanup: mode };
+  const written = writeRouting(file, next);
+  return { cleanup: written.cleanup, cleanupFor: written.cleanupFor };
 }
 
 /** Turns publishing to organizations on or off (`routing.publish`). */

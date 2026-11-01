@@ -389,8 +389,12 @@ export function createArchiveHandler(
         return json({ data: await routingPreview(store, readRouting(config.destinationsFile)) });
       }
       if (config && path === '/api/v1/archive/destinations/sync') {
-        z.strictObject({}).parse(body);
-        return json({ data: await syncArchives(store, readRouting(config.destinationsFile)) });
+        const { dryRun } = z.strictObject({ dryRun: z.boolean().optional() }).parse(body);
+        return json({
+          data: await syncArchives(store, readRouting(config.destinationsFile), {
+            ...(dryRun ? { dryRun } : {}),
+          }),
+        });
       }
       if (config && path === '/api/v1/archive/destinations/libraries') {
         z.strictObject({}).parse(body);

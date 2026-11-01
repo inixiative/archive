@@ -36,6 +36,7 @@ import {
   kingdomDirectory,
   readRouting,
   removeOrganization,
+  setCleanup,
   setOrganization,
   setPublish,
 } from './config';
@@ -148,6 +149,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'organizations list | organizations set --id ID [--project ID ...] [--roster NAME ...] | organizations remove --id ID   (the projects each organization owns; a session publishes to every organization its project or a project it touched belongs to)\n' +
         'route [--watch] [--concurrency 2] [--limit N] [--model claude-sonnet-5-5] [--claude-bin PATH] [--claude-config-dir DIR] [--dry-run]   (plan due sessions on the personal Claude login: parts × organizations; --watch wakes every 2 minutes)\n' +
         'route --backfill [--dry-run]   (plan every session and print the plan against what destinations hold now) | route plans [--all] | route review --id ID | route reset --id ID\n' +
+        'cleanup [ORG] [off|leaked|all]   (what sync deletes at destinations, default off; with ORG, that organization only) | sync --dry-run   (per destination, the ids cleanup would delete now)\n' +
         'publish [on|off]   (the go-live switch: off, the default, plans and deletes leaked whole-session copies but publishes nothing new)\n' +
         'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
         "settings [--capture-tool-calls-and-results true|false] [--capture-run-sessions true|false] [--retention-days N|off]   (read, or change, this Archive's settings)\n" +
@@ -329,6 +331,16 @@ export async function runCli(args = Bun.argv.slice(2)) {
         throw new Error('Destination is not an Archive-compatible endpoint');
     }
     output(connectDestination(config, destination));
+    return;
+  }
+  if (command === 'cleanup') {
+    // `cleanup MODE` sets the default; `cleanup ORG MODE` overrides it for one organization.
+    const [first, second] = positionals.slice(1);
+    const mode = second ?? first;
+    if (mode !== 'off' && mode !== 'leaked' && mode !== 'all') {
+      const routing = readRouting(config);
+      output({ cleanup: routing.cleanup, cleanupFor: routing.cleanupFor });
+    } else output(setCleanup(config, mode, second ? first : undefined));
     return;
   }
   if (command === 'publish') {
@@ -619,7 +631,23 @@ export async function runCli(args = Bun.argv.slice(2)) {
       process.removeListener('SIGTERM', stop);
     }
   } else if (command === 'sync') {
-    const results = await archive.sync();
+    const results = await archive.sync(v['dry-run'] ? { dryRun: true } : {});
+    if (v['dry-run']) {
+      // Per destination, what cleanup would delete under the current settings.
+      const byDestination: Record<string, { wouldDelete: number; ids: string[] }> = {};
+      for (const r of results.filter((r) => r.status === 'would delete')) {
+        const row = byDestination[r.destination] ?? { wouldDelete: 0, ids: [] };
+        row.wouldDelete++;
+        row.ids.push(r.id);
+        byDestination[r.destination] = row;
+      }
+      output({
+        dryRun: true,
+        destinations: byDestination,
+        other: results.filter((r) => r.status !== 'would delete'),
+      });
+      return;
+    }
     output(results);
     if (results.some((r) => r.status.startsWith('failed'))) process.exitCode = 1;
   } else if (command === 'import') {

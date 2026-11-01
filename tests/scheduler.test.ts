@@ -11,6 +11,7 @@ const routing: Routing = {
   destinations: [],
   publish: 'off',
   cleanup: 'leaked',
+  cleanupFor: {},
 };
 const map = { projects: [{ projectId: 'template', roots: ['/w/template'], repositories: [] }] };
 const session = (sessionId: string, n: number, extra: Record<string, unknown> = {}) =>
@@ -154,6 +155,7 @@ test('a backfill dry run plans every session, subagents against their parent’s
     ],
     publish: 'off',
     cleanup: 'leaked',
+    cleanupFor: {},
   };
   await store.setProjectMap({
     projects: [

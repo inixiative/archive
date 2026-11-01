@@ -135,7 +135,7 @@ Not done: S7 (asserting which account the default login is) and S8 (destination 
 | R1 | the clip check runs on a continuing part |
 | R2 | a deleted or pruned session's tombstone keeps the destinations that held it (`pending`) until each confirms; a refusal (an old Kingdom pairing's 403) stays queued; a session that comes back gets them as receipts |
 | R3 | sync reconciles each destination's own listing of this `sourceId` every ten minutes (direct Archives page `list`; Kingdom's `documents.read` has no source or paging, so only ids this Archive knows are taken) and deletes what `copiesToKeep` doesn't keep; another Archive's copies are never touched |
-| cleanup | `routing.cleanup: all \| leaked` (default `leaked`): with publishing off, a whole copy is kept only where the current valid plan sends the whole session there unredacted and unpruned |
+| cleanup | `routing.cleanup: off \| leaked \| all` (default `off`, overrides per organization in `cleanupFor`): off deletes nothing there and keeps pending deletes queued; leaked keeps, with publishing off, a whole copy its current valid plan sends there whole and unredacted; `sync --dry-run` lists per destination what would go |
 | quote regression | an unclosed quoting tag is `unknown` to the end of the entry |
 | guard | `publishArchive` refuses while `routing.publish` is off |
 | `.pending-*` | the run sweep removes them |

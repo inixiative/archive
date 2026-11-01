@@ -186,7 +186,8 @@ test('destination endpoints list delivery, libraries, connect and remove through
       organizations: [{ id: 'inixiative', projects: ['inixiative'] }],
       destinations: [],
       publish: 'off',
-      cleanup: 'leaked',
+      cleanup: 'off',
+      cleanupFor: {},
     });
     await expect(
       archive.request('destinations/remove', { ...route, organizationId: undefined }),
