@@ -14,7 +14,40 @@ export const REDACTION_REASONS = [
 export type RedactionReason = (typeof REDACTION_REASONS)[number];
 /** A span of an entry, byte for byte, and why it is replaced. */
 export type Redaction = { entryId: string; text: string; reason: RedactionReason };
-export const redactionMarker = (reason: RedactionReason) => `[redacted: ${reason}]`;
+
+/**
+ * The text with every occurrence of every redaction's span replaced, the spans found on the
+ * original text and merged where they overlap or touch, so one redaction never hides another's
+ * match. A merged span names each reason once.
+ */
+export function redactText(
+  text: string,
+  redactions: readonly Pick<Redaction, 'text' | 'reason'>[],
+) {
+  const spans: { start: number; end: number; reasons: RedactionReason[] }[] = [];
+  for (const r of redactions) {
+    if (!r.text) continue;
+    for (let at = text.indexOf(r.text); at >= 0; at = text.indexOf(r.text, at + 1))
+      spans.push({ start: at, end: at + r.text.length, reasons: [r.reason] });
+  }
+  if (!spans.length) return text;
+  spans.sort((a, b) => a.start - b.start);
+  const merged = [spans[0]!];
+  for (const span of spans.slice(1)) {
+    const last = merged.at(-1)!;
+    if (span.start <= last.end) {
+      last.end = Math.max(last.end, span.end);
+      last.reasons.push(...span.reasons);
+    } else merged.push(span);
+  }
+  let out = '';
+  let at = 0;
+  for (const span of merged) {
+    out += `${text.slice(at, span.start)}[redacted: ${[...new Set(span.reasons)].join(', ')}]`;
+    at = span.end;
+  }
+  return out + text.slice(at);
+}
 
 /** A part's session id: its session's, then the first entry it holds. Stable across re-plans. */
 export function partSessionId(sessionId: string, firstEntryId: string) {
@@ -48,11 +81,7 @@ export function partSnapshot(
   redactions: readonly Redaction[],
 ): ArchiveSnapshot {
   const keep = new Set(part.entryIds);
-  const redact = (text: string) =>
-    redactions.reduce(
-      (current, r) => (r.text ? current.replaceAll(r.text, redactionMarker(r.reason)) : current),
-      text,
-    );
+  const redact = (text: string) => redactText(text, redactions);
   // Tool activity never publishes in a part, whatever the stored copy keeps.
   const entries: ArchiveEntry[] = source.entries
     .filter((entry) => keep.has(entry.id) && !TOOL_KINDS.has(entry.kind))

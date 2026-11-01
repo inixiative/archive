@@ -137,3 +137,18 @@ test('a re-add the writer means (restore) lifts a destination’s tombstone; wit
   expect(restored.changed).toBe(true);
   expect((await destination.read(archiveKey(part)))?.snapshot.sessionId).toBe('s1#part-e0');
 });
+
+test('L4: overlapping redactions are one span over the original text; nothing between them survives', () => {
+  const s = session('overlap', [
+    { kind: 'user', text: 'I am interviewing at another company; Vlad is useless. Ship it.' },
+  ]);
+  const part = partSnapshot(
+    s,
+    { firstEntryId: 'e0', lastEntryId: 'e0', entryIds: ['e0'], projects: new Set() },
+    [
+      { entryId: 'e0', text: 'interviewing at another company', reason: 'career' },
+      { entryId: 'e0', text: 'company; Vlad is useless', reason: 'coworker' },
+    ],
+  );
+  expect(part.entries[0]!.text).toBe('I am [redacted: career, coworker]. Ship it.');
+});
