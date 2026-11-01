@@ -105,3 +105,25 @@ The planner doesn't wait for a session to go idle. A host scheduler wakes every 
 | 40b206fa84 | inixiative | UE + inixiative | no |
 
 A dry run plans the first window of a long session only (nothing is stored to continue from), and judges a subagent against its parent's whole dry-run reach, not the part at its spawn. The pass bar (every row, plus 30 UE-bound parts read whole) is not met: splitting and over-inclusion are charter work, to be tuned and measured before go-live.
+
+## Code review fixes (2026-11-01, `docs/ROUTING.code-review.md`)
+
+| Finding | Fix |
+|---|---|
+| L1 continuation sweeps gaps | a continuing part must start at the first new entry, or the plan holds |
+| L2 personal beside an organization | personal, or sensitive, with an organization is kept personal and keeps `sensitive` |
+| L3 unseen text | no per-entry clip; an entry longer than a window is shown cut and a work part holding it holds unless pruned |
+| L4 overlapping redactions | `redactText`: spans found on the original text, merged, replaced once |
+| L5 evidence gate meaning | **not changed; for Aron.** `routing.publish: off` (default) means plans are made and validated and only leaked whole copies are deleted |
+| L6 leaked whole copies | every receipt on a whole-session row is deleted, whatever the plan state; a removed destination's go once it is configured again |
+| L7 orphaned parts | `partOf` no longer cascades; deleting or pruning a session retires its parts so their copies are deleted first; a deleted part leaves a tombstone and a sticky prune |
+| S1 digest, atomicity | record only at the digest read; plan and parts in one transaction under the session's capture lock (`writeRevision` shared with capture) |
+| S2 subagent reach | spawn not found holds; plan changes mark parent and subagents due (`RoutingPlan.due`), re-applied without a model call |
+| S3 quoted text | `quotedOrigins` in `import.ts` beside the injected-tag classifier, every source; unknown or unplanned origin excluded |
+| S4 prior parts | every part re-validated on each plan or re-apply; `contextKey` makes plans due on an organization or project-map change |
+| S5 restore, kind part | `restore` honored only for parts; received parts are never planned |
+| S6 part metadata | only its organizations' project tags and run tags; no concept tags, goals, runs or session omissions |
+| Parallel machinery | `projectTags` reduces `sessionEvidence` over one `projectPaths`; one `repositorySlug`; one `pool`; agent-session's sweep is private to a live host, so the folder naming stays mirrored for dead runs |
+| Scheduler | one window a pass (`partial`), timeout 300 s from a measured window, due rows only, worktrees outside `projectMapKey` |
+
+Not done: S7 (asserting which account the default login is) and S8 (destination upgrades, Kingdom `sessions.delete`), which are operational.

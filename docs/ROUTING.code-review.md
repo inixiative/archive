@@ -1,0 +1,157 @@
+# Adversarial code review: PR #29 `feat/agentic-routing` (2026-11-01)
+
+**Verdict: REVISE. Do not install the router (`agents router`) or run a non-dry backfill yet.** The shape matches v3: one parser with two modes, plans in their own table, parts as local rows, publishing gated on `partOf` and `routedTo`, failure holds, and the old "touched project" routing is cut over. But the validator can **widen** routing in two proven ways. Three more paths publish text nobody planned or redacted. And the cleanup of the leaked whole-session copies on UE skips every session that never gets a valid plan.
+
+Ground truth: the worktree at `cbd362b`, `git diff origin/main...HEAD`. `bun run typecheck` passes. `bun run lint` reports 0 errors and 187 warnings. `bun test` ran against a throwaway Postgres (`pgvector:pg17` on port 6199), not the live instance on 6132, which the test preload would otherwise use. The first run had 1 fail and 1 error, a Prisma "Response from the Engine was empty" inside `compaction.test.ts`. The second run passed 145 of 145. The probes are in the session scratchpad (`probe/continues.ts`, `probe/cwd.ts`) and call `validatePlan` and `partSnapshot` directly. No live server, `~/.local/share/archive` or hosted Archive was touched, and no secrets were printed.
+
+---
+
+## Blocking: leak paths
+
+### L1. `continues` sweeps unplanned entries into the prior part's organization (validator widens; proven)
+`route.ts:309-322`: when the first proposed part sets `continues`, the prior last part is extended to `stored.lastEntryId`. Nothing checks that `part.from === context.from`. The evidence check (`:292-300`) covers only `[part.from, part.to]`. Entries between the prior plan's end and `part.from`, which the planner put in **no** part, end up inside the continued range. `publishedParts` then publishes the whole contiguous slice (`:402-410`).
+**Probe:** prior part E0–E2 goes to userevidence. The new window is E3–E7, and E4 = "I am interviewing at another company; Vlad is useless". The proposal is `[{from:6,to:7,organizations:['userevidence'],continues:true}]`. Result: `valid`, and the published entry ids are `e0…e7`, so E4 reaches UE with no evidence check and no part naming it.
+Fix: when `continues` is set, require `part.from === context.from`; otherwise hold. More generally, require the parts to tile the window exactly, or treat any uncovered entry as an explicit personal part.
+
+### L2. A part that names `personal` and an organization publishes to the organization (proven)
+`route.ts:298-305`: `personal` is just one more member of the closed set. `sensitive` is silently dropped unless every organization is personal. **Probe:** `{organizations:['personal','userevidence'], sensitive:true}` returns `valid` and publishes to UE. The charter says "use personal … whenever you are unsure". A plan that says personal and UE at once is the model's own uncertainty marker, and code turns it into a publish. Fix: hold, or narrow to personal, any part that mixes `personal` with an organization or sets `sensitive` together with one.
+
+### L3. Text past 8,000 characters of an entry publishes unseen
+`store.ts:139, 1714-1735`: each window entry is shown clipped to `ROUTE_ENTRY_CHARS = 8_000` with "… [N more characters]". `partSnapshot` publishes the full `entry.text` (`parts.ts:57-59`). The planner can't redact or prune what it never saw, and validation doesn't know an entry was clipped. Long pastes (Slack threads, PR bodies, a vent) are exactly the large user entries. **Scenario:** a 20k-character pasted Slack export in a Zealot session; the complaint about a coworker is at character 12,000; it is published to UE. Fix: never publish a clipped entry unless the plan prunes it. Either chunk the entry so the planner sees all of it, or hold the part.
+
+### L4. Overlapping redactions leak the remainder (proven)
+`parts.ts:51-55` applies redactions in sequence with `replaceAll`. The validator checks each redaction against the **original** text (`route.ts:325-335`). Once one redaction replaces its span, an overlapping one no longer matches. **Probe:** "interviewing at another company" (career) plus "company; Vlad is useless" (coworker) produces `I am [redacted: career]; Vlad is useless`. Fix: compute the spans on the original text, merge overlapping intervals, then replace once.
+
+### L5. The evidence gate doesn't bound the case this PR exists for (proven)
+Per v3, `evidencedOrganizations` (`evidence.ts:191-209`) admits an organization for a part when that part has any write, read or **reference**, or when the session's **start project** is in that organization. A reference is any GitHub link in any entry, including user text (`evidence.ts:106-109`). The start project adds that organization to every part of the session. **Probes:**
+- a career and "my manager Grant is awful" part with only `startProjectId: zealot` → `valid` for userevidence;
+- the same with a single `userevidence/zealot` link → `valid`;
+- the same with a single read → `valid`.
+
+So the 65fa49fe13 class (career advice in a session that read Zealot docs) and the B4 scenario (a personal thread started in `~/code/zealot`) are bounded only by the model's judgment. The dry run's held case was held only because the model named inixiative, which had no evidence. Had it named UE, the validator would have passed it. Prompt-injected text that names UE in a UE-touching session passes the same way. The B1 injection test (`route.test.ts:297-322`) covers only the no-evidence organization.
+
+Nothing then gates publishing. Confidence and redactions only order the review queue (`store.ts:1945-1981`), and a valid plan applies at once (`:1927`). The pass bar in ROUTING.md isn't met (30 UE parts unread, splitting and over-inclusion untuned), so this is the real exposure. Fix options for Aron, since this changes the meaning of the gate:
+- (a) a non-personal destination needs **writes** in that part, or a person's `route:`; reads, references and start cwd only order the queue;
+- (b) any part going to an organization other than the session's start organization, or any plan with a redaction or a `sensitive` part, is held until reviewed;
+- (c) at minimum, a go-live switch so plans are recorded but nothing publishes until the pass bar is met.
+
+### L6. Leaked whole-session copies on UE are deleted only after a valid plan, and several kinds never get one
+`client.ts:276-279` skips any held receipt where `!row.partOf && !row.routingPlan?.plan`. The test asserts this on purpose (`hosting.test.ts:434`, "neither sent nor deleted"). The whole copies already on UE then stay forever for:
+- **held sessions.** A non-dry backfill only takes `unplanned` sessions (`store.ts:2045`), so a held row (it has a `RoutingPlan` with `plan: null`) is never retried by the backfill. The scheduler retries a held plan only when the digest changes or its parent was planned (`:2053-2059`). Old sessions don't change. The 65fa49fe13 first run is exactly this: held, so its UE copy stays.
+- **superseded raw captures.** `routingDue` excludes `supersededBy` rows (`:2008`), so a raw copy published under the old rule and later fulfilled by Foundry is never planned and never deleted.
+- **exempt run sessions.** These are never planned (`:2033`); the old sync did publish them (`exempt: 'include'`).
+- **removed destinations.** `client.ts` ("A removed route keeps its receipts") skips them. If the UE destination is paused, as the design review's B7 suggests, the cleanup can never run against it.
+
+Since a whole session never routes again (`config.ts` `sessionOrganizations`), any receipt on a non-part row is a leak by definition. Delete it regardless of plan status. That needs no plan, so do it before the backfill.
+
+### L7. Deleting a source locally orphans its published parts; deleting a part locally is undone
+- The migration's `archives_partOf_fkey … ON DELETE CASCADE` and `Receipt … onDelete: Cascade` mean that `store.delete(source)`, and the retention `prune` (`store.ts:849-860`, which skips parts but cascades through the source), delete the parts and their receipts. `deliveries()` then has nothing to act on, and the parts stay at UE.
+  **Scenario:** Aron deletes a sensitive session locally and its UE part survives. Or retention prunes a 90-day-old session and its parts at UE become untracked.
+- `store.delete(partId)` is allowed. It tombstones the part locally, and its receipt cascades away. The next plan of the source runs `applyParts`, which calls `capture(..., { restore: true })` (`:775`) and lifts the tombstone. Sync then republishes with `previousDigest: null`.
+
+Fix: retire parts through `routedTo: []` before a source is deleted or pruned, and keep the source row, or a tombstone carrying its parts' receipts, until the destinations confirm. Refuse `delete` on a part, or route it to retire.
+
+---
+
+## Should fix
+
+### S1. `recordPlan` ignores the digest the planner read; plans are not atomic
+- `RecordPlanBody.digest` is sent, but `recordPlan` never compares it (`store.ts:1823-1846`; only `body.through` bounds are checked). The proposal's indices are resolved against the stripped entries **at record time**. The strip isn't append-only: `CALL_SHAPES` `codex question` drops a kept event once its answer arrives (`tool-activity.ts:155-170`), which shifts every later index by one.
+  **Scenario:** a Codex session is captured during the Sonnet call. Part boundaries move by one entry, and the first entry of a `sensitive` part falls into the preceding UE part. Validation recomputes evidence on the shifted ranges and passes when there are no redactions to mismatch.
+  Fix: send entry ids with the window and resolve proposals by id, or reject when the digest differs.
+- `recordPlan` upserts the valid plan (`:1922`) before `applyParts` (`:1927`), which runs several captures and updates with no transaction. If a capture throws partway (an `ArchiveConflict`, or a dropped run tag carried in `source.tags`), the plan says valid, some parts keep their old `routedTo`, and the session is no longer due. Nothing locks two planners on one session (`route --watch` plus a manual `route` or `--backfill`), and their `applyParts` calls interleave.
+
+### S2. A subagent's reach falls back to the parent's whole plan; parent changes don't reach children
+- `store.ts:1631-1633` calls `planReach(plan, entries, spawn)` with `spawn` undefined whenever `bySpawn` fails. `planReach` then returns every organization the parent reaches (`route.ts:441-451`). Codex lineage never carries `toolUseId` or `parentEntryId` (`import.ts:173-179`). Claude subagents without `agent-*.meta.json` don't either (`import-file.ts:64-91`). So "a subagent reaches only the parent's part at the spawn" (ROUTING.md, B4) holds only for Claude subagents with meta.
+  **Scenario:** a Codex thread's first part is UE work and its later part is a personal career thread. A subagent spawned in the career part reads Zealot and is allowed UE. Fix: no spawn found means no reach (personal), not the whole reach.
+- A parent's later `route:personal` or `route reset` retires the parent's parts only. Children are re-planned only on their own changes (`store.ts:2050-2061`), so their UE parts stay. Sessions that quote the parent keep entries admitted under its old reach. Make a parent's plan change mark its children and quoters due.
+
+### S3. Foreign-content detection is narrow, and a second recogniser
+`quotedSessions` (`route.ts:459-468`) runs only for `source === 'claude-code'` (`store.ts:1650`). It knows three tags. A `<task-notification>` whose agent isn't archived (still uncaptured, or dropped as a run) is classed `'own'` (`:1659-1667`), so the subagent's result text publishes with the parent. Codex and Foundry threads never mark foreign content. `import.ts:34-58` already classifies harness-injected tags (`injectedTags`, `onlyTagBlocks`); build on it rather than adding a parallel regex list. Unknown should mean excluded, not own.
+
+### S4. Prior parts are never re-validated
+`validatePlan` carries `priorParts` verbatim (`route.ts:342`). Moving a project between organizations (`organizations set`), removing a repository from the map, or adding a roster changes nothing that is already published. `sessionOrganizations` only intersects `routedTo` with organization ids (`config.ts`). Re-validate prior parts on a `routeKey`, `projectMapKey` or routing change, or at least narrow them.
+
+### S5. `restore` and lineage kind `part` are open to every writer
+`server.ts:41-42, 183-188` accept `restore` on any ingest, and `store.ts:306` skips the tombstone for any session. So any writer, or an old client, can resurrect a session that a destination's operator deleted. Accept `restore` only when `snapshot.lineage.kind === 'part'`. Separately, any writer may send `lineage.kind: 'part'` (`index.ts` enum). Planning such a row skips the parent wait (`store.ts:2036`) and the parent reach (`:1628`), for example an exported part imported back. Only `applyParts` should be able to create that kind; reject it at ingest otherwise.
+
+### S6. Parts carry whole-session metadata to the destination
+`parts.ts:89-103` keeps every non-`project:` tag (Atlas concept tags of every repo the session touched, collector `config.tags`), `goalIds`, `runIds`, `actor`, `runtime` and the source's `coverage.omissions`. **Scenario:** a UE part of a mixed session carries `atlas:` concepts from Kingdom or Oracle internals. Scope these to the part's projects, or drop them.
+
+### S7. The login pin is an assumption
+`claudeRouteModel` forces the default `~/.claude` (`suggest-claude.ts:200-208`). `claudeSubscription` checks only `authMethod === 'claude.ai'`. Nothing checks *which* login `~/.claude` holds; I didn't check it myself. Assert the expected account (`auth status` org or email against a configured personal identity), or every session's text goes to whatever organization owns the default login.
+
+### S8. Destinations and Kingdom
+- An older destination refuses parts. `lineage.kind: 'part'` fails its enum, and the `restore` key fails its `strictObject` ingest schema. That is a 400, so a per-archive backoff and retries; nothing leaks, and `delete` still works there. Upgrade UE's Render Archive before go-live, or every UE part fails.
+- Kingdom has no `sessions.delete` yet, so deletes on inixiative's hosted library retry forever. The test's fake Kingdom accepts it (`hosting.test.ts:361-369`). What Kingdom's own snapshot validation does with kind `part` is unverified.
+
+---
+
+## Parallel machinery
+
+1. **`sessionEvidence` re-implements `projectTags`' loop.** It has its own root flattening, container set and `resolvePath` walk (`evidence.ts:74-84` against `tags.ts` `projectTags`). ROUTING.md says the evidence counts "come from the loop `projectTags` already runs". It doesn't, and the two have already diverged: `projectTags` drops a `/` root and counts the cwd itself. Make `projectTags` a reduction of `sessionEvidence`, or the other way round, so "which project is this path" has one definition.
+2. **`sweepDecisionRuns` and `transcriptsOf` duplicate agent-session.** `ClaudePrimedSessions._projectDirectory` and `_sweepTranscripts` (`node_modules/@inixiative/agent-session/src/claude-primed.ts:310-357`) use the same folder encoding, re-typed in `suggest-claude.ts:59-70`. Extend agent-session with a stale-run sweep and remove-on-close instead.
+3. **A second injected-content recogniser:** `quotedSessions` beside `import.ts` `injectedTags` (S3).
+4. **Three repository-slug parsers** (`evidence.ts` `slugOf`, `tags.ts` `repositorySlug`, `provenanceReferences`), and two worker pools in `route.ts` (`runRouting` and `runBackfill`'s `pool`).
+5. **`routedTo` denormalizes `RoutingPlan.plan`** and can drift from it (S1, the non-atomic apply).
+
+These reuse what exists, correctly: `shellAccess` / `toolCallAccess` (one parser, two modes); `RoutingPlan` as its own record (not `Suggestion`); `deleteRemote` over the existing `delete` endpoint; publishing through `publishArchive` and its digest-ack; overrides as tag edits. The diff adds no `any`. `projectMap(db = this.db)` follows Archive's existing `settings(db)` pattern, which conflicts with the "never pass the database" rule. That's a repo-wide question, not this PR's.
+
+---
+
+## Scheduler and runner
+
+- **Cost bounds.** A non-dry pass plans a long session window after window, up to 51 windows of 300k characters each, in one pass (`route.ts:604-616`). There is no per-session or per-pass token budget. Only a dry run stops after the first window. The 120 s timeout (`suggest-claude.ts:154`) against a window of about 75k tokens is unmeasured. If it times out, the session is held and retried hourly while it is live, spending a full window each time with no progress.
+- **Load.** Every 2 minutes, `routingDue` loads every archive row with its summary, tag edits and plan JSON (`store.ts:2007-2028`). `routingContext` runs an unindexed JSON-path query for children and re-reads and re-strips every quoted session. Every 30-second sync, `deliveries()` loads every receipt with its plan JSON.
+- **Re-capture churn.** `route --watch` and `collect` re-send the project map on every pass (`cli.ts`). Any new worktree changes `projectMapKey`, and the collector then re-captures every session to recompute evidence (`collector.ts:563-564`).
+- **Crashed runs and stray transcripts.** Mostly handled: `.owner` plus a sweep at start, and close removes its own run. Two caveats:
+  - The `.owner` file is written after `mkdir` (`suggest-claude.ts:142-143`), so a concurrent sweep can remove a live run's directory.
+  - The router sweeps `suggest-*` directories too, but looks for their transcripts under its own config directory. A tagger that ran under another `CLAUDE_CONFIG_DIR` leaves its primed transcripts orphaned. They hold the charter only.
+- **Review churn.** `changed` compares the whole plan, `throughEntryId` included (`store.ts:1910`). Every delta bumps the version and clears `reviewedAt`, so a reviewed plan with redactions re-enters the queue on every delta.
+
+---
+
+## Data model and migrations
+- The `partOf` cascade with receipt cascade is L7.
+- `routedTo` duplicates the plan (P5).
+- `RoutingPlan.entries = -1` as "partial" is a sentinel. It works only because `summary.entries > -1`.
+- The evidence columns stay local and never reach a snapshot or the API (`listing` builds its own shape). Good.
+- The migrations are additive. On upgrade, every whole-session publish stops at once (intended), and the existing receipts stay until L6 is fixed.
+- Tombstone `restore` is tested both ways (`parts.test.ts:124`), but it is open to every writer (S5).
+
+## Tests: what they prove and what they don't
+They prove the happy paths and the narrowings in the spec: unknown organizations, no-evidence organizations, byte-exact redactions, the parent-reach filter at a found spawn, sticky sensitive parts, superseded parts, delete and restore on re-plan, and the Kingdom delete call against a fake. The model is scripted throughout, so the charter itself is never tested; the dry run in ROUTING.md is the only evidence on that. Missing, each one a finding above:
+- L1: a gap plus `continues`.
+- L2: `personal` mixed with an organization.
+- L3: a clipped entry.
+- L4: overlapping redactions.
+- L5: injection, or a model mistake, on an organization that *has* weak evidence (start cwd, one read, one link).
+- L6: held, superseded and exempt whole copies, and a removed destination.
+- L7: a source deleted or pruned with published parts; a part deleted locally.
+- S1: a capture landing between input and record that shifts entries; two concurrent planners; `applyParts` failing partway.
+- S2: a Codex subagent, or a spawn not found; a parent re-routed personal after its child published.
+- S3: a task notification for an uncaptured agent; Codex foreign content.
+
+Separately, the flake in `compaction.test.ts` ("Response from the Engine was empty") should be looked at.
+
+## Ranked verdict
+1. **L1** `continues` gap widening. Proven; a real widening by the validator.
+2. **L5** weak evidence (start cwd, one read, one link) admits UE for personal parts, and no publish gate exists. Proven; this is the leak class the PR exists for.
+3. **L6** leaked whole copies are kept for held, superseded, exempt and removed-route sessions.
+4. **L3** text past 8,000 characters publishes unseen.
+5. **L4** overlapping redactions leak. Proven.
+6. **L2** `personal` with an organization publishes. Proven.
+7. **L7** a local delete or retention prune orphans remote parts; a local part delete is undone.
+8. **S2** subagent reach falls back to the parent's whole plan (all Codex subagents); a parent's re-route doesn't reach its children.
+9. **S1** the digest is ignored, so indices shift on re-capture; plan and apply are not atomic; no planner lock.
+10. **S3, S5, S4, S6, S7, S8**, then the parallel machinery (P1, P2 first), then the scheduler, cost and test gaps.
+
+What holds:
+- Whole sessions no longer publish.
+- Failure holds the session.
+- The planner's organization names come from a closed set.
+- Unknown foreign reach excludes the entry.
+- New entries publish nowhere until they are planned.
+- Superseded parts are deleted.
+- The router is opt-in.
+- Plans are their own record, and evidence never travels.
