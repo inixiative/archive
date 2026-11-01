@@ -84,8 +84,15 @@ const { values: v } = parseArgs({
     label: { type: 'string', default: 'run' },
     out: { type: 'string' },
     concurrency: { type: 'string', default: '2' },
-    /** UNDER EXPERIMENT: run the sanitizing second call per work part. */
+    /** Run the sensitivity pass (the second call per work part). */
     sensitivity: { type: 'boolean', default: false },
+    /**
+     * With --replay: no model call at all. The pass's answers come from the replayed run's own
+     * recorded answers too, matched to each part; a call nothing recorded fits fails the run.
+     */
+    offline: { type: 'boolean', default: false },
+    /** `routing.personalSpans` for the run: `hold` (the shipped default) or `redact`. */
+    'personal-spans': { type: 'string', default: 'hold' },
     /** Plan and score only these case labels (comma-separated): a tiny test. */
     only: { type: 'string' },
     /**
@@ -109,7 +116,9 @@ const only = v.only ? new Set(v.only.split(',').map((label) => label.trim())) : 
 const routing: Routing = routingSchema.parse({
   organizations: cases.organizations,
   destinations: [],
+  personalSpans: v['personal-spans'],
 });
+if (v.offline && !v.replay) throw new Error('--offline replays a run: --replay is required');
 const store = new ArchiveStore(database.href);
 const agents = readAgents(resolve(v.agents));
 if (!agents) throw new Error(`No agents config at ${v.agents}`);
@@ -183,14 +192,55 @@ if (v['import-only']) {
 
 // The charter under test replaces the shipped one; everything else is the shipped path.
 const charter = v.charter ? readFileSync(v.charter, 'utf8') : ROUTE_PROMPT;
-const recorded = v.replay
-  ? (JSON.parse(readFileSync(v.replay, 'utf8')) as { proposals: Record<string, unknown> }).proposals
+const replayed = v.replay
+  ? (JSON.parse(readFileSync(v.replay, 'utf8')) as {
+      proposals: Record<string, unknown>;
+      answers?: { key: string; archiveId?: string; content: string }[];
+    })
   : undefined;
+const recorded = replayed?.proposals;
 /** In a replay (concurrency 1), the session whose input was read last: the one being planned. */
 let replaying: string | undefined;
-// A replay answers the planner from the recorded run; the sensitivity pass, when on, is live.
+// Offline: the pass's recorded answers, each used once. A live run at concurrency > 1 may have
+// tagged an answer with the wrong session, so an answer is matched to the part it quotes.
+const recordedChecks = (replayed?.answers ?? [])
+  .filter((a) => a.key === 'archive-sensitivity')
+  .map((a) => {
+    let texts: string[] = [];
+    try {
+      const parsed = JSON.parse(
+        a.content.slice(a.content.indexOf('{'), a.content.lastIndexOf('}') + 1),
+      );
+      texts = Array.isArray(parsed?.redactions)
+        ? parsed.redactions.flatMap((r: { text?: unknown }) =>
+            typeof r?.text === 'string' ? [r.text] : [],
+          )
+        : [];
+    } catch {}
+    return { ...a, texts, used: false };
+  });
+/** How each offline pass answer was matched: by the text it quotes, or by its session tag. */
+const matched = { quoted: 0, tagged: 0, clean: 0 };
+const offlineCheck = (input: string) => {
+  const open = recordedChecks.filter((a) => !a.used);
+  const own = (a: (typeof open)[number]) => a.archiveId === replaying;
+  const quotes = open
+    .filter((a) => a.texts.length && a.texts.every((t) => input.includes(t)))
+    .sort((a, b) => Number(own(b)) - Number(own(a)));
+  const clean = open.filter((a) => !a.texts.length && /"hold"\s*:\s*false/.test(a.content));
+  const pick =
+    quotes[0] ?? clean.find(own) ?? open.find((a) => own(a) && !a.texts.length) ?? clean[0];
+  if (!pick) throw new Error(`No recorded sensitivity answer fits a part of ${replaying}`);
+  pick.used = true;
+  if (quotes[0] === pick) matched.quoted++;
+  else if (clean.includes(pick)) matched.clean++;
+  else matched.tagged++;
+  return { content: pick.content };
+};
+// A replay answers the planner from the recorded run; the sensitivity pass, when on, is live,
+// unless offline.
 const live =
-  !recorded || v.sensitivity
+  !v.offline && (!recorded || v.sensitivity)
     ? await claudeRouteModel({ home: resolve(v.home), concurrency: Number(v.concurrency) })
     : undefined;
 const base: SuggestModel & { close(): Promise<void> } = recorded
@@ -198,6 +248,7 @@ const base: SuggestModel & { close(): Promise<void> } = recorded
       model: live?.model ?? 'replay',
       async decide(request) {
         if (request.key !== 'archive-route') {
+          if (v.offline) return offlineCheck(request.input);
           if (!live) throw new Error('A replay without --sensitivity makes no other call');
           return live.decide(request);
         }
@@ -273,7 +324,8 @@ let report: Awaited<ReturnType<typeof runBackfill>>;
 try {
   report = await runBackfill(archive, model, {
     dryRun: true,
-    ...(v.sensitivity ? { sensitivity: true } : {}),
+    // The pass is on by default in the shipped path; here it runs only when asked for.
+    sensitivity: v.sensitivity,
     ...(only
       ? { only: new Set(cases.cases.filter((c) => only.has(c.label)).map((c) => sessionOf(c).id)) }
       : {}),
@@ -390,6 +442,8 @@ type Score = Judgement & {
   prunes: number;
   parent?: { status: string; reach: string[] };
   strict: Judgement;
+  /** Parts held for review: for personal-only talk found in them, and for other reasons. */
+  heldParts: { detected: number; other: number };
 };
 const scores: Score[] = [];
 for (const c of cases.cases.filter((c) => !only || only.has(c.label))) {
@@ -425,6 +479,14 @@ for (const c of cases.cases.filter((c) => !only || only.has(c.label))) {
     })),
     redactions: result?.plan?.redactions.length ?? 0,
     prunes: result?.plan?.prune.length ?? 0,
+    heldParts: {
+      detected: (result?.notes ?? []).filter(
+        (n) => n.startsWith('held part') && n.includes('personal for every organization'),
+      ).length,
+      other: (result?.notes ?? []).filter(
+        (n) => n.startsWith('held part') && !n.includes('personal for every organization'),
+      ).length,
+    },
     // What publishes, in characters, each redaction marker counted as none (over-redaction).
     publishedChars: published.reduce(
       (n, p) =>
@@ -448,6 +510,8 @@ const count = (pick: (s: Score) => boolean, undisputed = false) =>
   scores.filter((s) => (!undisputed || !s.disputed) && pick(s)).length;
 const output = {
   label: v.label,
+  personalSpans: routing.personalSpans,
+  ...(v.offline ? { offline: { replayed: v.replay, matched } } : {}),
   charter: new Bun.CryptoHasher('sha256').update(charter).digest('hex').slice(0, 16),
   at: new Date(started).toISOString(),
   seconds: Math.round((Date.now() - started) / 1000),

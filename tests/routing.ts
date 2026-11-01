@@ -17,6 +17,7 @@ export const routing = (
   publish: 'on',
   cleanup: 'leaked',
   cleanupFor: {},
+  personalSpans: 'hold',
 });
 
 /**

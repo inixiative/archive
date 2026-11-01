@@ -10,7 +10,7 @@ import {
   type SessionEvidence,
 } from './evidence';
 import type { ArchiveEntry, ArchiveSnapshot } from './index';
-import { REDACTION_REASONS, type Redaction } from './parts';
+import { PERSONAL_ONLY_REASONS, REDACTION_REASONS, type Redaction } from './parts';
 import { pool, type SuggestModel, type TokenUsage } from './suggest';
 
 /** The organization a part stays in when it is no organization's: this machine only. */
@@ -339,8 +339,9 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
   let previousEnd = context.from - 1;
   let continued: PlanPart | undefined;
   const priorParts = context.prior?.parts ?? [];
-  // A redaction that doesn't match its entry holds the part holding that entry, nothing else: that
-  // part stays personal and goes to review. One outside the entries planned holds the plan.
+  // A redaction that doesn't match its entry, or one of personal-only talk in a work part (with
+  // `personalSpans: hold`), holds the part holding that entry, nothing else: that part stays
+  // personal and goes to review. One outside the entries planned holds the plan.
   const heldParts = new Map<number, string>();
   const redactions: Redaction[] = [...(context.prior?.redactions ?? [])];
   for (const r of proposal.redactions) {
@@ -357,6 +358,16 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
         : undefined;
     if (!problem) {
       redactions.push({ entryId: entry.id, text: r.text, reason: reason! });
+      // Career, investor and coworker talk in a work part: the part goes to review, whole.
+      if (context.routing.personalSpans === 'hold' && PERSONAL_ONLY_REASONS.includes(reason!)) {
+        const holder = proposal.parts.findIndex((p) => p.from <= r.entry && r.entry <= p.to);
+        const part = proposal.parts[holder];
+        if (part?.organizations.some((o) => o !== PERSONAL) && !heldParts.has(holder))
+          heldParts.set(
+            holder,
+            `it holds ${reason} talk (E${r.entry}), personal for every organization`,
+          );
+      }
       continue;
     }
     // Its text still goes wherever an echo of it appears, in every part.
@@ -487,7 +498,7 @@ export function validatePlan(proposal: ProposedPlan, context: ValidationContext)
     heldForReview: [],
   };
   plan.sensitive = [...new Set([...priorSensitive, ...sensitiveEntries(plan, entries, false)])];
-  // A part held for a bad redaction stays personal until a person reviews the plan.
+  // A held part stays personal until a person reviews the plan.
   const held = proposal.parts.flatMap((p, i) =>
     heldParts.has(i) ? entries.slice(p.from, p.to + 1).map((e) => e.id) : [],
   );
@@ -768,7 +779,7 @@ export async function planSession(
     tokens?: TokenUsage;
     input?: RoutingInput;
     calls?: number;
-    /** UNDER EXPERIMENT: what the sensitivity pass did. */
+    /** What the sensitivity pass did. */
     sensitivity?: { calls: number; held: number; unreadable: number; tokens: Required<TokenUsage> };
   }
 > {
@@ -818,7 +829,8 @@ export async function planSession(
     );
     return { ...(await archive.recordPlan({ ...base, failure, ...options })), input };
   }
-  const { sensitivity, ...recordOptions } = options;
+  // The sensitivity pass is on unless turned off.
+  const { sensitivity = true, ...recordOptions } = options;
   let proposal = parsePlan(content);
   let calls = 1;
   let sensitivityReport:
@@ -890,6 +902,8 @@ export async function runRouting(
     concurrency?: number;
     limit?: number;
     dryRun?: boolean;
+    /** The sensitivity pass; on unless `false`. */
+    sensitivity?: boolean;
     progress?: (line: string) => void;
   } = {},
 ): Promise<RoutingReport> {
@@ -912,12 +926,10 @@ export async function runRouting(
       let result: Awaited<ReturnType<typeof planSession>>;
       try {
         for (let window = 0; ; window++) {
-          result = await planSession(
-            archive,
-            model,
-            item.archiveId,
-            options.dryRun ? { dryRun: true } : {},
-          );
+          result = await planSession(archive, model, item.archiveId, {
+            ...(options.dryRun ? { dryRun: true } : {}),
+            ...(options.sensitivity === false ? { sensitivity: false } : {}),
+          });
           report.calls += result.calls ?? 1;
           for (const field of ['input', 'output', 'cacheRead', 'cacheWrite'] as const)
             report.tokens[field] += result.tokens?.[field] ?? 0;
@@ -986,7 +998,7 @@ export async function runBackfill(
     dryRun?: boolean;
     concurrency?: number;
     limit?: number;
-    /** UNDER EXPERIMENT: a second, sanitizing call per work part (`sensitivityPass`). */
+    /** The second, sanitizing call per work part (`sensitivityPass`); on unless `false`. */
     sensitivity?: boolean;
     /** Plan only these archives (a tiny test); others are left unplanned. */
     only?: ReadonlySet<string>;
@@ -1043,7 +1055,7 @@ export async function runBackfill(
       return await planSession(archive, model, archiveId, {
         ...(options.dryRun ? { dryRun: true } : {}),
         ...(options.dryRun && parentReach ? { assumeParentReach: parentReach } : {}),
-        ...(options.sensitivity ? { sensitivity: true } : {}),
+        ...(options.sensitivity === false ? { sensitivity: false } : {}),
       });
     } catch (error) {
       return {

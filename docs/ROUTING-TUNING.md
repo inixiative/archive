@@ -190,3 +190,33 @@ Two runs on the shipped charter (`v0-baseline.txt`, sha `1f99358a`), on this bra
 - 512aaec0a6: one part to inixiative, 1 of 4 markers published. The planner redacted 2 career and 2 investor spans; the pass added career and investor redactions of its own. Both missed the same remaining phrase, in the opener's third entry (the person's other companies).
 - 01b0bda06a: one part to inixiative and userevidence, 0 markers. The coworker remark was redacted twice, so its echo was caught.
 - No pass answer was unreadable.
+
+## Hold on detect, scored offline (post-hoc, not pre-registered; 2026-11-01)
+
+**Policy (coordinator's instruction after Aron's ruling).** When the planner or the sensitivity pass finds any span of career or job, investor or advisor, or coworker-complaint talk in a work part, the whole part stays personal and goes to review (`heldForReview`, sticky until `route review`). Secrets and personal-life spans still redact and publish. Shipped as `routing.personalSpans: hold` (default), with `redact` keeping the old behaviour.
+
+**Method.** Every recorded run was replayed through this branch's code with **zero model calls**: `--replay` feeds back the recorded planner proposals, and `--offline` feeds back the pass's recorded answers too, each matched to the part it quotes. Every run reported 0 tokens. Each run was scored twice, `--personal-spans redact` and `hold`, with markers counted anywhere in the published text (`within` dropped; the 7-name roster the runs used).
+- **Sanity:** `redact` reproduces every recorded run case for case. Two differences, both expected:
+  - treatment-b 01b0bda06a publishes 29 fewer characters, from #36's case-insensitive echo;
+  - fix-a and fix-b predate `publishedChars`.
+- **Two caveats:**
+  - The runner records proposals after the pass's redactions were merged in. For treatment and tiny runs, the replayed proposal therefore already carries the pass's findings, and replaying the pass again is idempotent.
+  - Under `hold`, a part the planner's own findings already hold is never sent to the pass. The tiny runs' hold replays made no pass call for that reason, which is also how production behaves.
+
+**Results.** fix-a/b replay the same proposals as control-a/b and score identically to them, so they're omitted.
+
+| Run (planner · pass) | 512aaec0a6 markers to a work org: redact → hold | 01b0bda06a: redact → hold | Parts held for personal-only talk (all cases) | Published characters lost vs control |
+|---|---|---|---|---|
+| control-a (#35 planner · none) | 1 → 1 | 0 → 0 | 1 (01b0bda06a, already personal in control) | 0 on every case |
+| control-b (#35 planner · none) | 4 → 4 | 1 → 1 | 0 | 0 on every case |
+| treatment-a (#35 planner · pass) | 0 → 0 | 0 → 0 | 2 (512aaec0a6, 01b0bda06a) | 512aaec0a6 100% (142,458 → 0); non-targets ≤ 0.04% (the pass's own redactions) |
+| treatment-b (#35 planner · pass) | 3 → **0** | 0 → 0 | 2 (512aaec0a6, 01b0bda06a) | 512aaec0a6 100% (149,548 → 0); 01b0bda06a 100% (69,090 → 0); 95a4acd0e0 0.7% (pass redaction); others 0 |
+| sens-tiny (#35 planner · pass, targets only) | 2 → **0** | 0 → 0 | 2 | both targets 100% |
+| personal-tiny (always-personal planner · pass, targets only) | 1 → **0** | 0 → 0 | 2 | both targets 100% (vs control-b) |
+
+**Reading.**
+- **With the pass, hold on detect brought markers reaching a work org to 0 in every run.** The three spans the pass missed in treatment-b, the two in sens-tiny and the one in personal-tiny no longer publish, because each of those parts had at least one detected span and the whole part was held.
+- **Without the pass, hold on detect changes nothing.** In control-b the #35 planner proposed no personal-only redaction in either target, so nothing was detected and the 4 + 1 markers still publish. Hold can only act on detection, which is the pass's job.
+- **The cost is whole sessions of real work.** Each target is one part, so a hold keeps all of it personal: 512aaec0a6's ~142–150k characters of template work and 01b0bda06a's ~69k of Zealot and json-rules work wait for review. Hold is only as fine-grained as the planner's split. A planner that cut the opener into its own part would hold only that.
+- **No non-target case was held in any run.** Routing of the other 9 cases is unchanged from each run's control.
+- **This is post-hoc** (designed after seeing the runs, on the same two sessions). Nothing here estimates how often the pass detects nothing in a part that holds such talk. In these runs it found something in every target part, in 4 of 4 runs.

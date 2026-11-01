@@ -66,6 +66,16 @@ A hosted personal Archive (none exists; personal = local); "another Kingdom" rou
 8. **Expose via lens is deferred (B3).** Kingdom applies the lens only to search. Read returns any document, Archive's tag filter takes a single tag, and `project:` tags mean "touched", not "about". Changing what a lens permits gets its own spec. Until then, primitives work useful to Zealot is duplicated as a part, which Aron allowed.
 9. **Write attribution (S5).** Zealot worktrees under `/private/tmp` resolve to Zealot through `git worktree list`, not as neutral temp. `gh --repo X` in the space form counts. A third-party repo inside the container is personal.
 
+## Personal-only talk: the second check and hold on detect (Aron, 2026-11-01)
+
+Career or job talk, investor or advisor talk, and complaints about or disparaging remarks on coworkers are personal for every organization, inixiative included; they never publish to any organization. Secrets and personal life are redacted as before.
+
+- **The planner** is told so: such talk is personal whatever organization it is about, even the person's own company.
+- **The sensitivity pass** (on by default; `route --no-sensitivity` turns it off) makes a second Sonnet-low call per part that would publish to an organization. The call reads that part's entries, its organizations and their rosters, and returns redactions or a hold. It can only remove: its redactions join the planner's, and a hold or an unreadable answer keeps the part personal.
+- **Hold on detect** (`routing.personalSpans: hold`, the default; `archive personal-spans hold|redact`): when the planner or the pass finds a span of personal-only talk in a work part, the whole part stays personal and its entries go to `heldForReview`. They stay personal through re-plans until `route review`. With `redact`, the span is redacted and the part publishes.
+
+Why hold and not redact: redaction depends on finding every span, and both the planner and the pass missed spans in the runs measured (ROUTING-TUNING.md). A hold depends only on finding one. Its cost is that a work part holding such talk publishes nothing until a person reviews it.
+
 Open for Aron: Tribe (remote owner `tribeutils`) is in the inixiative org map. Inixiative?
 
 ## Cadence (Aron, 2026-11-01; replaces "after ~30 min idle")

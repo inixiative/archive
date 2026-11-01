@@ -37,6 +37,7 @@ const routing: Routing = {
   publish: 'off',
   cleanup: 'leaked',
   cleanupFor: {},
+  personalSpans: 'hold',
 };
 const call = (input: object, name = 'Edit') => ({
   kind: 'tool-call' as const,
@@ -66,11 +67,14 @@ const session = (
     ...extra,
   });
 /** A model that answers with the plan the test scripts, recording what it was shown. */
-const scripted = (plans: (ProposedPlan | string | Error)[]) => {
+/** The planner answers from `plans`; the sensitivity pass finds nothing unless `checks` says. */
+const scripted = (plans: (ProposedPlan | string | Error)[], checks: string[] = []) => {
   const seen: string[] = [];
   const model: SuggestModel = {
     model: 'claude-sonnet-5-5',
-    async decide({ input }) {
+    async decide({ key, input }) {
+      if (key === 'archive-sensitivity')
+        return { content: checks.shift() ?? '{"hold": false, "redactions": []}' };
       seen.push(input);
       const next = plans.shift();
       if (next instanceof Error) throw next;
@@ -86,13 +90,16 @@ const plan = (parts: ProposedPlan['parts'], extra: Partial<ProposedPlan> = {}): 
   rationale: 'test',
   ...extra,
 });
-const setup = async () => {
+/** `redact`: tests of how redactions publish, with personal-only talk redacted, not held. */
+const redacting: Routing = { ...routing, personalSpans: 'redact' };
+const setup = async (options: { personalSpans?: Routing['personalSpans'] } = {}) => {
   const store = await freshStore();
   await store.updateSettings({ captureToolCallsAndResults: false });
   await store.setProjectMap(map);
+  const config = options.personalSpans === 'redact' ? redacting : routing;
   const archive: RoutingArchive = {
-    routingInput: (body) => store.routingInput(body.archiveId, routing, body.key),
-    recordPlan: (body) => store.recordPlan(body, routing),
+    routingInput: (body) => store.routingInput(body.archiveId, config, body.key),
+    recordPlan: (body) => store.recordPlan(body, config),
     routingDue: (body) => store.routingDue(body),
   };
   return { store, archive };
@@ -249,7 +256,7 @@ test('an opener that is personal and sensitive stays here; the template work aft
 });
 
 test('work for UserEvidence publishes there with the coworker lines redacted; the json-rules part goes to inixiative (01b0bda06a)', async () => {
-  const { store, archive } = await setup();
+  const { store, archive } = await setup({ personalSpans: 'redact' });
   const s = session('mixed', [
     { kind: 'user', text: 'Review Zealot PR 4590  \nplease' },
     call({ command: 'gh pr review 4590 --repo userevidence/zealot --approve' }, 'Bash'),
@@ -295,7 +302,7 @@ test('work for UserEvidence publishes there with the coworker lines redacted; th
 });
 
 test('a dry run returns the validated plan and, with preview, each part as it would publish; it stores nothing', async () => {
-  const { store } = await setup();
+  const { store } = await setup({ personalSpans: 'redact' });
   const s = session('preview', [
     { kind: 'user', text: 'Review Zealot PR 4590; vlad deleted my work' },
     call({ command: 'gh pr review 4590 --repo userevidence/zealot --approve' }, 'Bash'),
@@ -315,10 +322,10 @@ test('a dry run returns the validated plan and, with preview, each part as it wo
     proposal,
     dryRun: true,
   };
-  const plain = await store.recordPlan(body, routing);
+  const plain = await store.recordPlan(body, redacting);
   expect(plain.plan?.parts.map((p) => p.organizations)).toEqual([['userevidence']]);
   expect(plain.snapshots).toBeUndefined();
-  const preview = await store.recordPlan({ ...body, preview: true }, routing);
+  const preview = await store.recordPlan({ ...body, preview: true }, redacting);
   expect(preview.snapshots).toHaveLength(1);
   const text = preview.snapshots![0]!.entries.map((e) => e.text).join('\n');
   // Every redaction is applied to every kept entry, its echoes included.
@@ -355,7 +362,7 @@ test('text that asks to be routed cannot send a session anywhere its evidence do
 });
 
 test('a delta continues the last part; sensitive personal entries and redactions stay sticky; nothing new publishes before it is planned', async () => {
-  const { store, archive } = await setup();
+  const { store, archive } = await setup({ personalSpans: 'redact' });
   const first = [
     { kind: 'user' as const, text: 'Fix the template build' },
     call({ file_path: '/w/template/build.ts' }),
@@ -920,7 +927,7 @@ test('B2: an evidence-only capture never drops the row; the run drop path tombst
 });
 
 test('a person’s route: decision during a rebuild applies to the governing plan at once', async () => {
-  const { store, archive } = await setup();
+  const { store, archive } = await setup({ personalSpans: 'redact' });
   const long = session('rebuilding', [
     { kind: 'user', text: `${'first window words '.repeat(11_000)}` },
     call({ file_path: '/z/a.ts' }),
@@ -929,7 +936,8 @@ test('a person’s route: decision during a rebuild applies to the governing pla
   const { id } = await store.capture(long, { cwd: '/z' });
   const planner = (name: string): SuggestModel => ({
     model: name,
-    async decide({ input }) {
+    async decide({ key, input }) {
+      if (key === 'archive-sensitivity') return { content: '{"hold": false, "redactions": []}' };
       const range = input.match(/## New entries \(E(\d+)–E(\d+)/)!;
       const from = Number(range[1]);
       return {
@@ -1039,7 +1047,7 @@ test('(2) a redaction that misses its entry holds only its own part; the rest pu
 });
 
 test('(3) a published part redacts an echo of a coworker remark through the organization’s roster', async () => {
-  const { store, archive } = await setup();
+  const { store, archive } = await setup({ personalSpans: 'redact' });
   const s = session('echoed', [
     { kind: 'user', text: 'Review PR 4590. ugh, vlad deleted a bunch of my work again' },
     call({ file_path: '/z/a.ts' }),
@@ -1194,8 +1202,8 @@ test('a part held for a bad redaction stays personal through a rebuild until a p
   ).toMatchObject({ status: 'valid' });
 });
 
-test('UNDER EXPERIMENT: the sensitivity pass adds redactions per work part and its holds narrow; it never adds a destination', async () => {
-  const { store, archive } = await setup();
+test('the sensitivity pass adds redactions per work part and its holds narrow; it never adds a destination', async () => {
+  const { store, archive } = await setup({ personalSpans: 'redact' });
   const s = session('sanitized', [
     { kind: 'user', text: 'Fix zealot; also I am leaving my day job soon' },
     call({ file_path: '/z/a.ts' }),
@@ -1239,8 +1247,8 @@ test('UNDER EXPERIMENT: the sensitivity pass adds redactions per work part and i
   expect(text).toContain('Fix zealot');
 });
 
-test('UNDER EXPERIMENT: a sensitivity answer the pass cannot read holds its part; an E-labelled entry is read', async () => {
-  const { store, archive } = await setup();
+test('a sensitivity answer the pass cannot read holds its part; an E-labelled entry is read', async () => {
+  const { store, archive } = await setup({ personalSpans: 'redact' });
   const s = session('malformed', [
     { kind: 'user', text: 'Fix zealot; I am interviewing next week' },
     call({ file_path: '/z/a.ts' }),
@@ -1275,4 +1283,101 @@ test('UNDER EXPERIMENT: a sensitivity answer the pass cannot read holds its part
   const [part] = await store.list({ exempt: 'include', parts: 'only' });
   const text = (await store.read(part!.id))!.snapshot.entries.map((e) => e.text).join('\n');
   expect(text).not.toContain('interviewing');
+});
+
+test('hold on detect: career, investor or coworker talk the planner finds holds its whole work part for review; secrets and personal life still redact and publish', async () => {
+  const { store, archive } = await setup();
+  const s = session('detected', [
+    { kind: 'user', text: 'Fix zealot. Vlad deleted my work again' },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant', text: 'Fixed' },
+    { kind: 'user', text: 'Now the docs; the token is sk-123, and my kid is sick' },
+    call({ file_path: '/z/d.md' }),
+    { kind: 'assistant', text: 'Docs done' },
+  ]);
+  const { id } = await store.capture(s, { cwd: '/z' });
+  const { model } = scripted([
+    plan(
+      [
+        { from: 0, to: 1, organizations: ['userevidence'] },
+        { from: 2, to: 3, organizations: ['userevidence'] },
+      ],
+      {
+        redactions: [
+          { entry: 0, text: 'Vlad deleted my work again', reason: 'coworker' },
+          { entry: 2, text: 'sk-123', reason: 'secret' },
+          { entry: 2, text: 'my kid is sick', reason: 'personal-life' },
+        ],
+      },
+    ),
+  ]);
+  const result = await planSession(archive, model, id);
+  expect(result.status).toBe('valid');
+  // The first part is personal and waits for review; the second publishes, redacted.
+  expect(result.parts?.map((p) => p.organizations)).toEqual([['userevidence']]);
+  const [part] = await store.list({ exempt: 'include', parts: 'only' });
+  const text = (await store.read(part!.id))!.snapshot.entries.map((e) => e.text).join('\n');
+  expect(text).toContain('Now the docs');
+  expect(text).not.toContain('sk-123');
+  expect(text).not.toContain('my kid is sick');
+  expect(text).not.toMatch(/vlad|fix zealot/i);
+  const stored = await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } });
+  const held = storedPlanSchema.parse(stored.plan).heldForReview;
+  expect(held).toHaveLength(2);
+  expect(stored.notes.some((n) => n.includes('coworker talk'))).toBe(true);
+  expect((await store.routingPlans({ limit: 5 })).map((p) => p.archiveId)).toContain(id);
+});
+
+test('hold on detect: a span the sensitivity pass finds holds the part too; in a personal part it holds nothing; `redact` publishes it redacted', async () => {
+  const run = async (personalSpans: Routing['personalSpans']) => {
+    const { store, archive } = await setup({ personalSpans });
+    const s = session(`pass-${personalSpans}`, [
+      { kind: 'user', text: 'Fix zealot; also I am leaving my day job soon' },
+      call({ file_path: '/z/a.ts' }),
+      { kind: 'assistant', text: 'Fixed' },
+      { kind: 'user', text: 'I want to raise from investors next year' },
+      { kind: 'assistant', text: 'Noted' },
+    ]);
+    const { id } = await store.capture(s, { cwd: '/z' });
+    const { model } = scripted(
+      [
+        plan(
+          [
+            { from: 0, to: 1, organizations: ['userevidence'] },
+            { from: 2, to: 3, organizations: ['personal'], sensitive: true },
+          ],
+          {
+            redactions: [
+              { entry: 2, text: 'I want to raise from investors next year', reason: 'investor' },
+            ],
+          },
+        ),
+      ],
+      [
+        JSON.stringify({
+          hold: false,
+          redactions: [{ entry: 0, text: 'also I am leaving my day job soon', reason: 'career' }],
+        }),
+      ],
+    );
+    const result = await planSession(archive, model, id);
+    const stored = await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } });
+    return {
+      result,
+      store,
+      held: storedPlanSchema.parse(stored.plan).heldForReview,
+    };
+  };
+  const hold = await run('hold');
+  expect(hold.result.status).toBe('valid');
+  expect(hold.result.parts ?? []).toEqual([]);
+  // Only the work part's entries wait for review; the personal part was personal already.
+  expect(hold.held).toHaveLength(2);
+  expect(await hold.store.list({ exempt: 'include', parts: 'only' })).toEqual([]);
+  const redact = await run('redact');
+  expect(redact.held).toEqual([]);
+  const [part] = await redact.store.list({ exempt: 'include', parts: 'only' });
+  const text = (await redact.store.read(part!.id))!.snapshot.entries.map((e) => e.text).join('\n');
+  expect(text).toContain('Fix zealot');
+  expect(text).not.toContain('day job');
 });

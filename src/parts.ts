@@ -11,6 +11,8 @@ export const REDACTION_REASONS = [
   'secret',
   'other',
 ] as const;
+/** Reasons whose talk is personal for every organization: found in a work part, it holds the part. */
+export const PERSONAL_ONLY_REASONS: readonly RedactionReason[] = ['career', 'investor', 'coworker'];
 export type RedactionReason = (typeof REDACTION_REASONS)[number];
 /** A span of an entry, byte for byte, and why it is replaced. */
 /**
