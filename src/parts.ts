@@ -113,7 +113,7 @@ function echoSpans(
     // never takes work text with it.
     for (const name of r.reason === 'coworker' ? roster : []) {
       if (!new RegExp(`\\b${RegExp.escape(name)}\\b`, 'i').test(r.text)) continue;
-      for (const match of text.matchAll(new RegExp(`\\b${RegExp.escape(name)}\\b`, 'g'))) {
+      for (const match of text.matchAll(new RegExp(`\\b${RegExp.escape(name)}\\b`, 'gi'))) {
         const start = Math.max(
           ...['.', '!', '?', ';', '\n'].map((b) => text.lastIndexOf(b, match.index) + 1),
         );

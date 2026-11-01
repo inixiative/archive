@@ -386,3 +386,29 @@ Ground truth: `308a928`. `bun run typecheck` passes. `bun run lint` reports 0 er
 - **Held part via a continuation or a subagent: no leak.** Parts are disjoint. A held part can't continue (`!held`), and the next plan's continuation requires the same organizations as a personal last part. A subagent spawned in the held part gets an empty reach at its spawn (`planReach`) and stays personal.
   Two caveats. A held part is personal but not sticky, so a rebuild or `route reset` can route it with no redaction. And its review signal is the `held part` note, which the next delta's `notes` overwrite. Mark held parts sensitive (sticky) until reviewed.
 - **(1) `organizations: []` means personal.** No widening: it maps to `[PERSONAL]` before the evidence and `unsure` checks.
+
+---
+
+## PR #35 re-gate (2026-11-01, `d42dc27`)
+
+**Verdict: BLOCK. P1 still leaks in its own probe, now through the P2 fix.**
+
+Ground truth: `d42dc27`. `bun run typecheck` passes. `bun run lint` reports 0 errors. `bun test` passed 182 of 182 against a throwaway Postgres on random port 34290, never 6132. I re-ran `probe/pr35.ts` with two more checks.
+
+- **P1 is not fixed for the probed case.** Part E0–E2 is held, `heldForReview` is `[e0, e1, e2]`, and the bad redaction is kept as echo-only. But the neighbouring UE part still publishes `sorry vlad deleted your work again, ported anyway` **unredacted**, and so does the **correctly** redacted variant, which d42dc27's parent caught.
+  - The echo was only ever caught by the roster clause, and that clause is now case-sensitive (`parts.ts:116`, flag `g`), so a lowercase `vlad` no longer matches.
+  - The normalized match and the 4-word runs miss the echo, because the planner wrote "deleted my work" and the echo says "deleted your work".
+  - Measured against main, the bad-redaction case still widens (main held the whole plan).
+  - Fix: match the roster name case-insensitively again, now that the clause only fires for `coworker` redactions. Gating on the reason is what fixes P2's "grant", and a coworker-only clause redacting work sentences that mention the coworker is narrowing that's acceptable. Add the probe's two cases as tests.
+- **P2 is fixed for the probed case.** A career redaction no longer redacts `Signet grant` sentences. A coworker redaction of "Grant is slow" redacts both clauses that name `Grant`.
+- **The sticky held-part code doesn't widen.**
+  - `heldForReview` is excluded from publishing (`sensitiveEntries` includes it by default), and a work part over a held entry holds. Probe: a rebuild covering E0–E5 holds with "covers entries kept personal as sensitive (e0, e1, e2)".
+  - It carries through rebuilds (`held` in the context) and into `plan.heldForReview`.
+  - Echo-only redactions count as redactions, so a plan that has any is never `wholeTo`.
+  - Review clears only `heldForReview`; the held parts stay personal in the plan.
+- **Should fix, a lost update in review.** `reviewPlan` (`store.ts:2476`) reads the plan and writes the whole JSON back outside the session lock. If `recordPlan` lands between the two, the stored plan reverts to the older one: its newer redactions, prunes and `sensitive` entries are lost, while the part rows match the newer plan. Update only `heldForReview`, under `underSessionLock` (or as an atomic JSON update).
+
+**Addressed on `fix/echo-and-review` (after #35 merged as-is):**
+- Roster names match case-insensitively again (`parts.ts`). The clause still fires only for `coworker` redactions, and that is what keeps "grant" from taking work text. The P2 test now asserts the accepted narrowing: a coworker redaction of a name also removes work clauses that share it, in any case.
+- The probe's two cases are tests: a mis-cased and an exactly quoted coworker redaction, each with the lowercase neighbour echo. No "vlad" publishes in either.
+- `reviewPlan` clears only `heldForReview`, in place (`jsonb_set`), with `reviewedAt` in the same statement, under the session's advisory lock. It never writes the plan back. Tested against a racing re-plan.

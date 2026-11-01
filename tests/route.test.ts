@@ -12,6 +12,7 @@ import {
   publishedParts,
   type RoutingArchive,
   routeKey,
+  storedPlanSchema,
   validatePlan,
 } from '../src/route';
 import type { SuggestModel } from '../src/suggest';
@@ -1084,6 +1085,82 @@ test('P1: a redaction that fails validation still redacts its echoes in every ot
   const text = (await store.read(parts[0]!.id))!.snapshot.entries.map((e) => e.text).join('\n');
   expect(text).not.toMatch(/vlad/i);
   expect(text).toContain('and the docs');
+});
+
+for (const [label, quote] of [
+  ['mis-cased (fails validation)', 'vlad deleted my work again'],
+  ['quoted exactly', 'Vlad deleted my work again'],
+] as const)
+  test(`P1 probe: a ${label} coworker redaction redacts a lowercase echo in the neighbouring part`, async () => {
+    const { store, archive } = await setup();
+    const s = session(`probe-${quote}`, [
+      { kind: 'user', text: 'Vlad deleted my work again, port it' },
+      call({ file_path: '/z/a.ts' }),
+      { kind: 'assistant', text: 'Porting' },
+      { kind: 'user', text: 'and the docs' },
+      call({ file_path: '/z/d.md' }),
+      { kind: 'assistant', text: 'sorry vlad deleted your work again, ported anyway' },
+    ]);
+    const { id } = await store.capture(s, { cwd: '/z' });
+    const { model } = scripted([
+      plan(
+        [
+          { from: 0, to: 1, organizations: ['userevidence'] },
+          { from: 2, to: 3, organizations: ['userevidence'] },
+        ],
+        { redactions: [{ entry: 0, text: quote, reason: 'coworker' }] },
+      ),
+    ]);
+    expect((await planSession(archive, model, id)).status).toBe('valid');
+    const parts = await store.list({ exempt: 'include', parts: 'only' });
+    const text = (
+      await Promise.all(parts.map(async (p) => (await store.read(p.id))!.snapshot.entries))
+    )
+      .flat()
+      .map((e) => e.text)
+      .join('\n');
+    expect(text).not.toMatch(/vlad/i);
+    expect(text).toContain('and the docs');
+  });
+
+test('review clears only the held list, and never reverts a plan recorded since', async () => {
+  const { store } = await setup();
+  const s = session('review-race', [
+    { kind: 'user', text: 'Vlad broke it, fix zealot' },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant', text: 'Fixed' },
+  ]);
+  const { id } = await store.capture(s, { cwd: '/z' });
+  const record = async (key: string, proposal: ProposedPlan) => {
+    const input = await store.routingInput(id, routing, key);
+    return store.recordPlan(
+      { archiveId: id, digest: input.digest, through: input.total - 1, key, by: key, proposal },
+      routing,
+    );
+  };
+  await record(
+    'A',
+    plan([{ from: 0, to: 1, organizations: ['userevidence'] }], {
+      redactions: [{ entry: 0, text: 'vlad broke it', reason: 'coworker' }],
+    }),
+  );
+  const stored = async () => {
+    const row = await store.db.routingPlan.findUniqueOrThrow({ where: { archiveId: id } });
+    return { version: row.version, plan: storedPlanSchema.parse(row.plan) };
+  };
+  const before = await stored();
+  expect(before.plan.heldForReview.length).toBeGreaterThan(0);
+  // A review racing a re-plan: whichever takes the session lock first, the stored plan is never
+  // the older one written back over the newer.
+  await Promise.all([
+    store.reviewPlan(id),
+    record('B', plan([{ from: 0, to: 1, organizations: ['personal'] }])),
+  ]);
+  const after = await stored();
+  if (after.version > before.version) expect(after.plan.redactions).toEqual([]);
+  else expect({ ...after.plan, heldForReview: [] }).toEqual({ ...before.plan, heldForReview: [] });
+  await store.reviewPlan(id);
+  expect((await stored()).plan.heldForReview).toEqual([]);
 });
 
 test('a part held for a bad redaction stays personal through a rebuild until a person reviews it', async () => {

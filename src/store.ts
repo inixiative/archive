@@ -2472,25 +2472,22 @@ export class ArchiveStore {
       data: { due: 'related' },
     });
   }
-  /** A person read this plan; it leaves the review queue until it changes. */
+  /**
+   * A person read this plan; it leaves the review queue until it changes. Entries held for a bad
+   * redaction may be planned again: only `heldForReview` is cleared, in place, under the session's
+   * lock, so a plan recorded meanwhile is never overwritten.
+   */
   async reviewPlan(archiveId: string, now = Date.now()) {
-    // Reviewed: entries held for a bad redaction may be planned again.
-    const row = await this.db.routingPlan.findUnique({
-      where: { archiveId },
-      select: { plan: true },
+    return this.db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${archiveId}))`;
+      const reviewed = await tx.$executeRaw`
+        UPDATE "routing_plans"
+        SET "reviewedAt" = ${now},
+            "plan" = CASE WHEN "plan" ? 'heldForReview'
+              THEN jsonb_set("plan", '{heldForReview}', '[]'::jsonb) ELSE "plan" END
+        WHERE "archiveId" = ${archiveId}`;
+      return reviewed > 0;
     });
-    if (!row) return false;
-    const plan = row.plan ? storedPlanSchema.parse(row.plan) : undefined;
-    await this.db.routingPlan.update({
-      where: { archiveId },
-      data: {
-        reviewedAt: now,
-        ...(plan?.heldForReview.length
-          ? { plan: { ...plan, heldForReview: [] } as Prisma.InputJsonValue }
-          : {}),
-      },
-    });
-    return true;
   }
 
   /**

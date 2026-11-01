@@ -198,7 +198,7 @@ test('(3) echoes are redacted: case and whitespace variants, shared runs of four
   expect(texts[3]).toBe('Grant reviewed the PR.');
 });
 
-test('P2: the roster clause fires only for coworker redactions and matches the name as written', () => {
+test('P2: the roster clause fires only for coworker redactions, and matches the name in any case', () => {
   const s = session('grant', [
     { kind: 'user', text: 'I applied for a grant at UE' },
     {
@@ -233,8 +233,8 @@ test('P2: the roster clause fires only for coworker redactions and matches the n
     },
     [{ entryId: 'e2', text: 'Grant broke the build again', reason: 'coworker' }],
   );
-  expect(coworker.entries[1]!.text).toBe(
-    'Issue the Signet grant to the Foundry. Revoke the grant on deletion.',
-  );
+  // A coworker redaction takes every clause naming them, in any case: work text that shares the
+  // name is narrowed too, which errs toward personal.
+  expect(coworker.entries[1]!.text.toLowerCase()).not.toContain('grant');
   expect(coworker.entries[2]!.text).not.toContain('Grant');
 });
