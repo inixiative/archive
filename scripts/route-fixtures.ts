@@ -179,14 +179,29 @@ const charter = v.charter ? readFileSync(v.charter, 'utf8') : ROUTE_PROMPT;
 const base = await claudeRouteModel({ home: resolve(v.home), concurrency: Number(v.concurrency) });
 /** Answers the plan parser refused, kept whole so a parse failure can be told from a bad plan. */
 const unparseable: { session: string; content: string }[] = [];
+/** Every planner answer and sanitizer answer, by the session title line, for offline re-scoring. */
+const answers: { key: string; session: string; content: string }[] = [];
 const model: SuggestModel = {
   model: base.model,
   decide: async (request) => {
     // Only the planner's call takes the charter under test; the sanitizing call keeps its own.
-    if (request.key !== 'archive-route') return base.decide(request);
+    if (request.key !== 'archive-route') {
+      const checked = await base.decide(request);
+      answers.push({
+        key: request.key,
+        session: request.input.split('\n')[0] ?? '',
+        content: checked.content,
+      });
+      return checked;
+    }
     const answer = await base.decide({ ...request, instructions: charter });
     if (!parsePlan(answer.content))
       unparseable.push({ session: request.input.split('\n')[1] ?? '', content: answer.content });
+    answers.push({
+      key: request.key,
+      session: request.input.split('\n')[1] ?? '',
+      content: answer.content,
+    });
     return answer;
   },
 };
@@ -387,6 +402,7 @@ const output = {
   others,
   proposals: Object.fromEntries(proposals),
   unparseable,
+  answers,
 };
 if (v.out) {
   mkdirSync(resolve(v.out, '..'), { recursive: true });
