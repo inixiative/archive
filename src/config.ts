@@ -73,6 +73,12 @@ export const routingSchema = z
   .strictObject({
     organizations: z.array(organizationSchema).max(50),
     destinations: z.array(archiveDestinationSchema).max(100),
+    /**
+     * The go-live switch. `off` (the default): sessions are planned and plans validated and
+     * applied here, and sync only deletes the whole-session copies destinations hold; nothing new
+     * publishes to an organization. `on`: parts publish, and re-plans delete what they drop.
+     */
+    publish: z.enum(['off', 'on']).default('off'),
   })
   .superRefine((routing, ctx) => {
     const ids = routing.organizations.map((o) => o.id);
@@ -85,9 +91,9 @@ export const routingSchema = z
       if (!ids.includes(d.organizationId))
         ctx.addIssue({ code: 'custom', message: `Unknown organization ${d.organizationId}` });
   });
-export type Routing = z.infer<typeof routingSchema>;
+export type Routing = z.output<typeof routingSchema>;
 export type Organization = z.infer<typeof organizationSchema>;
-const noRouting = (): Routing => ({ organizations: [], destinations: [] });
+const noRouting = (): Routing => ({ organizations: [], destinations: [], publish: 'off' });
 
 /** Private regular file owned by this user; a symlink or group/world access is refused. */
 export function readTokenFile(path: string) {
@@ -244,8 +250,14 @@ export function removeOrganization(file: string, id: string) {
   const routing = readRouting(file);
   if (!routing.organizations.some((o) => o.id === id)) return false;
   writeRouting(file, {
+    ...routing,
     organizations: routing.organizations.filter((o) => o.id !== id),
     destinations: routing.destinations.filter((d) => d.organizationId !== id),
   });
   return true;
+}
+
+/** Turns publishing to organizations on or off (`routing.publish`). */
+export function setPublish(file: string, publish: Routing['publish']) {
+  return writeRouting(file, { ...readRouting(file), publish }).publish;
 }

@@ -185,6 +185,7 @@ test('destination endpoints list delivery, libraries, connect and remove through
     expect(readRouting(config.destinationsFile)).toEqual({
       organizations: [{ id: 'inixiative', projects: ['inixiative'] }],
       destinations: [],
+      publish: 'off',
     });
     await expect(
       archive.request('destinations/remove', { ...route, organizationId: undefined }),

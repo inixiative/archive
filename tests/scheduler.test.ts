@@ -9,6 +9,7 @@ import { freshStore } from './db';
 const routing: Routing = {
   organizations: [{ id: 'inixiative', projects: ['template'] }],
   destinations: [],
+  publish: 'off',
 };
 const map = { projects: [{ projectId: 'template', roots: ['/w/template'], repositories: [] }] };
 const session = (sessionId: string, n: number, extra: Record<string, unknown> = {}) =>
@@ -145,6 +146,7 @@ test('a backfill dry run plans every session, subagents against their parent’s
         tokenEnv: 'UE_TOKEN',
       },
     ],
+    publish: 'off',
   };
   await store.setProjectMap({
     projects: [

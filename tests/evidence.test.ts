@@ -24,6 +24,7 @@ const routing = {
     { id: 'userevidence', projects: ['zealot'] },
   ],
   destinations: [],
+  publish: 'off' as const,
 };
 const call = (name: string, input: object) => ({
   kind: 'tool-call' as const,

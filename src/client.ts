@@ -217,7 +217,9 @@ export async function syncArchives(
     Math.min(BACKOFF_BASE_MS * 2 ** (failures - 1), BACKOFF_MAX_MS);
   // A route that was removed never delivers: release the revisions its outbox rows hold.
   await store.releaseOutbox(routing.destinations.map(destinationIdentity));
-  const archives = await store.list({ exempt: 'include', parts: 'include' });
+  // With publishing off, nothing new goes out; only the leaked whole-session copies are deleted.
+  const archives =
+    routing.publish === 'on' ? await store.list({ exempt: 'include', parts: 'include' }) : [];
   for (const archive of archives)
     for (const destination of sessionDestinations(routing, archive)) {
       const identity = destinationIdentity(destination);
@@ -266,7 +268,9 @@ export async function syncArchives(
       }
     }
   // What a destination holds that routing no longer sends there goes: a part a re-plan dropped or
-  // moved, a superseded part, or a session that was published whole before it was planned.
+  // moved, or a superseded part (publishing on), and any whole session, whatever its plan, since a
+  // whole session never routes: each such copy is a leak. A removed destination can't be reached;
+  // its copies go once it is configured again (publishing may stay off meanwhile).
   const configured = new Map(routing.destinations.map((d) => [destinationIdentity(d), d]));
   for (const held of await store.deliveries()) {
     const destination = configured.get(held.destination);
@@ -275,8 +279,7 @@ export async function syncArchives(
     const row = held.archive;
     const routed =
       !row.supersededBy && sessionOrganizations(routing, row).includes(destination.organizationId);
-    // An unplanned or held session's earlier copies wait for its plan.
-    if (routed || (!row.partOf && !row.routingPlan?.plan)) continue;
+    if (row.partOf && (routed || routing.publish !== 'on')) continue;
     const key = JSON.stringify(['delete', held.archiveId, held.destination]);
     seen.add(key);
     const waiting = backoff?.get(key);

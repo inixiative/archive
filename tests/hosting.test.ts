@@ -431,7 +431,7 @@ test('parts publish to every organization their plan gives them; a re-plan delet
       'userevidence',
     ]);
     const unplanned = await local.capture(snapshot('inixiative', 'unplanned'));
-    // Its copy published before routing was planned waits for its plan: neither sent nor deleted.
+    // Its whole copy published before routing is a leak too, deleted with no plan needed.
     await local.delivered(unplanned.id, destinationIdentity(destinations[1]!), unplanned.digest);
     const routes = await routingPreview(local, routed);
     expect(routes.find((r) => r.id === mixedPart)?.organizations).toEqual([
@@ -447,6 +447,7 @@ test('parts publish to every organization their plan gives them; a re-plan delet
         )
         .sort();
     expect(await statuses()).toEqual([
+      'deleted:userevidence',
       'deleted:userevidence',
       'published:inixiative',
       'published:userevidence',
@@ -474,5 +475,52 @@ test('parts publish to every organization their plan gives them; a re-plan delet
   } finally {
     delete process.env.ARCHIVE_ORGANIZATION_TEST_TOKEN;
     for (const { instance } of instances) await instance.close();
+  }
+});
+
+test('L6: every whole-session copy a destination holds is deleted, whatever the plan; with publish off nothing new publishes', async () => {
+  const local = await freshStore();
+  const remote = await freshStore('remote');
+  process.env.ARCHIVE_LEAK_TEST_TOKEN = token;
+  const server = Bun.serve({ port: 0, fetch: createArchiveHandler(remote, token) });
+  try {
+    const destination: ArchiveDestination = {
+      kind: 'archive',
+      organizationId: 'userevidence',
+      url: server.url.href,
+      tokenEnv: 'ARCHIVE_LEAK_TEST_TOKEN',
+    };
+    const identity = destinationIdentity(destination);
+    const leak = async (sessionId: string, extra: Record<string, unknown> = {}) => {
+      const { id } = await local.capture({ ...snapshot('userevidence', sessionId), ...extra });
+      const copy = (await local.read(id))!;
+      await remote.capture(copy.snapshot, { previousDigest: null });
+      await local.delivered(id, identity, copy.digest);
+      return id;
+    };
+    const unplanned = await leak('unplanned');
+    const held = await leak('held');
+    await local.db.routingPlan.create({
+      data: { archiveId: held, status: 'held', key: 'k', by: 'm', digest: 'd', entries: 1, at: 1 },
+    });
+    const superseded = await leak('superseded');
+    await local.db.archive.update({ where: { id: superseded }, data: { supersededBy: 'driver' } });
+    const exempt = await leak('exempt', { tags: ['run:test'] });
+    // A planned part: with publish off it does not go out.
+    const planned = await local.capture(snapshot('userevidence', 'planned'));
+    await routeWhole(local, planned.id, ['userevidence']);
+    const off = { ...routing([destination]), publish: 'off' as const };
+    const results = await syncArchives(local, off);
+    expect(results.map((r) => [r.id, r.status]).sort()).toEqual(
+      [unplanned, held, superseded, exempt].map((id) => [id, 'deleted']).sort(),
+    );
+    expect(await remote.list({ exempt: 'include' })).toEqual([]);
+    // On, the part publishes.
+    expect((await syncArchives(local, routing([destination]))).map((r) => r.status)).toEqual([
+      'published',
+    ]);
+  } finally {
+    server.stop(true);
+    delete process.env.ARCHIVE_LEAK_TEST_TOKEN;
   }
 });

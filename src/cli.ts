@@ -37,6 +37,7 @@ import {
   readRouting,
   removeOrganization,
   setOrganization,
+  setPublish,
 } from './config';
 import { stampedRun } from './exemption';
 import { importTranscriptFile } from './import-file';
@@ -147,6 +148,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'organizations list | organizations set --id ID [--project ID ...] [--roster NAME ...] | organizations remove --id ID   (the projects each organization owns; a session publishes to every organization its project or a project it touched belongs to)\n' +
         'route [--watch] [--concurrency 2] [--limit N] [--model claude-sonnet-5-5] [--claude-bin PATH] [--claude-config-dir DIR] [--dry-run]   (plan due sessions on the personal Claude login: parts × organizations; --watch wakes every 2 minutes)\n' +
         'route --backfill [--dry-run]   (plan every session and print the plan against what destinations hold now) | route plans [--all] | route review --id ID | route reset --id ID\n' +
+        'publish [on|off]   (the go-live switch: off, the default, plans and deletes leaked whole-session copies but publishes nothing new)\n' +
         'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
         "settings [--capture-tool-calls-and-results true|false] [--capture-run-sessions true|false] [--retention-days N|off]   (read, or change, this Archive's settings)\n" +
         'maintenance status | maintenance reclaim   (compaction left to do and table sizes; return freed space to the OS once compaction is done)\n' +
@@ -322,6 +324,12 @@ export async function runCli(args = Bun.argv.slice(2)) {
         throw new Error('Destination is not an Archive-compatible endpoint');
     }
     output(connectDestination(config, destination));
+    return;
+  }
+  if (command === 'publish') {
+    const value = positionals[1];
+    if (value !== 'on' && value !== 'off') output({ publish: readRouting(config).publish });
+    else output({ publish: setPublish(config, value) });
     return;
   }
   if (command === 'organizations') {

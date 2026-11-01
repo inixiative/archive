@@ -14,6 +14,7 @@ export const routing = (
     ...new Set([...destinations.map((d) => d.organizationId), ...Object.keys(projects)]),
   ].map((id) => ({ id, projects: projects[id] ?? [id] })),
   destinations,
+  publish: 'on',
 });
 
 /**

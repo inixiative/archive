@@ -44,6 +44,7 @@ test('serve --sync publishes what it receives to its destinations from the same 
             tokenEnv: 'HOSTED_TOKEN',
           },
         ],
+        publish: 'on',
       }),
     );
     const reader = local.stdout.getReader();
@@ -144,6 +145,7 @@ test('routes and sync run against the Archive server of the home, without DATABA
       url: hosted.server.url.href,
       tokenFile: join(home, 'hosted.token'),
     });
+    expect(await cli('publish on')).toEqual({ publish: 'on' });
     expect(await cli('organizations set --id inixiative --project inixiative')).toEqual([
       { id: 'inixiative', projects: ['inixiative'] },
     ]);
