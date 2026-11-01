@@ -115,6 +115,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       backfill: { type: 'boolean', default: false },
       all: { type: 'boolean', default: false },
       roster: { type: 'string', multiple: true },
+      'all-organizations': { type: 'boolean', default: false },
       name: { type: 'string' },
       hostname: { type: 'string', default: '127.0.0.1' },
       watch: { type: 'boolean', default: false },
@@ -149,7 +150,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'organizations list | organizations set --id ID [--project ID ...] [--roster NAME ...] | organizations remove --id ID   (the projects each organization owns; a session publishes to every organization its project or a project it touched belongs to)\n' +
         'route [--watch] [--concurrency 2] [--limit N] [--model claude-sonnet-5-5] [--claude-bin PATH] [--claude-config-dir DIR] [--dry-run]   (plan due sessions on the personal Claude login: parts × organizations; --watch wakes every 2 minutes)\n' +
         'route --backfill [--dry-run]   (plan every session and print the plan against what destinations hold now) | route plans [--all] | route review --id ID | route reset --id ID\n' +
-        'cleanup [ORG] [off|leaked|all]   (what sync deletes at destinations, default off; with ORG, that organization only) | sync --dry-run   (per destination, the ids cleanup would delete now)\n' +
+        'cleanup [ORG] [off|leaked|all] [--all-organizations]   (what sync deletes at destinations, default off; with ORG, that organization only; leaked or all for every organization needs --all-organizations) | sync --dry-run   (per destination, the ids cleanup would delete now)\n' +
         'publish [on|off]   (the go-live switch: off, the default, plans and deletes leaked whole-session copies but publishes nothing new)\n' +
         'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
         "settings [--capture-tool-calls-and-results true|false] [--capture-run-sessions true|false] [--retention-days N|off]   (read, or change, this Archive's settings)\n" +
@@ -340,7 +341,14 @@ export async function runCli(args = Bun.argv.slice(2)) {
     if (mode !== 'off' && mode !== 'leaked' && mode !== 'all') {
       const routing = readRouting(config);
       output({ cleanup: routing.cleanup, cleanupFor: routing.cleanupFor });
-    } else output(setCleanup(config, mode, second ? first : undefined));
+    } else {
+      // Deleting at every organization's destinations is asked for by name, never by default.
+      if (!second && mode !== 'off' && !v['all-organizations'])
+        throw new Error(
+          `cleanup ${mode} without an organization applies to every organization: name one (cleanup ORG ${mode}) or pass --all-organizations`,
+        );
+      output(setCleanup(config, mode, second ? first : undefined));
+    }
     return;
   }
   if (command === 'publish') {

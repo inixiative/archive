@@ -871,17 +871,22 @@ export class ArchiveStore {
    *   sends the whole session there unredacted and unpruned (its one part holds every entry);
    * - an id with no row here (deleted, or never kept): never.
    */
-  async copiesToKeep(ids: string[], organizationId: string, routing: Routing) {
+  async copiesToKeep(
+    ids: string[],
+    organizationId: string,
+    routing: Routing,
+    /** The digest the destination holds of each copy, where known (its listing, else the receipt). */
+    held: ReadonlyMap<string, string> = new Map(),
+  ) {
     const keep = new Set<string>();
     const rows = await this.db.archive.findMany({
       where: { id: { in: ids } },
       select: {
         id: true,
-        digest: true,
         partOf: true,
         routedTo: true,
         supersededBy: true,
-        routingPlan: { select: { plan: true, digest: true, due: true } },
+        routingPlan: { select: { plan: true, wholeTo: true, wholeDigests: true } },
       },
     });
     for (const row of rows) {
@@ -896,27 +901,16 @@ export class ArchiveStore {
         row.supersededBy
       )
         continue;
-      const plan = row.routingPlan?.plan ? storedPlanSchema.parse(row.routingPlan.plan) : undefined;
-      if (!plan || row.routingPlan?.digest !== row.digest || row.routingPlan.due === 'partial')
-        continue;
-      const work = plan.parts.filter((p) => p.organizations.some((o) => o !== PERSONAL));
+      // Kept only while the copy is a revision a plan reviewed, stripped, and sent there whole:
+      // later captures don't drop it before the re-plan, and a copy unlike it (one with tool
+      // activity, or of a revision no plan read) goes.
+      const plan = row.routingPlan;
+      const digest = held.get(row.id);
       if (
-        work.length !== 1 ||
-        !work[0]!.organizations.includes(organizationId) ||
-        plan.prune.length ||
-        plan.redactions.length
-      )
-        continue;
-      const parts = await this.db.archive.findMany({
-        where: { partOf: row.id },
-        select: { routedTo: true, summary: true },
-      });
-      const session = await this.plannedSession(row.id);
-      if (
-        parts.length === 1 &&
-        parts[0]!.routedTo.includes(organizationId) &&
-        session &&
-        (parts[0]!.summary as Summary).entries === session.snapshot.entries.length
+        plan?.plan &&
+        plan.wholeTo.includes(organizationId) &&
+        digest &&
+        plan.wholeDigests.includes(digest)
       )
         keep.add(row.id);
     }
@@ -946,6 +940,7 @@ export class ArchiveStore {
       select: {
         archiveId: true,
         destination: true,
+        digest: true,
         archive: {
           select: {
             partOf: true,
@@ -2114,11 +2109,32 @@ export class ArchiveStore {
     const decisions = (plan?: StoredPlan) =>
       plan && JSON.stringify([plan.parts, plan.prune, plan.redactions]);
     const changed = decisions(prior) !== decisions(result.plan);
+    // The organizations this plan sends the whole reviewed revision to, unredacted and unpruned,
+    // and the stripped digests of the revisions plans sent whole there: a whole copy a destination
+    // holds of one of those is kept under `cleanup: leaked` with publishing off.
+    const all = entries.map((e) => e.id);
+    const whole =
+      body.through === entries.length - 1 &&
+      !result.plan.redactions.length &&
+      published.length === 1 &&
+      published[0]!.entryIds.length === all.length
+        ? [...published[0]!.organizations].sort()
+        : [];
+    const previous = row.routingPlan;
+    const sameWhole =
+      previous && JSON.stringify([...previous.wholeTo].sort()) === JSON.stringify(whole);
+    const wholeDigests = whole.length
+      ? [...new Set([...(sameWhole ? previous.wholeDigests : []), snapshotDigest(snapshot)])].slice(
+          -50,
+        )
+      : [];
     const version = (row.routingPlan?.version ?? 0) + (changed ? 1 : 0);
     const fields = {
       ...record,
       status: 'valid',
       plan: result.plan as Prisma.InputJsonValue,
+      wholeTo: whole,
+      wholeDigests,
       attempt: Prisma.DbNull,
       issues: [],
       notes: result.notes,

@@ -162,32 +162,36 @@ model Suggestion {
 /// latest attempt that failed validation (`attempt`, with its `issues`), held for review. Its own
 /// record, never the tagger's; only a valid plan routes.
 model RoutingPlan {
-  archiveId  String   @id
+  archiveId    String   @id
   /// Bumps each time the valid plan changes.
-  version    Int      @default(0)
+  version      Int      @default(0)
   /// `valid`: the latest attempt passed; `held`: it failed, and `plan` (if any) still stands.
-  status     String
-  plan       Json?
-  attempt    Json?
-  issues     String[] @default([])
-  notes      String[] @default([])
+  status       String
+  plan         Json?
+  attempt      Json?
+  issues       String[] @default([])
+  notes        String[] @default([])
   /// The charter and model, hashed (`routeKey`).
-  key        String
-  by         String
+  key          String
+  by           String
   /// The session's digest and stored entry count when planned: more entries make it due again.
-  digest     String
-  entries    Int
+  digest       String
+  entries      Int
   /// A person's `route:` decisions it was planned under; a change makes it due again.
-  overrides  String[] @default([])
-  at         Float
+  overrides    String[] @default([])
+  at           Float
   /// When a person read it in the review queue.
-  reviewedAt Float?
+  reviewedAt   Float?
   /// Why it is due again, or null: `new entries`, `decision`, `related`, `partial`. Set by the
   /// change that makes it due, so the scheduler reads only these rows.
-  due        String?
+  due          String?
+  /// The organizations the valid plan sends the whole reviewed revision to, unredacted and
+  /// unpruned, and the stripped digests of the revisions plans sent whole there.
+  wholeTo      String[] @default([])
+  wholeDigests String[] @default([])
   /// The organizations and project map it was validated under (`routingContextKey`): another
   /// key makes it due, to re-validate its parts.
-  contextKey String?
+  contextKey   String?
 
   archive Archive @relation(fields: [archiveId], references: [id], onDelete: Cascade)
 

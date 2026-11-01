@@ -764,3 +764,113 @@ test('cleanup off (the default) deletes nothing at a destination; a per-organiza
     delete process.env.ARCHIVE_CLEANUP_TEST_TOKEN;
   }
 });
+
+test('G1, G2: a whole copy its plan keeps survives later captures; a copy unlike the revision the plan reviewed goes', async () => {
+  const local = await freshStore();
+  const remote = await freshStore('remote');
+  process.env.ARCHIVE_G_TEST_TOKEN = token;
+  const server = Bun.serve({ port: 0, fetch: createArchiveHandler(remote, token) });
+  try {
+    const destination: ArchiveDestination = {
+      kind: 'archive',
+      organizationId: 'userevidence',
+      url: server.url.href,
+      tokenEnv: 'ARCHIVE_G_TEST_TOKEN',
+    };
+    const identity = destinationIdentity(destination);
+    const r = { ...routing([destination]), publish: 'off' as const };
+    const sourceId = await local.sourceId();
+    const leaked = async (sessionId: string) => {
+      const s = { ...snapshot('userevidence', sessionId), sourceId };
+      const { id, digest } = await local.capture(s);
+      await remote.capture(s, { previousDigest: null });
+      await local.delivered(id, identity, digest);
+      await local.tag(id, { add: ['route:userevidence'] });
+      return { id, s };
+    };
+    const planWhole = async (id: string) => {
+      const input = await local.routingInput(id, r);
+      const recorded = await local.recordPlan(
+        {
+          archiveId: id,
+          digest: input.digest,
+          through: input.total - 1,
+          key: 'k',
+          by: 'test',
+          proposal: {
+            parts: [
+              {
+                from: input.entries[0]?.index ?? 0,
+                to: input.total - 1,
+                organizations: ['userevidence'],
+                continues: Boolean(input.prior),
+              },
+            ],
+            prune: [],
+            redactions: [],
+            rationale: '',
+          },
+        },
+        r,
+      );
+      expect(recorded.status).toBe('valid');
+    };
+    const held = async () =>
+      (await remote.list({ exempt: 'include' })).map((a) => a.sessionId).sort();
+    // G1: the plan sends the whole session to UE; the copy stays through a later capture.
+    const kept = await leaked('kept');
+    await planWhole(kept.id);
+    await syncArchives(local, r);
+    expect(await held()).toEqual(['kept']);
+    const grown = {
+      ...kept.s,
+      capturedAt: 2,
+      entries: [
+        ...kept.s.entries,
+        { id: 'two', kind: 'assistant' as const, text: 'More', timestamp: 2, sourceRef: 'line:2' },
+      ],
+    };
+    await local.capture(grown);
+    await syncArchives(local, r);
+    expect(await held()).toEqual(['kept']);
+    // Re-planned, still whole: the reviewed copy it holds stays.
+    await planWhole(kept.id);
+    await syncArchives(local, r);
+    expect(await held()).toEqual(['kept']);
+    // G2: the destination's copy is not the revision the plan reviewed (here it was sent with
+    // tool activity this Archive no longer keeps): it goes.
+    const tools = {
+      ...snapshot('userevidence', 'with-tools'),
+      sourceId,
+      entries: [
+        ...snapshot('userevidence', 'with-tools').entries,
+        {
+          id: 'call',
+          kind: 'tool-call' as const,
+          text: '{"name":"Read","input":{}}',
+          timestamp: 1,
+          sourceRef: 'line:2',
+        },
+        {
+          id: 'result',
+          kind: 'tool-result' as const,
+          text: 'secret output',
+          timestamp: 1,
+          sourceRef: 'line:3',
+        },
+      ],
+    };
+    const withTools = await local.capture(tools);
+    await remote.capture(tools, { previousDigest: null });
+    await local.delivered(withTools.id, identity, withTools.digest);
+    await local.tag(withTools.id, { add: ['route:userevidence'] });
+    await planWhole(withTools.id);
+    expect((await syncArchives(local, r)).map((x) => [x.id, x.status])).toEqual([
+      [withTools.id, 'deleted'],
+    ]);
+    expect(await held()).toEqual(['kept']);
+  } finally {
+    server.stop(true);
+    delete process.env.ARCHIVE_G_TEST_TOKEN;
+  }
+});

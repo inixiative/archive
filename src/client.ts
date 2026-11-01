@@ -222,9 +222,9 @@ async function heldCopies(store: ArchiveStore, destination: ArchiveDestination, 
       limit: 100,
     })) as { documents?: { id?: unknown }[] } | undefined;
     const ids = (result?.documents ?? []).flatMap((d) => (typeof d.id === 'string' ? [d.id] : []));
-    return [...(await store.knownIds(ids))];
+    return [...(await store.knownIds(ids))].map((id): { id: string; digest?: string } => ({ id }));
   }
-  const ids: string[] = [];
+  const ids: { id: string; digest?: string }[] = [];
   let beforeId: string | undefined;
   for (let page = 0; page < 1000; page++) {
     const { data } = await archiveRequest(destination, 'list', {
@@ -233,10 +233,12 @@ async function heldCopies(store: ArchiveStore, destination: ArchiveDestination, 
       ...(beforeId ? { beforeId } : {}),
     });
     const listed = data as {
-      archives: { id: string; sourceId?: string }[];
+      archives: { id: string; sourceId?: string; digest?: string }[];
       nextCursor: string | null;
     };
-    for (const archive of listed.archives) if (archive.sourceId === sourceId) ids.push(archive.id);
+    for (const archive of listed.archives)
+      if (archive.sourceId === sourceId)
+        ids.push({ id: archive.id, ...(archive.digest ? { digest: archive.digest } : {}) });
     if (!listed.nextCursor) break;
     beforeId = listed.nextCursor;
   }
@@ -331,16 +333,22 @@ export async function syncArchives(
     // Cleanup off: nothing is deleted or listed there; pending deletes stay queued.
     if (cleanupFor(routing, destination.organizationId) === 'off') continue;
     const identity = destinationIdentity(destination);
+    const ours = receipts.filter((r) => r.destination === identity);
     const candidates = new Set([
-      ...receipts.filter((r) => r.destination === identity).map((r) => r.archiveId),
+      ...ours.map((r) => r.archiveId),
       ...pending.filter((p) => p.destination === identity).map((p) => p.archiveId),
     ]);
+    // What the destination holds of each: its own listing's digest, else what was delivered.
+    const held = new Map(ours.map((r) => [r.archiveId, r.digest]));
     const listedUntil = options.reconciled?.get(identity) ?? 0;
     const circuit = backoff?.get(JSON.stringify(['destination', identity]));
     // A destination down for publishing is down for listing too.
     if (now() >= listedUntil && !(circuit && now() < circuit.until))
       try {
-        for (const id of await heldCopies(store, destination, sourceId)) candidates.add(id);
+        for (const copy of await heldCopies(store, destination, sourceId)) {
+          candidates.add(copy.id);
+          if (copy.digest) held.set(copy.id, copy.digest);
+        }
         options.reconciled?.set(identity, now() + (options.reconcileMs ?? RECONCILE_MS));
       } catch (error) {
         options.reconciled?.set(identity, now() + BACKOFF_BASE_MS);
@@ -351,7 +359,12 @@ export async function syncArchives(
         });
       }
     if (!candidates.size) continue;
-    const keep = await store.copiesToKeep([...candidates], destination.organizationId, routing);
+    const keep = await store.copiesToKeep(
+      [...candidates],
+      destination.organizationId,
+      routing,
+      held,
+    );
     let deletes = 0;
     for (const archiveId of candidates) {
       if (keep.has(archiveId)) continue;
