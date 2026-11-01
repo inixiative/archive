@@ -774,7 +774,9 @@ export class ArchiveStore {
     if (!source || source.partOf) throw new Error('Archive unavailable');
     const kept: string[] = [];
     for (const part of parts) {
-      // A part re-added after a re-plan dropped it is meant: its tombstone, if any, is lifted.
+      // A part a person deleted here is never cut again.
+      if (await this.db.archiveTombstone.findUnique({ where: { id: archiveKey(part.snapshot) } }))
+        continue;
       const { id } = await this.capture(part.snapshot, { restore: true });
       await this.db.archive.update({
         where: { id },
@@ -827,12 +829,25 @@ export class ArchiveStore {
     });
   }
   /** Deletes a session and leaves its tombstone (`head`), so it is not imported again unchanged. */
+  /**
+   * Deletes a session and leaves its tombstone (`head`), so it is not imported again unchanged.
+   * Its parts are retired first: one a destination holds stays, routed nowhere, until sync has
+   * deleted its copies there. Deleting a part retires it the same way, and it is never cut again:
+   * its tombstone keeps `applyParts` from restoring it, and its entries become a sticky prune of
+   * its session's plan.
+   */
   async delete(id: string) {
     return this.db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
       const archive = await tx.archive.findUnique({
         where: { id },
-        select: { digest: true, transcriptDigest: true, projectId: true },
+        select: {
+          digest: true,
+          transcriptDigest: true,
+          projectId: true,
+          partOf: true,
+          revision: true,
+        },
       });
       if (!archive) return false;
       const tombstone = {
@@ -845,6 +860,38 @@ export class ArchiveStore {
         create: { id, ...tombstone },
         update: { ...tombstone, deletedAt: new Date() },
       });
+      const retire = async (partIds: string[]) => {
+        const parts = await tx.archive.findMany({
+          where: { id: { in: partIds } },
+          select: { id: true, receipts: { select: { destination: true } } },
+        });
+        for (const part of parts)
+          if (part.receipts.length)
+            await tx.archive.update({ where: { id: part.id }, data: { routedTo: [] } });
+          else await tx.archive.delete({ where: { id: part.id } });
+      };
+      if (archive.partOf) {
+        const plan = await tx.routingPlan.findUnique({ where: { archiveId: archive.partOf } });
+        const revision = await tx.revision.findUnique({
+          where: { archiveId_revision: { archiveId: id, revision: archive.revision } },
+          select: { snapshot: true },
+        });
+        if (plan?.plan && revision) {
+          const stored = storedPlanSchema.parse(plan.plan);
+          const entries = archiveSnapshotSchema.parse(revision.snapshot).entries;
+          stored.prune.push(
+            ...entries.map((e) => ({ entryId: e.id, reason: 'deleted by a person' })),
+          );
+          await tx.routingPlan.update({
+            where: { archiveId: archive.partOf },
+            data: { plan: stored as Prisma.InputJsonValue },
+          });
+        }
+        await retire([id]);
+        return true;
+      }
+      const parts = await tx.archive.findMany({ where: { partOf: id }, select: { id: true } });
+      await retire(parts.map((p) => p.id));
       await tx.archive.delete({ where: { id } });
       return true;
     });

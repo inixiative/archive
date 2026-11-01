@@ -279,7 +279,8 @@ export async function syncArchives(
     const row = held.archive;
     const routed =
       !row.supersededBy && sessionOrganizations(routing, row).includes(destination.organizationId);
-    if (row.partOf && (routed || routing.publish !== 'on')) continue;
+    // Deleting never widens, so it runs with publishing off too.
+    if (row.partOf && routed) continue;
     const key = JSON.stringify(['delete', held.archiveId, held.destination]);
     seen.add(key);
     const waiting = backoff?.get(key);

@@ -524,3 +524,50 @@ test('L6: every whole-session copy a destination holds is deleted, whatever the 
     delete process.env.ARCHIVE_LEAK_TEST_TOKEN;
   }
 });
+
+test('L7: deleting or pruning a session deletes its parts’ copies first; a part deleted here stays deleted', async () => {
+  const local = await freshStore();
+  const remote = await freshStore('remote');
+  process.env.ARCHIVE_L7_TEST_TOKEN = token;
+  const server = Bun.serve({ port: 0, fetch: createArchiveHandler(remote, token) });
+  try {
+    const destination: ArchiveDestination = {
+      kind: 'archive',
+      organizationId: 'userevidence',
+      url: server.url.href,
+      tokenEnv: 'ARCHIVE_L7_TEST_TOKEN',
+    };
+    const routed = routing([destination]);
+    const published = async (sessionId: string) => {
+      const { id } = await local.capture(snapshot('userevidence', sessionId));
+      const part = await routeWhole(local, id, ['userevidence']);
+      return { id, part };
+    };
+    const a = await published('deleted-here');
+    const b = await published('pruned');
+    const c = await published('part-deleted');
+    expect((await syncArchives(local, routed)).map((r) => r.status)).toEqual([
+      'published',
+      'published',
+      'published',
+    ]);
+    expect(await remote.list()).toHaveLength(3);
+    // A person deletes a session; retention prunes another; a person deletes a part.
+    await local.delete(a.id);
+    await local.db.archive.update({ where: { id: c.id }, data: { capturedAt: 5 * 86_400_000 } });
+    await local.updateSettings({ retentionDays: 1 });
+    expect(await local.prune(5.5 * 86_400_000)).toEqual([b.id]);
+    expect(await local.delete(c.part)).toBe(true);
+    expect((await syncArchives(local, routed)).map((r) => [r.id, r.status]).sort()).toEqual(
+      [a.part, b.part, c.part].map((id) => [id, 'deleted']).sort(),
+    );
+    expect(await remote.list()).toEqual([]);
+    // The deleted part is not restored by the next plan of its session.
+    await routeWhole(local, c.id, ['userevidence']);
+    expect(await syncArchives(local, routed)).toEqual([]);
+    expect(await remote.list()).toEqual([]);
+  } finally {
+    server.stop(true);
+    delete process.env.ARCHIVE_L7_TEST_TOKEN;
+  }
+});

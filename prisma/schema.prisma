@@ -20,9 +20,9 @@ model Setting {
 /// One session. `summary` is its listing (snapshot metadata, tags as captured, models,
 /// references, suggestions), recomputed on capture and when settings change.
 model Archive {
-  id               String    @id
+  id               String   @id
   /// Insertion order: listings are newest first.
-  seq              BigInt    @unique @default(autoincrement())
+  seq              BigInt   @unique @default(autoincrement())
   /// The snapshot as its writer sent it: head, ingest and previousDigest speak this digest.
   digest           String
   /// The current revision as stored here and published onward. Differs from `digest` only when
@@ -47,13 +47,12 @@ model Archive {
   /// The project map the evidence was computed under; another key makes a capture recompute it.
   evidenceKey      String?
   /// A part: the session (archive) its routing plan cut it from. Parts are what publishes; they
-  /// stay out of local search, suggestions and retention, and go with their session.
+  /// stay out of local search, suggestions and retention. Not a foreign key: a part outlives its
+  /// deleted session, retired, until sync has deleted its copies at the destinations.
   partOf           String?
-  whole            Archive?  @relation("Parts", fields: [partOf], references: [id], onDelete: Cascade)
-  parts            Archive[] @relation("Parts")
   /// A part's organizations, from its session's validated plan; empty once a re-plan drops it
   /// (it is deleted here when no destination still holds it).
-  routedTo         String[]  @default([])
+  routedTo         String[] @default([])
 
   revisions   Revision[]
   tagEdits    TagEdit[]
