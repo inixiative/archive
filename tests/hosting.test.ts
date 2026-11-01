@@ -302,19 +302,8 @@ test('hosted tag filtering matches exact explicit tags, not transcript mentions'
 test('Kingdom destinations write and search through the paired Signet', async () => {
   const local = await freshStore();
   const source = (await local.capture(snapshot())).id;
+  // routeWhole records the session's plan too.
   const id = await routeWhole(local, source, ['inixiative']);
-  await local.db.routingPlan.create({
-    data: {
-      archiveId: source,
-      status: 'valid',
-      plan: {},
-      key: 'k',
-      by: 'm',
-      digest: 'd',
-      entries: 1,
-      at: 1,
-    },
-  });
   const directory = mkdtempSync(join(tmpdir(), 'archive-kingdom-'));
   chmodSync(directory, 0o700);
   const integrationId = crypto.randomUUID();
