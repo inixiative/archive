@@ -1193,3 +1193,48 @@ test('a part held for a bad redaction stays personal through a rebuild until a p
     await record('C', plan([{ from: 0, to: 1, organizations: ['userevidence'] }])),
   ).toMatchObject({ status: 'valid' });
 });
+
+test('UNDER EXPERIMENT: the sensitivity pass adds redactions per work part and its holds narrow; it never adds a destination', async () => {
+  const { store, archive } = await setup();
+  const s = session('sanitized', [
+    { kind: 'user', text: 'Fix zealot; also I am leaving my day job soon' },
+    call({ file_path: '/z/a.ts' }),
+    { kind: 'assistant', text: 'Fixed' },
+    { kind: 'user', text: 'Now the docs' },
+    call({ file_path: '/z/d.md' }),
+    { kind: 'assistant', text: 'Docs done' },
+  ]);
+  const { id } = await store.capture(s, { cwd: '/z' });
+  const asked: string[] = [];
+  const answers: Record<string, string> = {
+    'archive-route': JSON.stringify(
+      plan([
+        { from: 0, to: 1, organizations: ['userevidence'] },
+        { from: 2, to: 3, organizations: ['userevidence'] },
+      ]),
+    ),
+  };
+  const sanitizer = [
+    JSON.stringify({
+      hold: false,
+      redactions: [{ entry: 0, text: 'also I am leaving my day job soon', reason: 'career' }],
+    }),
+    'not json',
+  ];
+  const model: SuggestModel = {
+    model: 'claude-sonnet-5-5',
+    async decide({ key, input }) {
+      asked.push(key);
+      return { content: key === 'archive-route' ? answers[key]! : (sanitizer.shift() ?? '{}') };
+    },
+  };
+  const result = await planSession(archive, model, id, { sensitivity: true });
+  expect(asked).toEqual(['archive-route', 'archive-sensitivity', 'archive-sensitivity']);
+  expect(result.calls).toBe(3);
+  // The unreadable answer held the second part: only the first publishes, redacted.
+  expect(result.parts?.map((p) => p.organizations)).toEqual([['userevidence']]);
+  const [part] = await store.list({ exempt: 'include', parts: 'only' });
+  const text = (await store.read(part!.id))!.snapshot.entries.map((e) => e.text).join('\n');
+  expect(text).not.toContain('day job');
+  expect(text).toContain('Fix zealot');
+});

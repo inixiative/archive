@@ -84,6 +84,10 @@ const { values: v } = parseArgs({
     label: { type: 'string', default: 'run' },
     out: { type: 'string' },
     concurrency: { type: 'string', default: '2' },
+    /** UNDER EXPERIMENT: run the sanitizing second call per work part. */
+    sensitivity: { type: 'boolean', default: false },
+    /** Plan and score only these case labels (comma-separated): a tiny test. */
+    only: { type: 'string' },
   },
 });
 if (!v.database || !v.cases || !v.agents || !v.home)
@@ -94,6 +98,7 @@ if (database.hostname !== '127.0.0.1' || database.port === '6132')
   throw new Error('--database must be a scratch Postgres on 127.0.0.1, not port 6132');
 
 const cases: Cases = casesSchema.parse(JSON.parse(readFileSync(v.cases, 'utf8')));
+const only = v.only ? new Set(v.only.split(',').map((label) => label.trim())) : undefined;
 const routing: Routing = routingSchema.parse({
   organizations: cases.organizations,
   destinations: [],
@@ -177,6 +182,8 @@ const unparseable: { session: string; content: string }[] = [];
 const model: SuggestModel = {
   model: base.model,
   decide: async (request) => {
+    // Only the planner's call takes the charter under test; the sanitizing call keeps its own.
+    if (request.key !== 'archive-route') return base.decide(request);
     const answer = await base.decide({ ...request, instructions: charter });
     if (!parsePlan(answer.content))
       unparseable.push({ session: request.input.split('\n')[1] ?? '', content: answer.content });
@@ -201,6 +208,10 @@ let report: Awaited<ReturnType<typeof runBackfill>>;
 try {
   report = await runBackfill(archive, model, {
     dryRun: true,
+    ...(v.sensitivity ? { sensitivity: true } : {}),
+    ...(only
+      ? { only: new Set(cases.cases.filter((c) => only.has(c.label)).map((c) => sessionOf(c).id)) }
+      : {}),
     concurrency: Number(v.concurrency),
     progress: (line) => console.error(line),
   });
@@ -315,7 +326,7 @@ type Score = Judgement & {
   strict: Judgement;
 };
 const scores: Score[] = [];
-for (const c of cases.cases) {
+for (const c of cases.cases.filter((c) => !only || only.has(c.label))) {
   const session = sessionOf(c);
   const result = results.get(session.id);
   const valid = result?.status === 'valid';
