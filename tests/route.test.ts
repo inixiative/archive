@@ -591,3 +591,53 @@ test('S1: a plan is recorded only against the digest it read, and stored with it
   expect(await store.db.routingPlan.count()).toBe(0);
   expect(await store.list({ exempt: 'include', parts: 'only' })).toEqual([]);
 });
+
+test('S2: a subagent whose spawn can’t be found holds; a parent re-routed personal re-plans its subagent', async () => {
+  const { store, archive } = await setup();
+  const root = session('tree', [
+    { kind: 'user', text: 'Port it into zealot' },
+    { kind: 'tool-call', text: JSON.stringify({ name: 'Agent', input: { description: 'port' } }) },
+    { kind: 'assistant', text: 'Spawned' },
+  ]);
+  root.entries[1]!.callId = 'toolu_tree';
+  const { id: rootId } = await store.capture(root, { cwd: '/z' });
+  const child = (sessionId: string, toolUseId?: string) =>
+    session(
+      sessionId,
+      [
+        { kind: 'event', text: 'Port' },
+        call({ file_path: '/z/b.ts' }),
+        { kind: 'assistant', text: 'Ported' },
+      ],
+      {
+        lineage: {
+          kind: 'subagent',
+          parentSessionId: 'tree',
+          rootSessionId: 'tree',
+          ...(toolUseId ? { toolUseId } : {}),
+        },
+      },
+    );
+  const { id: found } = await store.capture(child('tree/agent-a', 'toolu_tree'), { cwd: '/z' });
+  // Like every Codex subagent: no record of the call that spawned it.
+  const { id: lost } = await store.capture(child('tree/agent-b'), { cwd: '/z' });
+  const all = { from: 0, to: 2, organizations: ['userevidence'] };
+  const sub = { from: 0, to: 1, organizations: ['userevidence'] };
+  const { model } = scripted([plan([all]), plan([sub]), plan([sub])]);
+  expect(await planSession(archive, model, rootId)).toMatchObject({ status: 'valid' });
+  expect((await planSession(archive, model, found)).status).toBe('valid');
+  expect(await planSession(archive, model, lost)).toMatchObject({
+    status: 'held',
+    issues: ['its spawn entry is not found in its parent session'],
+  });
+  // The person keeps the parent here: its subagent is due again, and re-applied, personal too.
+  await store.tag(rootId, { add: ['route:personal'] });
+  const due = async () =>
+    (await store.routingDue({ limit: 10, now: Date.now() })).map((d) => d.archiveId);
+  expect(await due()).toContain(rootId);
+  const { model: none } = scripted([]);
+  await planSession(archive, none, rootId);
+  expect(await due()).toContain(found);
+  await planSession(archive, none, found);
+  expect(await store.list({ exempt: 'include', parts: 'only' })).toEqual([]);
+});

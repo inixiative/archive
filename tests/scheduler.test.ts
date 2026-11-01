@@ -27,6 +27,8 @@ const session = (sessionId: string, n: number, extra: Record<string, unknown> = 
       { length: n },
       (_, i): ArchiveEntry => ({
         id: `${sessionId}-${i}`,
+        // The second entry stands for the call that spawns this session's subagents.
+        ...(i === 1 ? { callId: `spawn-${sessionId}` } : {}),
         kind: i % 2 ? 'assistant' : 'user',
         text: `turn ${i}`,
         timestamp: i,
@@ -70,7 +72,7 @@ test('due sessions: unplanned now; with new entries once paused or an hour (stag
   const { id } = await store.capture(session('a', 2), { cwd: '/w/template' });
   const { id: child } = await store.capture(
     session('a/agent-x', 2, {
-      lineage: { kind: 'subagent', parentSessionId: 'a', rootSessionId: 'a' },
+      lineage: { kind: 'subagent', parentSessionId: 'a', rootSessionId: 'a', toolUseId: 'spawn-a' },
     }),
     { cwd: '/w/template' },
   );
@@ -83,7 +85,10 @@ test('due sessions: unplanned now; with new entries once paused or an hour (stag
     { archiveId: child, reason: 'unplanned' },
   ]);
   await runRouting(archive, model);
-  // Planned and unchanged: nothing is due, parts included.
+  // The subagent's plan makes its parent due once (entries quoting it may move), re-applied with
+  // no model call; then nothing is due, parts included.
+  expect((await due({ now: Date.now(), limit: 10 })).map((d) => d.reason)).toEqual(['related']);
+  await runRouting(archive, model);
   expect(await due({ now: Date.now() + 10 * 3_600_000, limit: 10 })).toEqual([]);
   // New entries: due once paused, or once the hour (plus its stagger) has passed.
   const grown = session('a', 4);
@@ -165,7 +170,12 @@ test('a backfill dry run plans every session, subagents against their parent’s
   const { id: root } = await store.capture(session('root', 2), { cwd: '/z' });
   const { id: child } = await store.capture(
     session('root/agent-x', 2, {
-      lineage: { kind: 'subagent', parentSessionId: 'root', rootSessionId: 'root' },
+      lineage: {
+        kind: 'subagent',
+        parentSessionId: 'root',
+        rootSessionId: 'root',
+        toolUseId: 'spawn-root',
+      },
     }),
     { cwd: '/z' },
   );

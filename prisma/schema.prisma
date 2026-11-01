@@ -180,6 +180,9 @@ model RoutingPlan {
   at         Float
   /// When a person read it in the review queue.
   reviewedAt Float?
+  /// Why it is due again, or null: `new entries`, `decision`, `related`, `partial`. Set by the
+  /// change that makes it due, so the scheduler reads only these rows.
+  due        String?
 
   archive Archive @relation(fields: [archiveId], references: [id], onDelete: Cascade)
 

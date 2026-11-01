@@ -362,6 +362,11 @@ export class ArchiveStore {
           ...evidenceFields(evidenceOf(snapshot)),
         };
         await writeRevision(tx, id, snapshot, fields, old?.revision);
+        // New content makes its plan due (the scheduler decides when).
+        await tx.routingPlan.updateMany({
+          where: { archiveId: id, due: null },
+          data: { due: 'new entries' },
+        });
         // A superseded session's parts are superseded with it, so they never publish.
         if (supersededBy && supersededBy !== old?.supersededBy)
           await tx.archive.updateMany({ where: { partOf: id }, data: { supersededBy } });
@@ -561,6 +566,9 @@ export class ArchiveStore {
       for (const tag of remove) await set(tag, false);
       // A lifted run tag leaves the stored copy too, so what syncs onward is not a run.
       if (remove.some((tag) => RUN_TAG_VALUES.includes(tag))) await this.storeLifted(tx, id);
+      // A person's routing decision makes the plan due at once.
+      if ([...add, ...remove].some((tag) => tag.startsWith(ROUTE_TAG_PREFIX)))
+        await tx.routingPlan.updateMany({ where: { archiveId: id }, data: { due: 'decision' } });
       const edits = await tx.tagEdit.findMany({ where: { archiveId: id } });
       const removed = new Set(edits.filter((e) => !e.added).map((e) => e.tag));
       const tags = [
@@ -1706,8 +1714,12 @@ export class ArchiveStore {
       else if (!parentSession.plan) parentIssue = 'its parent session has no valid plan yet';
       else {
         const spawn = bySpawn(parentSession.snapshot.entries, lineage);
-        parentReach = planReach(parentSession.plan, parentSession.snapshot.entries, spawn);
-        parent = { title: parentSession.snapshot.title, organizations: [...parentReach] };
+        // Without the spawn, the parent's reach is unknown: never the whole of it.
+        if (!spawn) parentIssue = 'its spawn entry is not found in its parent session';
+        else {
+          parentReach = planReach(parentSession.plan, parentSession.snapshot.entries, spawn);
+          parent = { title: parentSession.snapshot.title, organizations: [...parentReach] };
+        }
       }
     }
     const root =
@@ -1923,7 +1935,15 @@ export class ArchiveStore {
     const hold = async (issues: string[], notes: string[] = []) => {
       if (!body.dryRun) {
         const attempt = (body.proposal ?? { failure: body.failure }) as Prisma.InputJsonValue;
-        const fields = { ...record, status: 'held', attempt, issues, notes, reviewedAt: null };
+        const fields = {
+          ...record,
+          status: 'held',
+          attempt,
+          issues,
+          notes,
+          reviewedAt: null,
+          due: null,
+        };
         const recorded = await this.underSessionLock(body.archiveId, body.digest, (tx) =>
           tx.routingPlan.upsert({
             where: { archiveId: body.archiveId },
@@ -2005,6 +2025,8 @@ export class ArchiveStore {
       issues: [],
       notes: result.notes,
       version,
+      // A window still to plan keeps it due; otherwise it is not until something changes.
+      due: record.entries === -1 ? 'partial' : null,
       ...(changed ? { reviewedAt: null } : {}),
     };
     // The plan and its parts are stored together, against the digest the planner read.
@@ -2014,7 +2036,9 @@ export class ArchiveStore {
         create: { archiveId: body.archiveId, ...fields },
         update: fields,
       });
-      return this.applyPartsIn(tx, body.archiveId, parts);
+      const applied = await this.applyPartsIn(tx, body.archiveId, parts);
+      if (changed) await this.markRelatedDue(tx, body.archiveId);
+      return applied;
     });
     if (!applied) return { status: 'stale' };
     return { status: 'valid', version, ...outcome, retired: applied.retired, holds };
@@ -2096,12 +2120,13 @@ export class ArchiveStore {
   }
   /**
    * Sessions due for a routing plan, in the order to plan them: a tree's parents before their
-   * subagents, oldest change first. A session is due when it has no plan yet, or new entries since
-   * its plan (or a person changed its `route:` tags), and either it paused (no capture for
-   * `pausedMs`) or its plan is older than `intervalMs` plus a stagger of up to `staggerMs` from its
-   * id, so sessions are not all planned at once. A held plan is retried only when the session
-   * changed or its parent has been planned since. Exempt runs, parts and superseded raw captures
-   * are never planned, and a subagent waits for its parent's plan.
+   * subagents, oldest change first. Only rows with no plan, or whose plan something marked due
+   * (`RoutingPlan.due`), are read. `decision` (a person's `route:` change), `related` (its parent's
+   * or a subagent's plan changed) and `partial` (windows still to plan) are due at once; `new
+   * entries` once the session paused (no capture for `pausedMs`) or its plan is older than
+   * `intervalMs` plus a stagger of up to `staggerMs` from its id. Exempt runs, superseded raw
+   * captures and parts (cut here or received as parts) are never planned, and an unplanned
+   * subagent waits for its parent's plan.
    */
   async routingDue(input: {
     now?: number;
@@ -2119,7 +2144,14 @@ export class ArchiveStore {
     const paused = input.pausedMs ?? 30 * 60_000;
     const stagger = input.staggerMs ?? 10 * 60_000;
     const rows = await this.db.archive.findMany({
-      where: { partOf: null, supersededBy: null },
+      where: {
+        partOf: null,
+        supersededBy: null,
+        OR: [
+          { routingPlan: null },
+          ...(input.unplanned ? [] : [{ routingPlan: { due: { not: null } } }]),
+        ],
+      },
       select: {
         id: true,
         revision: true,
@@ -2127,53 +2159,38 @@ export class ArchiveStore {
         capturedAt: true,
         summary: true,
         tagEdits: true,
-        routingPlan: {
-          select: {
-            status: true,
-            plan: true,
-            entries: true,
-            digest: true,
-            overrides: true,
-            at: true,
-            issues: true,
-          },
-        },
+        routingPlan: { select: { due: true, at: true } },
       },
     });
-    const planned = new Set(rows.filter((r) => r.routingPlan?.plan).map((r) => r.id));
+    const parentOf = (summary: Summary) =>
+      archiveKey({
+        sourceId: summary.sourceId,
+        source: summary.source,
+        sessionId: summary.lineage!.parentSessionId,
+      });
+    const waiting = rows.filter((r) => !r.routingPlan && (r.summary as Summary).lineage);
+    const planned = new Set(
+      (
+        await this.db.routingPlan.findMany({
+          where: {
+            archiveId: { in: waiting.map((r) => parentOf(r.summary as Summary)) },
+            plan: { not: Prisma.DbNull },
+          },
+          select: { archiveId: true },
+        })
+      ).map((p) => p.archiveId),
+    );
     const due: { archiveId: string; capturedAt: number; depth: number; reason: string }[] = [];
     for (const row of rows) {
-      const view = listing({ ...row, suggestion: null }, { exempt: 'include' })[0]!;
-      if (exemptRun(view.tags)) continue;
       const summary = row.summary as Summary;
       const lineage = summary.lineage;
-      if (lineage && lineage.kind !== 'part' && !input.withoutParents) {
-        const parent = archiveKey({
-          sourceId: summary.sourceId,
-          source: summary.source,
-          sessionId: lineage.parentSessionId,
-        });
-        if (!planned.has(parent)) continue;
-      }
+      if (lineage?.kind === 'part') continue;
+      const view = listing({ ...row, suggestion: null }, { exempt: 'include' })[0]!;
+      if (exemptRun(view.tags)) continue;
       const plan = row.routingPlan;
-      if (input.unplanned && plan) continue;
-      const overrides = row.tagEdits
-        .filter((e) => e.added && e.tag.startsWith(ROUTE_TAG_PREFIX))
-        .map((e) => e.tag)
-        .sort();
-      let reason: string | undefined;
-      if (!plan) reason = 'unplanned';
-      else if (JSON.stringify(overrides) !== JSON.stringify(plan.overrides)) reason = 'decision';
-      else if (plan.status === 'held')
-        reason =
-          plan.digest !== row.digest
-            ? 'changed'
-            : plan.issues.some((i) => i.includes('parent session'))
-              ? 'parent planned'
-              : undefined;
-      else if (summary.entries > plan.entries) reason = 'new entries';
-      if (!reason) continue;
-      if (plan && reason !== 'decision') {
+      if (!plan && lineage && !input.withoutParents && !planned.has(parentOf(summary))) continue;
+      let reason = plan?.due ?? 'unplanned';
+      if (plan && reason === 'new entries') {
         const offset = Number.parseInt(digest(row.id).slice(0, 8), 16) % (stagger + 1);
         const pausedNow = now - row.capturedAt >= paused;
         if (!pausedNow && now < plan.at + interval + offset) continue;
@@ -2191,6 +2208,39 @@ export class ArchiveStore {
       .slice(0, input.limit)
       .map(({ archiveId, reason, depth }) => ({ archiveId, reason, depth }));
   }
+  /** Marks the plans of a session's parent and subagents due: a change to its plan moves theirs. */
+  private async markRelatedDue(tx: Prisma.TransactionClient, archiveId: string) {
+    const row = await tx.archive.findUnique({
+      where: { id: archiveId },
+      select: { summary: true },
+    });
+    if (!row) return;
+    const summary = row.summary as Summary;
+    const children = await tx.archive.findMany({
+      where: {
+        partOf: null,
+        source: summary.source,
+        AND: [
+          { summary: { path: ['sourceId'], equals: summary.sourceId } },
+          { summary: { path: ['lineage', 'parentSessionId'], equals: summary.sessionId } },
+        ],
+      },
+      select: { id: true },
+    });
+    const related = children.map((c) => c.id);
+    if (summary.lineage && summary.lineage.kind !== 'part')
+      related.push(
+        archiveKey({
+          sourceId: summary.sourceId,
+          source: summary.source,
+          sessionId: summary.lineage.parentSessionId,
+        }),
+      );
+    await tx.routingPlan.updateMany({
+      where: { archiveId: { in: related }, due: null },
+      data: { due: 'related' },
+    });
+  }
   /** A person read this plan; it leaves the review queue until it changes. */
   async reviewPlan(archiveId: string, now = Date.now()) {
     return (
@@ -2203,7 +2253,11 @@ export class ArchiveStore {
    * Its parts stand until the next plan replaces them.
    */
   async resetPlan(archiveId: string) {
-    return (await this.db.routingPlan.deleteMany({ where: { archiveId } })).count > 0;
+    return this.db.$transaction(async (tx) => {
+      const reset = (await tx.routingPlan.deleteMany({ where: { archiveId } })).count > 0;
+      if (reset) await this.markRelatedDue(tx, archiveId);
+      return reset;
+    });
   }
   async close() {
     await this.db.$disconnect();
