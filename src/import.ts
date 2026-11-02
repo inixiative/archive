@@ -6,8 +6,14 @@ import {
 } from './index';
 import { personToolResults } from './tool-activity';
 
+/** The harnesses whose session histories (`.jsonl` transcripts) Archive imports and collects. */
+export const TRANSCRIPT_SOURCES = ['codex', 'claude-code', 'muse'] as const;
+export type TranscriptSource = (typeof TRANSCRIPT_SOURCES)[number];
+export const isTranscriptSource = (value: unknown): value is TranscriptSource =>
+  (TRANSCRIPT_SOURCES as readonly unknown[]).includes(value);
+
 export interface ImportOptions {
-  source: 'codex' | 'claude-code';
+  source: TranscriptSource;
   sourceId: string;
   sessionId?: string;
   title?: string;
@@ -31,6 +37,8 @@ export function claudeSessionId(
   const agentId = text(row.agentId) ?? fileAgentId;
   return agentId && (row.isSidechain || fileAgentId) ? `${sessionId}/agent-${agentId}` : sessionId;
 }
+/** The suffix of the entry a Muse parent records when it starts a subagent (`<record id>:spawn`). */
+export const MUSE_SPAWN_SUFFIX = 'spawn';
 /** Content the harness wraps in or adds to a user message; the person never typed it. */
 const injectedTags = [
   'system-reminder',
@@ -160,14 +168,18 @@ export function importTranscriptLines(
   let metaPrompt: string | undefined;
   let index = -1;
   let contentBytes = 0;
-  // Codex states the model per turn; Claude Code per assistant record.
+  // Codex states the model per turn, Muse per run (and when a run completes); Claude Code per
+  // assistant record.
   let turn: { model?: string; effort?: string } = {};
+  // A Muse run's `started` record repeats the prompt its accepted user intent already holds.
+  const museIntents = new Set<string>();
   // A Codex session started by a script (codex exec, a custom originator) has no typed prompts.
   let scripted = false;
   let metaSeen = false;
   let lineage: ArchiveLineage | undefined;
   let copiedHistory = false;
-  let provider: string | undefined = options.source === 'claude-code' ? 'anthropic' : undefined;
+  let provider: string | undefined =
+    options.source === 'claude-code' ? 'anthropic' : options.source === 'muse' ? 'meta' : undefined;
   // Only a subscription's rate-limit windows prove the access path; an API key leaves no mark.
   let subscription = false;
   const text = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
@@ -185,6 +197,28 @@ export function importTranscriptLines(
     }
     if (!row || typeof row !== 'object' || Array.isArray(row))
       throw new Error(`Invalid transcript record at line ${index + 1}`);
+    if (options.source === 'muse') {
+      // Muse writes each record in an envelope on its session's stream; a few lines have another
+      // shape (a retained permission transaction's frame) and hold no turns.
+      if (!row.stream || typeof row.stream !== 'object') continue;
+      const id = row.stream.kind === 'session' ? text(row.stream.id) : undefined;
+      if (id) {
+        if (sessionId && sessionId !== id) throw new Error('Mixed transcript sessions');
+        sessionId = id;
+      }
+      const p = row.payload ?? {};
+      const model =
+        row.payload_type === 'runtime.model_reconfigure.completed'
+          ? p.record?.effective?.model_id
+          : ['run.model.configured', 'runtime.session.metadata'].includes(row.payload_type)
+            ? p.record?.model_id
+            : p.kind === 'run' && p.event?.kind === 'model_completed'
+              ? p.event.model
+              : undefined;
+      if (text(model)) turn = { model };
+      const named = text(p.record?.provider_id)?.toLowerCase();
+      if (named && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(named)) provider = named;
+    }
     if (options.source === 'codex' && row.type === 'session_meta') {
       const meta = row.payload ?? {};
       const id = meta.id;
@@ -260,7 +294,7 @@ export function importTranscriptLines(
     if (options.source === 'codex' && row.type === 'turn_context')
       turn = { model: text(row.payload?.model), effort: text(row.payload?.effort) };
     const producer =
-      options.source === 'codex'
+      options.source === 'codex' || options.source === 'muse'
         ? turn
         : row.type === 'assistant'
           ? { model: text(row.message?.model), effort: text(row.effort) }
@@ -279,16 +313,29 @@ export function importTranscriptLines(
                 ? row.origin.kind !== 'human'
                 : typeof row.entrypoint === 'string' && row.entrypoint.startsWith('sdk')),
           )
-        : scripted && row.type === 'response_item' && row.payload?.role === 'user';
+        : options.source === 'muse'
+          ? // A user intent other than chat, or a run's own prompt (a subagent's task, written by
+            // the runtime that spawned it).
+            row.payload_type === 'runtime.user_intent.accepted'
+            ? row.payload?.semantic_kind?.kind !== 'chat'
+            : row.payload?.kind === 'run' && row.payload.event?.kind === 'started'
+          : scripted && row.type === 'response_item' && row.payload?.role === 'user';
     // User text is a user entry only when the person typed it; markers and injected blocks are events.
     const textKind = (role: 'user' | 'assistant', content: unknown) =>
       role === 'user' && (written || typeof content !== 'string' || !typedPrompt(content))
         ? 'event'
         : role;
-    const timestamp = typeof row.timestamp === 'number' ? row.timestamp : Date.parse(row.timestamp);
+    // Muse records microseconds.
+    const timestamp =
+      options.source === 'muse'
+        ? Math.floor(row.recorded_at / 1000)
+        : typeof row.timestamp === 'number'
+          ? row.timestamp
+          : Date.parse(row.timestamp);
+    const recordId = options.source === 'muse' ? text(row.id) : (row.uuid ?? row.payload?.id);
     const add = (kind: ArchiveEntry['kind'], content: unknown, suffix: string, callId?: string) => {
       if (typeof content !== 'string' || !content.length) return;
-      const id = `${row.uuid ?? row.payload?.id ?? `line-${index + 1}`}:${suffix}`;
+      const id = `${recordId ?? `line-${index + 1}`}:${suffix}`;
       const identity = JSON.stringify([kind, content, callId]);
       if (seen.has(id)) {
         if (seen.get(id) !== identity)
@@ -366,6 +413,61 @@ export function importTranscriptLines(
           omissions.add('Private reasoning and encrypted payloads are not included');
         }
       }
+    } else if (options.source === 'muse') {
+      const p = row.payload ?? {};
+      const event = p.kind === 'run' && p.event && typeof p.event === 'object' ? p.event : {};
+      if (row.payload_type === 'runtime.user_intent.accepted') {
+        // What the person sent; `model_messages` is what the model was given of it.
+        const blocks: any[] =
+          Array.isArray(p.refill_blocks) && p.refill_blocks.length
+            ? p.refill_blocks
+            : (Array.isArray(p.model_messages) ? p.model_messages : []).flatMap((message: any) =>
+                Array.isArray(message?.content) ? message.content : [],
+              );
+        if (text(p.intent_id)) museIntents.add(p.intent_id);
+        const said = blocks.filter((block) => block?.kind === 'text').map((block) => block.text);
+        if (said.length) museIntents.add(said.join('\n'));
+        for (const [i, block] of blocks.entries()) {
+          if (block?.kind === 'text') add(textKind('user', block.text), block.text, `text-${i}`);
+          else omissions.add('Non-text message content is not included');
+        }
+      } else if (row.payload_type === 'runtime.session' && p.kind === 'run') {
+        if (event.kind === 'started') {
+          // A top-level run repeats its user intent; a subagent's run is started by its prompt.
+          if (!museIntents.has(p.run_id) && !museIntents.has(event.prompt))
+            add(textKind('user', event.prompt), event.prompt, 'prompt');
+        } else if (event.kind === 'assistant_message_committed')
+          add('assistant', event.text, 'text');
+        else if (event.kind === 'reasoning_summary_committed') {
+          if (text(event.text)) reasoning = true;
+          add('reasoning-summary', event.text, 'summary');
+        } else if (event.kind === 'reasoning_committed')
+          omissions.add('Private reasoning and encrypted payloads are not included');
+        else if (event.kind === 'assistant_tool_calls_committed') {
+          for (const [i, call] of (Array.isArray(event.tool_calls)
+            ? event.tool_calls
+            : []
+          ).entries())
+            add(
+              'tool-call',
+              JSON.stringify({ name: call?.name, arguments: call?.args }),
+              `call-${i}`,
+              text(call?.call_id),
+            );
+        } else if (event.kind === 'tool_result_batch_committed') {
+          for (const [i, result] of (Array.isArray(event.results) ? event.results : []).entries())
+            add('tool-result', result?.text, `result-${i}`, text(result?.tool_call_id));
+        } else if (text(event.child_session_id))
+          // A subagent this run started (a reminder observer): the entry its lineage points at.
+          add(
+            'event',
+            JSON.stringify({
+              spawned: text(event.reminder_agent_id) ?? 'subagent',
+              sessionId: event.child_session_id,
+            }),
+            MUSE_SPAWN_SUFFIX,
+          );
+      }
     } else if (['user', 'assistant'].includes(row.type) && row.message) {
       const blocks = row.message.content;
       if (typeof blocks === 'string') add(textKind(row.type, blocks), blocks, 'text');
@@ -408,11 +510,15 @@ export function importTranscriptLines(
     sessionId,
     title,
     projectId: options.projectId,
-    runtime: {
-      provider: provider ?? 'openai',
-      accessPath: subscription ? 'subscription' : 'unknown',
-      ...(subscription ? { evidence: 'transcript' } : {}),
-    },
+    // Muse runs on the person's Meta subscription login; its transcript never states the access path.
+    runtime:
+      options.source === 'muse'
+        ? { provider: provider ?? 'meta', accessPath: 'subscription', evidence: 'harness' }
+        : {
+            provider: provider ?? 'openai',
+            accessPath: subscription ? 'subscription' : 'unknown',
+            ...(subscription ? { evidence: 'transcript' } : {}),
+          },
     ...(lineage ? { lineage } : {}),
     tags: [],
     capturedAt: Date.now(),

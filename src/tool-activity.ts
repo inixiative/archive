@@ -144,7 +144,7 @@ const CALL_SHAPES: {
   {
     shape: 'spawn',
     keep: (call) => {
-      if (!['Agent', 'Task', 'spawn_agent'].includes(call.name)) return undefined;
+      if (!['Agent', 'Task', 'spawn_agent', 'subagent_spawn'].includes(call.name)) return undefined;
       const detail =
         string(call.input?.description) ??
         string(call.input?.agent_type) ??
