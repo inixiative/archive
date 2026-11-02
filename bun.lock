@@ -5,7 +5,7 @@
     "": {
       "name": "@inixiative/archive",
       "dependencies": {
-        "@inixiative/agent-session": "^0.8.0",
+        "@inixiative/agent-session": "^0.9.0",
         "@inixiative/signet": "^0.11.1",
         "@prisma/client": "^6.6.0",
         "js-tiktoken": "1.0.21",
@@ -40,7 +40,7 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.5.2", "", { "os": "win32", "cpu": "x64" }, "sha512-4InchVpdVmdkkkgjQqKpgvyu+VPnoF/7RPSw5YATgEVpt2j72wcCAeV5TwaE9ZGJUZWZn7v2CwSAj6CrMJEx8A=="],
 
-    "@inixiative/agent-session": ["@inixiative/agent-session@0.8.0", "", { "dependencies": { "@inixiative/json-rules": "^3.16.0", "@muse-code/sdk": "1.4.14" } }, "sha512-suI2gbf4wRyna4A/BQwIuuO49Uw+gGxHe5gEbdlco/pAe4WhfxEyeyV3cSFYYPB8Meb5FZR5IGvhT0ieEB9J4g=="],
+    "@inixiative/agent-session": ["@inixiative/agent-session@0.9.0", "", { "dependencies": { "@inixiative/json-rules": "^3.16.0", "@muse-code/sdk": "1.4.14" } }, "sha512-d7TrIymlYDuVQ6Hpd8B7gHcZ6EH2YZg9c/bOuJkVvKoCHCPl7kz6YfwPB8xtTzJwckjSUvtxj5btjuYkOKrSBA=="],
 
     "@inixiative/config": ["@inixiative/config@0.5.176", "", { "peerDependencies": { "@biomejs/biome": ">=2.5.0", "tsup": ">=8.5.0", "typescript": ">=6.0.0" }, "optionalPeers": ["@biomejs/biome", "tsup", "typescript"], "bin": { "inixiative-config": "dist/cli.js" } }, "sha512-SJVFAc+FpLcrzMuEi0naSN3iqgMOOJjbrlEkIjUeLr9Wnf+mj8oWk1/wxsr4P+oym/o7zR228snFyxf6kbxOgg=="],
 
