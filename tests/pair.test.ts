@@ -125,7 +125,6 @@ const fakeKingdom = () => {
                   name: 'Acme Archive',
                   kind: 'archiveLibrary',
                   integrationId: hostedId,
-                  lens: {},
                 },
               ],
             },
@@ -179,8 +178,7 @@ test('pair registers the Archive, waits for the claim, confirms the owner and co
       resources: [
         {
           resourceKind: 'archiveLibrary',
-          operations: ['sessions.write', 'sessions.delete'],
-          lens: {},
+          operations: { picks: ['sessions.write', 'sessions.delete'] },
         },
       ],
     });
@@ -235,15 +233,20 @@ test('pair asks for the named libraries, else the ones its Kingdom destinations 
       resourceId: crypto.randomUUID(),
     },
   ];
-  const operations = ['sessions.write', 'sessions.delete'];
+  const operations = { picks: ['sessions.write', 'sessions.delete'] };
+  const byId = (integrationResourceId: string) => ({
+    resourceModel: 'IntegrationResource' as const,
+    integrationResourceId,
+    operations,
+  });
   expect(pairingRequest({ kingdom, destinations })).toEqual({
-    resources: [{ resourceId: configured, operations }],
+    resources: [byId(configured)],
   });
   expect(
     pairingRequest({ kingdom, libraries: [named, 'inixiative Archive'], destinations }),
   ).toEqual({
     resources: [
-      { resourceId: named, operations },
+      byId(named),
       { resourceKind: 'archiveLibrary', resourceName: 'inixiative Archive', operations },
     ],
   });
