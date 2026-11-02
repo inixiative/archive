@@ -1,6 +1,6 @@
 {
   "name": "@inixiative/archive",
-  "version": "0.32.0",
+  "version": "0.33.0",
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
@@ -38,7 +38,7 @@
   },
   "dependencies": {
     "@inixiative/agent-session": "^0.9.0",
-    "@inixiative/signet": "^0.11.1",
+    "@inixiative/signet": "^0.12.1",
     "@prisma/client": "^6.6.0",
     "js-tiktoken": "1.0.21",
     "prisma": "^6.6.0",
@@ -46,7 +46,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
-    "@inixiative/config": "^0.5.177",
+    "@inixiative/config": "^0.5.178",
     "@types/bun": "1.4.4",
     "lefthook": "2.1.9",
     "typescript": "6.0.3"

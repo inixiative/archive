@@ -65,7 +65,6 @@ export function signetKingdom(options: {
                 name: library.name,
                 kind: 'archiveLibrary',
                 integrationId: library.integrationId,
-                lens: {},
               })),
             },
           ],

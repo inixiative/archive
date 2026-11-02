@@ -40,11 +40,17 @@ export function pairingRequest(input: {
   libraries?: string[];
   destinations: ArchiveDestination[];
 }): { owner?: RequestedOwner; resources: RequestedResource[] } {
-  // Deleting is how a re-plan takes back a part it no longer routes there.
-  const operations = ['sessions.write', 'sessions.delete'];
+  // Exactly these: deleting is how a re-plan takes back a part it no longer routes there, and
+  // `full` is the grantor's to give, not the asker's to ask for.
+  const operations = { picks: ['sessions.write', 'sessions.delete'] };
+  const byId = (integrationResourceId: string) => ({
+    resourceModel: 'IntegrationResource' as const,
+    integrationResourceId,
+    operations,
+  });
   const named = (input.libraries ?? []).map((library) =>
     z.uuid().safeParse(library).success
-      ? { resourceId: library, operations }
+      ? byId(library)
       : { resourceKind: 'archiveLibrary', resourceName: library, operations },
   );
   const configured = [
@@ -55,7 +61,7 @@ export function pairingRequest(input: {
           : [],
       ),
     ),
-  ].map((resourceId) => ({ resourceId, operations }));
+  ].map(byId);
   const resources = named.length
     ? named
     : configured.length
