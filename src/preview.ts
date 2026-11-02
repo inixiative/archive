@@ -1,9 +1,10 @@
 import { lstatSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import type { TranscriptSource } from './import';
 import { importTranscriptFile } from './import-file';
 
 /** Inspect explicit source paths without opening an archive store or publishing data. */
-export function previewImports(path: string, source: 'codex' | 'claude-code', limit = 100) {
+export function previewImports(path: string, source: TranscriptSource, limit = 100) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 1000)
     throw new Error('Preview limit must be between 1 and 1000');
   const files: string[] = [];

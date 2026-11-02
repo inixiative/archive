@@ -42,6 +42,7 @@ import {
   setPublish,
 } from './config';
 import { stampedRun } from './exemption';
+import { isTranscriptSource, type TranscriptSource } from './import';
 import { importTranscriptFile } from './import-file';
 import { pairingRequest, pairWithKingdom, verifyKingdomDestination } from './kingdom';
 import { previewImports } from './preview';
@@ -139,8 +140,8 @@ export async function runCli(args = Bun.argv.slice(2)) {
       'Archive: init | up | down | serve | connect (setup) | preview | import | collect | repair | list | export | tag | tags | suggest | route | routes | sync | search | settings | maintenance | organizations | agents\n' +
         'up | down   (the local Archive: bundled compose.yaml with Postgres, data in --home)\n' +
         'serve [--port 4700 --hostname 127.0.0.1] [--sync]   (DATABASE_URL; token from ARCHIVE_SERVER_TOKEN or --token-file)\n' +
-        'import --file PATH --source codex|claude-code|chatgpt --project-id ID [--tag TAG]\n' +
-        'collect --directory HISTORY --source codex|claude-code (--project-root CWD [--project-root ...] --project-id ID [--worktrees] [--subdirectories] | --catch-all) [--include GLOB ...] [--exclude GLOB ...] [--atlas] [--watch]\n' +
+        'import --file PATH --source codex|claude-code|muse|chatgpt --project-id ID [--tag TAG]\n' +
+        'collect --directory HISTORY --source codex|claude-code|muse (--project-root CWD [--project-root ...] --project-id ID [--worktrees] [--subdirectories] | --catch-all) [--include GLOB ...] [--exclude GLOB ...] [--atlas] [--watch]\n' +
         'collect --agent NAME [--watch]   (one collector from agents.json, routed against the others, re-read each scan)\n' +
         'repair [--agent NAME]   (every collector once, from the transcripts still on disk: re-captures each session as it routes now, taking over one another project holds only when that row holds another transcript, and reports every session re-imported or refused)\n' +
         'list | search --query TEXT [--remote]   [--project-id ID] [--source S] [--tag T] [--suggested T] [--exempt exclude|include|only] [--provider P] [--model M] [--effort E] [--access-path subscription|api|unknown]\n' +
@@ -159,7 +160,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'sync | routes   (the server publishes to, or previews, its destinations once)\n' +
         "settings [--capture-tool-calls-and-results true|false] [--capture-run-sessions true|false] [--retention-days N|off]   (read, or change, this Archive's settings)\n" +
         'maintenance status | maintenance reclaim   (compaction left to do and table sizes; return freed space to the OS once compaction is done)\n' +
-        'agents add-collector --name N --source codex|claude-code (--project-id ID --project-root DIR [--project-root ...] [--worktrees] [--subdirectories] [--former-root DIR ...] | --catch-all) [--directory HISTORY] [--atlas]   (former roots: where the checkouts used to live, for evidence only)\n' +
+        'agents add-collector --name N --source codex|claude-code|muse (--project-id ID --project-root DIR [--project-root ...] [--worktrees] [--subdirectories] [--former-root DIR ...] | --catch-all) [--directory HISTORY] [--atlas]   (former roots: where the checkouts used to live, for evidence only)\n' +
         'agents router [--concurrency N] [--limit N] | agents router off   (install the routing scheduler beside the collectors; --limit caps the sessions a wake plans, default 30)\n' +
         'agents remove-collector --name N | folders [--include GLOB ...] [--exclude GLOB ...] | server --url URL | install | uninstall | status\n' +
         `Data commands talk to the Archive server at --url (default ${DEFAULT_URL}) with the token in --token-file (default <home>/server.token) or ARCHIVE_TOKEN.\n`,
@@ -397,7 +398,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         throw new Error(
           'add-collector requires --name, --source, and --project-id with --project-root (or --catch-all)',
         );
-      const source = v.source as 'codex' | 'claude-code';
+      const source = v.source as TranscriptSource;
       output(
         writeAgents(
           file,
@@ -464,18 +465,11 @@ export async function runCli(args = Bun.argv.slice(2)) {
     return;
   }
   if (command === 'preview') {
-    if (
-      Boolean(v.file) === Boolean(v.directory) ||
-      !['codex', 'claude-code'].includes(v.source ?? '')
-    )
-      throw new Error('Preview requires one --file or --directory and --source codex|claude-code');
-    output(
-      previewImports(
-        v.file ?? v.directory!,
-        v.source as 'codex' | 'claude-code',
-        Number(v.limit ?? 100),
-      ),
-    );
+    if (Boolean(v.file) === Boolean(v.directory) || !isTranscriptSource(v.source))
+      throw new Error(
+        'Preview requires one --file or --directory and --source codex|claude-code|muse',
+      );
+    output(previewImports(v.file ?? v.directory!, v.source, Number(v.limit ?? 100)));
     return;
   }
   if (command === 'search' && v.remote) {
@@ -492,7 +486,9 @@ export async function runCli(args = Bun.argv.slice(2)) {
     throw new Error('Filter by one --tag at a time');
   const filter = {
     ...(v['project-id'] ? { projectId: v['project-id'] } : {}),
-    ...(v.source ? { source: v.source as 'claude-code' | 'codex' | 'foundry' | 'chatgpt' } : {}),
+    ...(v.source
+      ? { source: v.source as 'claude-code' | 'codex' | 'muse' | 'foundry' | 'chatgpt' }
+      : {}),
     ...(v.tag?.length ? { tag: v.tag[0] } : {}),
     ...(v.provider ? { provider: v.provider } : {}),
     ...(v.model ? { model: v.model } : {}),
@@ -677,13 +673,9 @@ export async function runCli(args = Bun.argv.slice(2)) {
     output(results);
     if (results.some((r) => r.status.startsWith('failed'))) process.exitCode = 1;
   } else if (command === 'import') {
-    if (
-      !v.file ||
-      !['codex', 'claude-code', 'chatgpt'].includes(v.source ?? '') ||
-      !v['project-id']
-    )
+    if (!v.file || (v.source !== 'chatgpt' && !isTranscriptSource(v.source)) || !v['project-id'])
       throw new Error(
-        'Import requires --file, --source codex|claude-code|chatgpt and --project-id',
+        'Import requires --file, --source codex|claude-code|muse|chatgpt and --project-id',
       );
     const sourceId = await archive.sourceId();
     const snapshot =
@@ -694,7 +686,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
             title: v.title,
           })
         : importTranscriptFile(v.file, {
-            source: v.source as 'codex' | 'claude-code',
+            source: v.source as TranscriptSource,
             sourceId,
             projectId: v['project-id'],
             sessionId: v['session-id'],
@@ -705,7 +697,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
     const cwd =
       v.source === 'chatgpt'
         ? undefined
-        : sessionMetadata(v.file, v.source as 'codex' | 'claude-code')?.cwd;
+        : sessionMetadata(v.file, v.source as TranscriptSource)?.cwd;
     output({
       ...(await archive.capture(snapshot, cwd ? { cwd } : {})),
       entries: snapshot.entries.length,
@@ -717,7 +709,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
       const catchAll = v['catch-all'];
       if (
         !v.directory ||
-        !['codex', 'claude-code'].includes(v.source ?? '') ||
+        !isTranscriptSource(v.source) ||
         (!catchAll && (!v['project-root'] || !v['project-id']))
       )
         throw new Error(
@@ -725,7 +717,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         );
       const collector = {
         directory: v.directory,
-        source: v.source as 'codex' | 'claude-code',
+        source: v.source,
         projectRoots: catchAll ? [] : v['project-root']!,
         projectId: catchAll ? UNROUTED : v['project-id']!,
         worktrees: v.worktrees,

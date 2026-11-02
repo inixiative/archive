@@ -18,7 +18,7 @@ import {
   defaultExclusions,
   routeSession,
 } from '../src/collector';
-import { importTranscript } from '../src/import';
+import { EmptyTranscript, importTranscript } from '../src/import';
 import { importTranscriptFile } from '../src/import-file';
 import type { ClaimSource } from '../src/schemas';
 import { freshStore } from './db';
@@ -488,7 +488,7 @@ test('a Codex subagent rollout is its own session, with its parent as lineage an
         sourceId: crypto.randomUUID(),
       },
     ),
-  ).toThrow('contain supported records');
+  ).toThrow(EmptyTranscript);
   // Two unrelated sessions in one file are still refused.
   const [, second] = rows;
   expect(() =>

@@ -28,13 +28,21 @@ import {
   UNROUTED,
 } from './collector';
 import type { ProjectMap } from './evidence';
+import { TRANSCRIPT_SOURCES, type TranscriptSource } from './import';
 import { repositorySlug } from './tags';
 
 export const defaultHome = () => join(homedir(), '.local/share/archive');
 export const AGENT_LABEL_PREFIX = 'com.inixiative.archive.';
 /** History each provider writes by default. */
-export const defaultHistoryDirectory = (source: 'claude-code' | 'codex') =>
-  join(homedir(), source === 'codex' ? '.codex/sessions' : '.claude/projects');
+export const defaultHistoryDirectory = (source: TranscriptSource) =>
+  join(
+    homedir(),
+    {
+      codex: '.codex/sessions',
+      'claude-code': '.claude/projects',
+      muse: '.local/share/muse/sessions',
+    }[source],
+  );
 
 const absolute = z.string().max(4096).refine(isAbsolute, 'Path must be absolute');
 /** Folder globs, normalized; an empty entry is refused, never read as "all". */
@@ -60,7 +68,7 @@ export const collectorAgentSchema = z
       .string()
       .max(64)
       .regex(/^[a-z0-9]+(?:[.-][a-z0-9]+)*$/),
-    source: z.enum(['claude-code', 'codex']),
+    source: z.enum(TRANSCRIPT_SOURCES),
     directory: absolute,
     projectId: z.string().min(1).max(256),
     projectRoots: z.array(absolute).max(100),

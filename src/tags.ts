@@ -481,9 +481,28 @@ const FILE_TOOLS: Record<string, string[]> = {
   Grep: ['path'],
   LS: ['path'],
   view_image: ['path'],
+  // Muse Code's file tools (`read_file({ path })` in its tool guidance; the others by analogy).
+  read_file: ['path'],
+  write_file: ['path'],
+  edit_file: ['path'],
+  search: ['path'],
 };
-const WRITE_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit']);
-const SHELL_TOOLS = new Set(['Bash', 'shell', 'local_shell', 'exec_command', 'unified_exec']);
+const WRITE_TOOLS = new Set([
+  'Edit',
+  'MultiEdit',
+  'Write',
+  'NotebookEdit',
+  'write_file',
+  'edit_file',
+]);
+const SHELL_TOOLS = new Set([
+  'Bash',
+  'bash',
+  'shell',
+  'local_shell',
+  'exec_command',
+  'unified_exec',
+]);
 const PATCH_HEADER = /^\*\*\* (?:Update|Add|Delete) File: (.+)$|^\*\*\* Move to: (.+)$/gm;
 /** A JavaScript string literal's value; undefined when it is not one. */
 const jsString = (quote: string, body: string) => {

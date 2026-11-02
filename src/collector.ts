@@ -9,11 +9,11 @@ import {
   realpathSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { projectTags } from './evidence';
 import { cwdRunTags, exemptRun, temporaryRoots } from './exemption';
-import { claudeSessionId } from './import';
-import { importTranscriptFile, transcriptAgentId } from './import-file';
+import { claudeSessionId, EmptyTranscript, type TranscriptSource } from './import';
+import { importTranscriptFile, museAncestors, transcriptAgentId } from './import-file';
 import {
   type ArchiveSnapshot,
   archiveKey,
@@ -28,7 +28,7 @@ export { UNROUTED } from './index';
 
 export interface CollectionSource {
   directory: string;
-  source: 'codex' | 'claude-code';
+  source: TranscriptSource;
   projectRoots: string[];
   projectId: string;
   /** Also match the git worktrees of each root; nested checkouts stay separate. */
@@ -118,13 +118,16 @@ const temporary = (cwd: string) =>
 
 /**
  * The transcripts a collector reads: its history directory's, and for Codex the rollouts Codex
- * moved to `archived_sessions` beside `sessions`, which are sessions all the same.
+ * moved to `archived_sessions` beside `sessions`, which are sessions all the same. Muse writes
+ * each session, and each of its subagents, as a `session.jsonl` in a directory of its own.
  */
 export function historyFiles(config: Pick<CollectionSource, 'directory' | 'source'>) {
   const directory = resolve(config.directory);
   const archived = join(dirname(directory), 'archived_sessions');
   return [
-    ...transcriptFiles(directory),
+    ...transcriptFiles(directory).filter(
+      (file) => config.source !== 'muse' || basename(file) === 'session.jsonl',
+    ),
     ...(config.source === 'codex' && directory.endsWith('/sessions') && existsSync(archived)
       ? transcriptFiles(archived)
       : []),
@@ -152,12 +155,9 @@ export type SessionMetadata = {
   sessionId?: string;
 };
 
-/** Provider metadata, never text/tags/model suggestions; `routeSession` decides where it goes. */
-export function sessionMetadata(
-  file: string,
-  source: CollectionSource['source'],
-): SessionMetadata | undefined {
-  // A bounded synchronous read: streamed readline could leave a watch loop waiting forever.
+/** A transcript's first megabyte, by a bounded synchronous read. */
+function transcriptHead(file: string) {
+  // Streamed readline could leave a watch loop waiting forever.
   const buffer = Buffer.alloc(Math.min(lstatSync(file).size, 1_000_000));
   const fd = openSync(file, 'r');
   try {
@@ -165,7 +165,51 @@ export function sessionMetadata(
   } finally {
     closeSync(fd);
   }
-  for (const line of buffer.toString('utf8').split('\n')) {
+  return buffer.toString('utf8');
+}
+
+/**
+ * A Muse session's id (its stream's) and working directory: the process's (`route_facts`), else
+ * the workspace root its metadata names. A subagent records neither, and runs in its parent's.
+ */
+function museMetadata(file: string): SessionMetadata | undefined {
+  let sessionId: string | undefined;
+  let cwd: string | undefined;
+  let root: string | undefined;
+  for (const line of transcriptHead(file).split('\n')) {
+    if (!line) continue;
+    let row: any;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      break;
+    }
+    const record = row?.payload?.record;
+    if (row?.stream?.kind === 'session' && typeof row.stream.id === 'string')
+      sessionId ??= row.stream.id;
+    if (row?.payload_type === 'runtime.session.route_facts' && typeof record?.cwd === 'string')
+      cwd = record.cwd;
+    const workspace = record?.workspace_root ?? record?.command?.session_metadata?.workspace_root;
+    if (typeof workspace === 'string' && isAbsolute(workspace)) root ??= workspace;
+    if (sessionId && cwd && isAbsolute(cwd)) break;
+  }
+  const at = cwd && isAbsolute(cwd) ? cwd : root;
+  if (at) return { cwd: resolve(at), ...(sessionId ? { sessionId } : {}) };
+  for (const ancestor of museAncestors(file)) {
+    if (!existsSync(ancestor.file)) continue;
+    const parent = museMetadata(ancestor.file);
+    if (parent) return { cwd: parent.cwd, ...(sessionId ? { sessionId } : {}) };
+  }
+  return undefined;
+}
+
+/** Provider metadata, never text/tags/model suggestions; `routeSession` decides where it goes. */
+export function sessionMetadata(
+  file: string,
+  source: CollectionSource['source'],
+): SessionMetadata | undefined {
+  if (source === 'muse') return museMetadata(file);
+  for (const line of transcriptHead(file).split('\n')) {
     if (!line) continue;
     let row: any;
     try {
@@ -299,6 +343,8 @@ export function harnessAccess(
 ): 'subscription' | 'api' | undefined {
   const json = (path: string) =>
     existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined;
+  // The Muse importer records its subscription itself.
+  if (source === 'muse') return undefined;
   const harnessHome = dirname(resolve(directory));
   if (source === 'claude-code') {
     const settings = json(join(harnessHome, 'settings.json'));
@@ -511,6 +557,12 @@ export async function collectSessions(
           projectId: config.projectId,
         });
       } catch (error) {
+        // Nothing to capture yet: read again once the file changes.
+        if (error instanceof EmptyTranscript) {
+          result.skipped++;
+          remember('skipped', meta);
+          continue;
+        }
         // The same bytes fail the same way; a partial file is retried once it changes.
         refuse(file, error);
         remember('failed', meta);
