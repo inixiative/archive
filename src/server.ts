@@ -243,22 +243,8 @@ export function createArchiveHandler(
               ? selectChunks((await store.read(a.id))!.chunks, query, remaining)
               : { chunks: [], tokenCount: 0 };
           remaining -= selected.tokenCount;
-          archives.push({
-            archiveId: a.id,
-            revision: a.revision,
-            digest: a.digest,
-            title: a.title,
-            projectId: a.projectId,
-            actor: a.actor,
-            runtime: a.runtime,
-            lineage: a.lineage,
-            models: a.models,
-            tags: a.tags,
-            suggestedTags: a.suggestedTags,
-            references: a.references,
-            coverage: a.coverage,
-            ...selected,
-          });
+          const { id, entries: _entries, ...listing } = a;
+          archives.push({ archiveId: id, ...listing, ...selected });
         }
         return json({
           data: { archives, tokenCount: budget - remaining, nextCursor: result.nextCursor },

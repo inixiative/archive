@@ -32,7 +32,14 @@ const captureResponse = z.object({
 const readResponse = z.object({ data: z.object({ snapshot: archiveSnapshotSchema }) });
 const searchResponse = z.object({
   data: z.object({
-    archives: z.array(z.object({ tokenCount: z.number() })),
+    archives: z.array(
+      z.object({
+        tokenCount: z.number(),
+        source: z.string(),
+        sessionId: z.string(),
+        projectId: z.string().nullable().optional(),
+      }),
+    ),
     tokenCount: z.number(),
   }),
 });
@@ -119,6 +126,11 @@ test('hosted auth, compacted revisions, concurrent-write conflicts and bounded s
       await (await handler(request('search', { query: 'privacy', budget: 32 }))).json(),
     );
     expect(found.data.archives).toHaveLength(2);
+    // Each hit names its session, so a client can open it where it ran.
+    expect(found.data.archives.map((a) => [a.source, a.sessionId]).sort()).toEqual([
+      ['codex', 'one'],
+      ['codex', 'two'],
+    ]);
     expect(found.data.tokenCount).toBeLessThanOrEqual(32);
     expect(found.data.archives.reduce((n, a) => n + a.tokenCount, 0)).toBe(found.data.tokenCount);
     expect(
