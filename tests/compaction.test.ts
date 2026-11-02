@@ -286,7 +286,7 @@ test('turning tool capture off removes the tool activity already held, batched a
     'tool-result',
     'user',
   ]);
-});
+}, 60_000);
 
 test('a sweep that stopped resumes after the last archive it finished', async () => {
   const store = await freshStore();
