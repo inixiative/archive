@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { defaultHistoryDirectory } from '../src/agents';
 import { collectSessions, historyFiles, sessionMetadata } from '../src/collector';
 import { type Routing, sessionOrganizations } from '../src/config';
-import { importTranscript } from '../src/import';
+import { EmptyTranscript, importTranscript } from '../src/import';
 import { importTranscriptFile } from '../src/import-file';
 import { previewImports } from '../src/preview';
 import { planSession, type RoutingArchive } from '../src/route';
@@ -213,7 +213,7 @@ test('a Muse session imports as user, assistant, reasoning-summary and tool entr
   // A session with no turns (a sign-in) has nothing to archive.
   expect(() =>
     importTranscript(parentLines('/w').slice(0, 4).join('\n'), { source: 'muse', sourceId }),
-  ).toThrow('contain supported records');
+  ).toThrow(EmptyTranscript);
 });
 
 test('the strip drops Muse tool activity and evidence reads its file tools', () => {
@@ -332,7 +332,18 @@ test('the muse collector finds sessions and their subagents, which run in the pa
       projectRoots: ['/work/widgets'],
       projectId: 'widgets',
     };
-    expect(await collectSessions(store, config)).toMatchObject({ imported: 3, failed: 0 });
+    // A sign-in session with no turns is skipped, not refused, and not read again until it changes.
+    const signIn = join(dir, '2026', '01', '02', 'sign-in');
+    mkdirSync(signIn, { recursive: true });
+    writeFileSync(
+      join(signIn, 'session.jsonl'),
+      `${parentLines('/work/widgets').slice(0, 4).join('\n')}\n`,
+    );
+    expect(await collectSessions(store, config)).toMatchObject({
+      imported: 3,
+      failed: 0,
+      skipped: 1,
+    });
     const listed = await store.list({ exempt: 'include' });
     expect(listed.map((a) => [a.source, a.sessionId]).sort()).toEqual([
       ['muse', ROOT],

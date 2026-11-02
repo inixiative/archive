@@ -12,7 +12,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { projectTags } from './evidence';
 import { cwdRunTags, exemptRun, temporaryRoots } from './exemption';
-import { claudeSessionId, type TranscriptSource } from './import';
+import { claudeSessionId, EmptyTranscript, type TranscriptSource } from './import';
 import { importTranscriptFile, museAncestors, transcriptAgentId } from './import-file';
 import {
   type ArchiveSnapshot,
@@ -557,6 +557,12 @@ export async function collectSessions(
           projectId: config.projectId,
         });
       } catch (error) {
+        // Nothing to capture yet: read again once the file changes.
+        if (error instanceof EmptyTranscript) {
+          result.skipped++;
+          remember('skipped', meta);
+          continue;
+        }
         // The same bytes fail the same way; a partial file is retried once it changes.
         refuse(file, error);
         remember('failed', meta);

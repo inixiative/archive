@@ -6,6 +6,9 @@ import {
 } from './index';
 import { personToolResults } from './tool-activity';
 
+/** A transcript that names its session but holds no turns: nothing to capture, not a failure. */
+export class EmptyTranscript extends Error {}
+
 /** The harnesses whose session histories (`.jsonl` transcripts) Archive imports and collects. */
 export const TRANSCRIPT_SOURCES = ['codex', 'claude-code', 'muse'] as const;
 export type TranscriptSource = (typeof TRANSCRIPT_SOURCES)[number];
@@ -500,8 +503,10 @@ export function importTranscriptLines(
         }
     }
   }
-  if (!sessionId || !entries.length)
+  if (!sessionId)
     throw new Error('Transcript must identify a session and contain supported records');
+  // A session with no turns (a Muse login, a Codex session closed before its first prompt).
+  if (!entries.length) throw new EmptyTranscript('Transcript holds no turns');
   const title = options.title ?? (prompt ?? metaPrompt)?.slice(0, 160) ?? sessionId;
   return archiveSnapshotSchema.parse({
     schemaVersion: 1,
