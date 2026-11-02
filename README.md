@@ -1,6 +1,8 @@
 # Archive
 
-MIT-licensed, local-first session storage for Claude Code, Codex and Foundry. Run it independently or connect through Foundry and Kingdom.
+> Part of [inixiative](https://www.inixiative.com), technology for cooperation. See [all the projects](https://github.com/inixiative).
+
+Keeps every agent session, local-first, and syncs to the archives you choose. MIT-licensed. It captures Claude Code, Codex, Muse and Foundry sessions; run it on its own or connect through Foundry and Kingdom.
 
 ## What runs today
 
