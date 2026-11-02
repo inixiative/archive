@@ -1,0 +1,6 @@
+# Legitimate uses of retired terms (@inixiative/config check). <term> allows it everywhere;
+# <path>	<term> in one file, or under a directory when the path ends in /. Stale copy never goes here.
+
+# Provenance and retention history name the retired kingdom-workspace roots.
+docs/PROVENANCE.md	retired-workspaces
+docs/RETENTION.md	retired-workspaces
