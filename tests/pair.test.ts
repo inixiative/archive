@@ -11,15 +11,15 @@ import { routing } from './routing';
 const fakeKingdom = () => {
   const nonces = new Set<string>();
   const state = { polls: 0, collected: 0, actions: [] as string[], requests: [] as unknown[] };
-  let inquiryId = crypto.randomUUID();
-  const signetId = crypto.randomUUID();
-  const integrationId = crypto.randomUUID();
-  const resourceId = crypto.randomUUID();
-  const hostedId = crypto.randomUUID();
+  let inquiryId = Bun.randomUUIDv7();
+  const signetId = Bun.randomUUIDv7();
+  const integrationId = Bun.randomUUIDv7();
+  const resourceId = Bun.randomUUIDv7();
+  const hostedId = Bun.randomUUIDv7();
   const owner = {
     ownerModel: 'Organization',
     userId: null,
-    organizationId: crypto.randomUUID(),
+    organizationId: Bun.randomUUIDv7(),
     spaceId: null,
   };
   const server = Bun.serve({
@@ -45,11 +45,11 @@ const fakeKingdom = () => {
       });
       if (!nonces.delete(proof.nonce)) return Response.json({}, { status: 401 });
       state.actions.push(action);
-      if (action === 'registerInstallation') return data({ installationId: crypto.randomUUID() });
+      if (action === 'registerInstallation') return data({ installationId: Bun.randomUUIDv7() });
       if (action === 'requestRegistration') {
         state.requests.push(requestRegistrationSchema.parse(await request.json()).terms);
         state.polls = 0;
-        inquiryId = crypto.randomUUID();
+        inquiryId = Bun.randomUUIDv7();
         return data({
           reviewCode: 'ABCDEF123456',
           expiresAt: new Date(Date.now() + 600000).toISOString(),
@@ -90,7 +90,7 @@ const fakeKingdom = () => {
       if (action === 'collectSignet') {
         state.collected++;
         return data({
-          enrollmentId: crypto.randomUUID(),
+          enrollmentId: Bun.randomUUIDv7(),
           lifecycle: 'ongoing',
           taskId: null,
           accessToken: `kingdom_${'a'.repeat(43)}`,
@@ -138,7 +138,7 @@ const fakeKingdom = () => {
               space: null,
               user: null,
             },
-            issuedBy: { id: crypto.randomUUID(), name: 'Ada', email: 'ada@acme.example' },
+            issuedBy: { id: Bun.randomUUIDv7(), name: 'Ada', email: 'ada@acme.example' },
             webUrl: 'https://kingdom.example',
             manageUrl: `https://kingdom.example/dashboard?integration=${integrationId}`,
           },
@@ -159,7 +159,7 @@ test('pair registers the Archive, waits for the claim, confirms the owner and co
     const paired = await pairWithKingdom({
       kingdom: kingdom.url,
       name: 'Laptop Archive',
-      sourceId: crypto.randomUUID(),
+      sourceId: Bun.randomUUIDv7(),
       directory,
       request: pairingRequest({ kingdom: kingdom.url, organization: 'acme', destinations: [] }),
       onReview: (review) => reviews.push(review.reviewCode, review.review),
@@ -196,7 +196,7 @@ test('pair registers the Archive, waits for the claim, confirms the owner and co
       pairWithKingdom({
         kingdom: kingdom.url,
         name: 'Laptop Archive',
-        sourceId: crypto.randomUUID(),
+        sourceId: Bun.randomUUIDv7(),
         directory,
         request: { resources: [] },
         onReview: () => {},
@@ -213,15 +213,15 @@ test('pair registers the Archive, waits for the claim, confirms the owner and co
 
 test('pair asks for the named libraries, else the ones its Kingdom destinations name', () => {
   const kingdom = 'https://api.kingdom.example.com';
-  const configured = crypto.randomUUID();
-  const named = crypto.randomUUID();
+  const configured = Bun.randomUUIDv7();
+  const named = Bun.randomUUIDv7();
   const destinations = [
     {
       kind: 'kingdom' as const,
       organizationId: 'kingdom',
       url: `${kingdom}/`,
       credentialFile: '/tmp/signet.json',
-      integrationId: crypto.randomUUID(),
+      integrationId: Bun.randomUUIDv7(),
       resourceId: configured,
     },
     {
@@ -229,8 +229,8 @@ test('pair asks for the named libraries, else the ones its Kingdom destinations 
       organizationId: 'other',
       url: 'https://api.elsewhere.example.com',
       credentialFile: '/tmp/signet.json',
-      integrationId: crypto.randomUUID(),
-      resourceId: crypto.randomUUID(),
+      integrationId: Bun.randomUUIDv7(),
+      resourceId: Bun.randomUUIDv7(),
     },
   ];
   const operations = { picks: ['sessions.write', 'sessions.delete'] };

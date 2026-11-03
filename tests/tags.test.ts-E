@@ -1,0 +1,204 @@
+import { expect, test } from 'bun:test';
+import { type ArchiveEntry, archiveSnapshotSchema } from '../src/index';
+import {
+  archiveReferences,
+  atlasTags,
+  defaultIntegrations,
+  projectPaths,
+  provenanceReferences,
+  referencesIn,
+  shellAccess,
+  toolCallAccess,
+} from '../src/tags';
+
+const snapshot = (entries: Pick<ArchiveEntry, 'kind' | 'text'>[]) =>
+  archiveSnapshotSchema.parse({
+    schemaVersion: 1,
+    sourceId: '1ae3ac76-faa8-4498-8072-425ab35f453c',
+    source: 'claude-code',
+    sessionId: 'session',
+    title: 'Tags',
+    tags: [],
+    capturedAt: 1,
+    coverage: { reasoning: 'unavailable', completeness: 'partial', omissions: [] },
+    entries: entries.map((entry, i) => ({
+      ...entry,
+      id: `e${i}`,
+      timestamp: 1,
+      sourceRef: `line:${i}`,
+    })),
+  });
+
+test('linked pull requests, issues, commits and Linear issues become references, recorded first, then most-linked', () => {
+  const archive = snapshot([
+    { kind: 'user', text: 'Fix the bug from https://linear.app/inixiative/issue/arc-12/title' },
+    {
+      kind: 'tool-result',
+      text: 'https://github.com/inixiative/Foundry/pull/24 and https://github.com/inixiative/foundry/pull/24',
+    },
+    {
+      kind: 'assistant',
+      text: 'See https://github.com/inixiative/archive/commit/531c17d9a1b2 and github.com/a/b/issues/3',
+    },
+  ]);
+  archive.references = [{ integration: 'github', ref: 'inixiative/archive' }];
+  expect(archiveReferences(archive)).toEqual([
+    { integration: 'github', ref: 'inixiative/archive', recorded: true, mentions: 0 },
+    { integration: 'github', ref: 'inixiative/foundry#24', recorded: false, mentions: 2 },
+    { integration: 'github', ref: 'a/b#3', recorded: false, mentions: 1 },
+    { integration: 'github', ref: 'inixiative/archive@531c17d', recorded: false, mentions: 1 },
+    { integration: 'linear', ref: 'ARC-12', recorded: false, mentions: 1 },
+  ]);
+  expect(archiveReferences(archive, defaultIntegrations, 1)).toHaveLength(1);
+});
+
+test("only the archive's integrations are referenced; others match their link prefix", () => {
+  const archive = snapshot([
+    {
+      kind: 'user',
+      text: 'See https://acme.atlassian.net/browse/JIRA-7. and https://linear.app/x/issue/ARC-1/t',
+    },
+  ]);
+  archive.references = [{ integration: 'notion', ref: 'page' }];
+  expect(
+    archiveReferences(archive, [
+      { key: 'jira', name: 'Jira', prefix: 'https://acme.atlassian.net/browse/' },
+    ]),
+  ).toEqual([{ integration: 'jira', ref: 'JIRA-7', recorded: false, mentions: 1 }]);
+});
+
+test('recorded git context becomes repository and branch references', () => {
+  expect(
+    provenanceReferences({ repository: 'git@github.com:inixiative/Foundry.git', branch: 'fix/x' }),
+  ).toEqual([
+    { integration: 'github', ref: 'inixiative/foundry' },
+    { integration: 'github', ref: 'inixiative/foundry/tree/fix/x' },
+  ]);
+  expect(provenanceReferences({ repository: 'https://github.com/a/b', branch: 'HEAD' })).toEqual([
+    { integration: 'github', ref: 'a/b' },
+  ]);
+  expect(provenanceReferences({ repository: 'https://gitlab.example/a/b', branch: 'x' })).toEqual(
+    [],
+  );
+});
+
+test('Atlas concepts come from files tool calls touched, in any root, never from prose', () => {
+  const graph = {
+    'apps/api/archive.ts': { partOf: ['feature:archive'] },
+    'apps/api/auth.ts': { partOf: ['feature:auth', 'primitive:access'] },
+  };
+  const archive = snapshot([
+    { kind: 'user', text: 'apps/api/auth.ts' },
+    { kind: 'tool-call', text: '{"input":{"file_path":"/repo/.worktrees/a/apps/api/auth.ts"}}' },
+    { kind: 'tool-call', text: '{"input":{"file_path":"/repo/apps/api/auth.ts"}}' },
+    { kind: 'tool-call', text: '{"input":{"command":"cat apps/api/archive.ts /elsewhere/x.ts"}}' },
+  ]);
+  expect(atlasTags(archive, graph, ['/repo', '/repo/.worktrees/a'])).toEqual([
+    'atlas:feature:auth',
+    'atlas:primitive:access',
+    'atlas:feature:archive',
+  ]);
+});
+
+test('references in plain text, one per mention, as archiveReferences counts them', () => {
+  expect(
+    referencesIn(
+      'Part of https://linear.app/acme/issue/zlt-88/title; see github.com/Acme/Widgets/pull/5 and linear.app/acme/issue/ZLT-88',
+    ),
+  ).toEqual([
+    { integration: 'github', ref: 'acme/widgets#5' },
+    { integration: 'linear', ref: 'ZLT-88' },
+    { integration: 'linear', ref: 'ZLT-88' },
+  ]);
+  expect(referencesIn('ZLT-88 bare', defaultIntegrations)).toEqual([]);
+});
+
+test('a path resolves to the project holding it, the longest root winning', () => {
+  const resolvePath = projectPaths([
+    { projectId: 'code', roots: ['/w'] },
+    { projectId: 'template', roots: ['/w/template', '/w/template/.worktrees/x', '/w/template-wt'] },
+    { projectId: 'kingdom', roots: ['/w/kingdom'] },
+  ]);
+  expect(resolvePath('/w/template/.worktrees/x/src/a.ts')).toEqual({
+    projectId: 'template',
+    root: '/w/template/.worktrees/x',
+    path: 'src/a.ts',
+  });
+  expect(resolvePath('/w/template-wt/package.json')?.path).toBe('package.json');
+  expect(resolvePath('/w/kingdom/src/a.ts')?.projectId).toBe('kingdom');
+  expect(resolvePath('/w/CLAUDE.md')).toEqual({ projectId: 'code', root: '/w', path: 'CLAUDE.md' });
+  expect(resolvePath('/elsewhere/a.ts')).toBeUndefined();
+});
+
+test('write mode: redirects, sed -i, cp/mv targets, path verbs, git and gh, never reads or descriptor duplications', () => {
+  const w = (script: string, cwd = '/w/a') => shellAccess(script, cwd);
+  expect(w('echo hi > out.txt 2>&1; cat < in.txt >> /w/b/log').writes).toEqual([
+    '/w/a/out.txt',
+    '/w/b/log',
+  ]);
+  expect(w('cat < in.txt').writes).toEqual([]);
+  expect(w('ls >/dev/null 2>&1 && grep x f >& err.log').writes).toEqual(['/w/a/err.log']);
+  expect(w("cat > /w/c/r.md <<'EOF'\n/w/z/x\nEOF").writes).toEqual(['/w/c/r.md']);
+  expect(w("sed -i '' 's/a/b/' x.ts y.ts").writes).toEqual(['/w/a/x.ts', '/w/a/y.ts']);
+  expect(w('sed -n 1,5p x.ts').writes).toEqual([]);
+  expect(w('sed -i -e s/a/b/ z.ts').writes).toEqual(['/w/a/z.ts']);
+  expect(w('cp -r src /w/b/dst && mv a.txt b.txt').writes).toEqual(['/w/b/dst', '/w/a/b.txt']);
+  expect(w('rsync -a src host:dst').writes).toEqual([]);
+  expect(w('mkdir -p d/e && touch f && rm -rf g').writes).toEqual(['/w/a/d/e', '/w/a/f', '/w/a/g']);
+  expect(w('git -C /w/b commit -m x; git status; git checkout main').writes).toEqual(['/w/b']);
+  expect(w('git checkout -b feat').writes).toEqual(['/w/a']);
+  expect(w('cd /w/c && git push && FOO=1 bun run test').writes).toEqual(['/w/c', '/w/c']);
+  expect(w('git --work-tree=/w/d add .').writes).toEqual(['/w/d']);
+  expect(w('git worktree add /w/a/.worktrees/x -b x').writes).toEqual([
+    '/w/a/.worktrees/x',
+    '/w/a',
+  ]);
+  expect(w('git worktree list').writes).toEqual([]);
+  for (const repo of [
+    '-R UserEvidence/zealot',
+    '--repo userevidence/zealot',
+    '--repo=userevidence/zealot',
+  ])
+    expect(w(`gh pr create ${repo} --title x`)).toMatchObject({
+      writes: [],
+      repositories: ['userevidence/zealot'],
+    });
+  expect(w('gh pr comment 5 --body hi').writes).toEqual(['/w/a']);
+  expect(w('gh pr view 5 --repo a/b').repositories).toEqual([]);
+  expect(w('gh api repos/inixiative/archive/issues -f title=x').repositories).toEqual([
+    'inixiative/archive',
+  ]);
+  expect(w('gh api repos/inixiative/archive/pulls').repositories).toEqual([]);
+});
+
+test('write mode per tool call: file tools, Codex patches, exec cells with their own workdir, Foundry tool entries', () => {
+  const claude = (name: string, input: object) => JSON.stringify({ name, input });
+  expect(toolCallAccess(claude('Edit', { file_path: 'x.ts' }), '/w/a').writes).toEqual([
+    '/w/a/x.ts',
+  ]);
+  expect(toolCallAccess(claude('Read', { file_path: 'x.ts' }), '/w/a')).toMatchObject({
+    paths: ['/w/a/x.ts'],
+    writes: [],
+  });
+  expect(
+    toolCallAccess(JSON.stringify({ tool: 'Write', input: { file_path: '/w/f/y.ts' } })).writes,
+  ).toEqual(['/w/f/y.ts']);
+  const cell = [
+    'const r = await tools.exec_command({cmd:"git commit -am x", "workdir":"/w/z"});',
+    'text(await tools.apply_patch("*** Begin Patch\\n*** Update File: /w/z/a.ts\\n@@\\n-x\\n+y\\n*** End Patch"));',
+    'text(await tools.exec_command({cmd:"cat src/b.ts"}));',
+  ].join('\n');
+  const access = toolCallAccess(JSON.stringify({ name: 'exec', arguments: cell }), '/w/a');
+  expect(access.writes).toEqual(['/w/z', '/w/z/a.ts']);
+  expect(access.paths).toContain('/w/a/src/b.ts');
+  expect(access.paths).toContain('/w/z');
+  expect(
+    toolCallAccess(
+      JSON.stringify({
+        name: 'apply_patch',
+        arguments: '*** Begin Patch\n*** Add File: n.ts\n+x\n*** End Patch',
+      }),
+      '/w/a',
+    ).writes,
+  ).toEqual(['/w/a/n.ts']);
+});

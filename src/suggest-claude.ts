@@ -145,7 +145,7 @@ export async function claudeDecisionModel(
   sweepDecisionRuns(parent, env.CLAUDE_CONFIG_DIR, role);
   // One directory per run: a primed host sweeps its directory's transcripts on first use. It
   // appears under its run name only once it names its process, so a sweep never takes a live one.
-  const id = crypto.randomUUID();
+  const id = Bun.randomUUIDv7();
   const cwd = join(parent, `${role}-${id}`);
   const pending = join(parent, `.pending-${id}`);
   mkdirSync(pending, { mode: 0o700 });

@@ -23,9 +23,9 @@ export function signetKingdom(options: {
 }) {
   const nonces = new Set<string>();
   const executed: ExecuteBody[] = [];
-  const signetId = crypto.randomUUID();
-  const localIntegrationId = crypto.randomUUID();
-  const holderUser = { id: crypto.randomUUID(), name: 'Ada', email: 'ada@example.com' };
+  const signetId = Bun.randomUUIDv7();
+  const localIntegrationId = Bun.randomUUIDv7();
+  const holderUser = { id: Bun.randomUUIDv7(), name: 'Ada', email: 'ada@example.com' };
   const server = Bun.serve({
     port: 0,
     hostname: '127.0.0.1',
@@ -85,7 +85,7 @@ export function signetKingdom(options: {
       if (action === 'execute') {
         const body = (await request.json()) as ExecuteBody;
         executed.push(body);
-        return data({ executionId: crypto.randomUUID(), result: await options.execute?.(body) });
+        return data({ executionId: Bun.randomUUIDv7(), result: await options.execute?.(body) });
       }
       return Response.json({}, { status: 404 });
     },
@@ -107,7 +107,7 @@ export function signetKingdom(options: {
         signetId,
         integrationId: localIntegrationId,
         keyFile,
-        enrollmentId: crypto.randomUUID(),
+        enrollmentId: Bun.randomUUIDv7(),
         lifecycle: 'ongoing',
         taskId: null,
         accessToken: `kingdom_${'a'.repeat(43)}`,

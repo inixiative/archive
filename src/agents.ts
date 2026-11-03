@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
@@ -128,7 +127,7 @@ export const readAgents = (file: string): AgentsConfig | undefined =>
 export function writeAgents(file: string, input: AgentsConfig) {
   const config = agentsConfigSchema.parse(input);
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-  const temp = `${file}.${randomUUID()}.tmp`;
+  const temp = `${file}.${Bun.randomUUIDv7()}.tmp`;
   writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
   renameSync(temp, file);
   chmodSync(file, 0o600);
@@ -504,7 +503,7 @@ export function installAgents(config: AgentsConfig, options: AgentHostOptions = 
   h.remove(plan.remove);
   const previous = new Map(installed.map((i) => [i.label, i.content]));
   const write = (file: string, content: string) => {
-    const temp = `${file}.${randomUUID()}.tmp`;
+    const temp = `${file}.${Bun.randomUUIDv7()}.tmp`;
     writeFileSync(temp, content, { mode: 0o644, flag: 'wx' });
     renameSync(temp, file);
   };

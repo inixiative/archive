@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
@@ -220,7 +219,7 @@ export type DescribedDestination = ReturnType<typeof describeDestination>;
 function writeRouting(file: string, input: Routing) {
   const routing = routingSchema.parse(input);
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-  const temp = `${file}.${randomUUID()}.tmp`;
+  const temp = `${file}.${Bun.randomUUIDv7()}.tmp`;
   writeFileSync(temp, `${JSON.stringify(routing, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
   renameSync(temp, file);
   chmodSync(file, 0o600);

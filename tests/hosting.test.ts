@@ -318,8 +318,8 @@ test('Kingdom destinations write and search through the paired Signet', async ()
   const id = await routeWhole(local, source, ['inixiative']);
   const directory = mkdtempSync(join(tmpdir(), 'archive-kingdom-'));
   chmodSync(directory, 0o700);
-  const integrationId = crypto.randomUUID();
-  const resourceId = crypto.randomUUID();
+  const integrationId = Bun.randomUUIDv7();
+  const resourceId = Bun.randomUUIDv7();
   const kingdom = signetKingdom({
     libraries: [{ integrationId, resourceId, name: 'Org Archive' }],
     execute: async (body) =>
@@ -342,7 +342,7 @@ test('Kingdom destinations write and search through the paired Signet', async ()
   try {
     await verifyKingdomDestination(destination);
     await expect(
-      verifyKingdomDestination({ ...destination, resourceId: crypto.randomUUID() }),
+      verifyKingdomDestination({ ...destination, resourceId: Bun.randomUUIDv7() }),
     ).rejects.toThrow('does not grant sessions.write');
     await publishArchive(local, id, destination, routing([destination]));
     expect(executed[0]).toMatchObject({
@@ -624,7 +624,7 @@ test('R2, R3, cleanup: deletes survive a local delete, reconciliation finds copi
     await local.delivered(gone.id, identity, gone.digest);
     // R3: a copy the destination holds with no local row and no receipt, and another Archive's.
     await send(ours('lost'));
-    const foreign = { ...snapshot('userevidence', 'foreign'), sourceId: crypto.randomUUID() };
+    const foreign = { ...snapshot('userevidence', 'foreign'), sourceId: Bun.randomUUIDv7() };
     await send(foreign);
     // cleanup: leaked keeps a whole copy its valid plan sends there whole and unredacted.
     const whole = await local.capture(ours('whole'));
@@ -700,8 +700,8 @@ test('R3 through Kingdom: a listed copy this Archive knows is deleted; one it ca
   const stranger = 'f'.repeat(64);
   const directory = mkdtempSync(join(tmpdir(), 'archive-kingdom-reconcile-'));
   chmodSync(directory, 0o700);
-  const integrationId = crypto.randomUUID();
-  const resourceId = crypto.randomUUID();
+  const integrationId = Bun.randomUUIDv7();
+  const resourceId = Bun.randomUUIDv7();
   const kingdom = signetKingdom({
     libraries: [{ integrationId, resourceId, name: 'UE Archive' }],
     execute: (body) =>

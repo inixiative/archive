@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { z } from 'zod';
 import {
@@ -252,7 +251,7 @@ export class ArchiveStore {
     if (this.cachedSourceId) return this.cachedSourceId;
     const row = await this.db.setting.upsert({
       where: { key: 'sourceId' },
-      create: { key: 'sourceId', value: randomUUID() },
+      create: { key: 'sourceId', value: Bun.randomUUIDv7() },
       update: {},
     });
     this.cachedSourceId = z.uuid().parse(row.value);

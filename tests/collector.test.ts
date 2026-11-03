@@ -452,7 +452,7 @@ test('a Codex subagent rollout is its own session, with its parent as lineage an
   ];
   const snapshot = importTranscript(rows.map((r) => JSON.stringify(r)).join('\n'), {
     source: 'codex',
-    sourceId: crypto.randomUUID(),
+    sourceId: Bun.randomUUIDv7(),
   });
   expect(snapshot.sessionId).toBe(child);
   expect(snapshot.lineage).toEqual({
@@ -485,7 +485,7 @@ test('a Codex subagent rollout is its own session, with its parent as lineage an
         .join('\n'),
       {
         source: 'codex',
-        sourceId: crypto.randomUUID(),
+        sourceId: Bun.randomUUIDv7(),
       },
     ),
   ).toThrow(EmptyTranscript);
@@ -499,7 +499,7 @@ test('a Codex subagent rollout is its own session, with its parent as lineage an
       ].join('\n'),
       {
         source: 'codex',
-        sourceId: crypto.randomUUID(),
+        sourceId: Bun.randomUUIDv7(),
       },
     ),
   ).toThrow('identity mismatch');
@@ -512,7 +512,7 @@ test('Claude subagent runs carry lineage from meta.json; runtime is tagged and f
   try {
     mkdirSync(join(dir, parent, 'subagents'), { recursive: true });
     const row = (extra: object) =>
-      JSON.stringify({ sessionId: parent, cwd: '/work/a', uuid: crypto.randomUUID(), ...extra });
+      JSON.stringify({ sessionId: parent, cwd: '/work/a', uuid: Bun.randomUUIDv7(), ...extra });
     writeFileSync(
       join(dir, `${parent}.jsonl`),
       [
@@ -610,7 +610,7 @@ test('a subagent transcript never takes its parent’s key; a parent row holding
   const store = await freshStore();
   const parent = 'c8c7f7a9-7f4e-4ac7-9d6a-6a4c2a2a0c01';
   const row = (extra: object) =>
-    JSON.stringify({ sessionId: parent, cwd: '/work/a', uuid: crypto.randomUUID(), ...extra });
+    JSON.stringify({ sessionId: parent, cwd: '/work/a', uuid: Bun.randomUUIDv7(), ...extra });
   const subagents = join(dir, parent, 'subagents');
   // Records of an older Claude Code: sidechain, but no agentId; only the file name says which agent.
   const older = [
