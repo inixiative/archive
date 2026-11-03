@@ -65,7 +65,7 @@ test('serve --sync publishes what it receives to its destinations from the same 
       printed += new TextDecoder().decode(chunk.value);
     }
     const url = JSON.parse(printed).listening as string;
-    const sessionId = `synced-${crypto.randomUUID()}`;
+    const sessionId = `synced-${Bun.randomUUIDv7()}`;
     const snapshot = archiveSnapshotSchema.parse({
       schemaVersion: 1,
       sourceId: '1ae3ac76-faa8-4498-8072-425ab35f453c',

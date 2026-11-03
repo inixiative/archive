@@ -73,8 +73,8 @@ test('destination endpoints list delivery, libraries, connect and remove through
     destinationsFile: destinationsFile(dir),
     kingdomDirectory: kingdomDirectory(dir),
   };
-  const integrationId = crypto.randomUUID();
-  const resourceId = crypto.randomUUID();
+  const integrationId = Bun.randomUUIDv7();
+  const resourceId = Bun.randomUUIDv7();
   const kingdom = signetKingdom({
     libraries: [{ integrationId, resourceId, name: 'Org Archive' }],
   });
@@ -94,7 +94,7 @@ test('destination endpoints list delivery, libraries, connect and remove through
       paired: true,
       libraries: [{ integrationId, resourceId, name: 'Org Archive' }],
     });
-    const other = { ...route, resourceId: crypto.randomUUID() };
+    const other = { ...route, resourceId: Bun.randomUUIDv7() };
     const refused = await archive.connectDestination(other).catch((error) => error);
     expect(refused).toBeInstanceOf(ArchiveRequestError);
     expect(refused).toMatchObject({
