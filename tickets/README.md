@@ -1,6 +1,6 @@
 # Archive goals and tickets
 
-These tickets began as product goals. As of 2026-09-20, a standalone MIT implementation exists; see the README and `docs/PILOT-2026-09-20.md` for verified scope. Historical FF labels are not a statement that all collection remains unimplemented. Full incremental ingestion, remote mirroring and lifecycle features remain future work.
+These tickets began as product goals. As of 2026-09-20, a standalone MIT implementation exists; see the README for verified scope. Historical FF labels are not a statement that all collection remains unimplemented. Full incremental ingestion, remote mirroring and lifecycle features remain future work.
 
 ## MVP
 
