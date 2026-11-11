@@ -100,15 +100,12 @@ const fakeKingdom = () => {
           idleExpiresAt: new Date(Date.now() + 86400000).toISOString(),
           tokenType: 'DPoP',
           signetId,
-          integrationId,
           owner,
         });
       }
       if (action === 'describe')
         return data({
           signetId,
-          integrationId,
-          provider: 'archive',
           name: 'Laptop Archive',
           expiresAt: new Date(Date.now() + 300000).toISOString(),
           lifecycle: 'ongoing',
@@ -125,6 +122,7 @@ const fakeKingdom = () => {
                   name: 'Acme Archive',
                   kind: 'archiveLibrary',
                   integrationId: hostedId,
+                  provider: 'archive',
                 },
               ],
             },

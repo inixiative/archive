@@ -1,7 +1,7 @@
 import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { kingdomUrl, pairInstallation, SignetClient } from '@inixiative/signet';
-import type { RequestedOwner, RequestedResource } from '@inixiative/signet/contracts';
+import type { RegisteredResource, RequestedOwner } from '@inixiative/signet/contracts';
 import { z } from 'zod';
 import type { ArchiveDestination } from './config';
 
@@ -39,7 +39,7 @@ export function pairingRequest(input: {
   organization?: string;
   libraries?: string[];
   destinations: ArchiveDestination[];
-}): { owner?: RequestedOwner; resources: RequestedResource[] } {
+}): { owner?: RequestedOwner; resources: RegisteredResource[] } {
   // Exactly these: deleting is how a re-plan takes back a part it no longer routes there, and
   // `full` is the grantor's to give, not the asker's to ask for.
   const operations = { picks: ['sessions.write', 'sessions.delete'] };
@@ -80,7 +80,7 @@ type Pairing = {
   name: string;
   sourceId: string;
   directory: string;
-  request: { owner?: RequestedOwner; resources: RequestedResource[] };
+  request: { owner?: RequestedOwner; resources: RegisteredResource[] };
   onReview: (review: { reviewCode: string; review: string; expiresAt: string }) => void;
   confirmOwner: (owner: { ownerName: string | null; owner: unknown }) => Promise<boolean>;
   onError?: (error: unknown) => void;
@@ -104,7 +104,6 @@ export async function pairWithKingdom(input: Pairing) {
       ...input.request,
       expiresAt: null,
       maxRequests: null,
-      maxConcurrent: 4,
     },
     onReview: input.onReview,
     confirmOwner: input.confirmOwner,

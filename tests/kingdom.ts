@@ -48,8 +48,6 @@ export function signetKingdom(options: {
       if (action === 'describe')
         return data({
           signetId,
-          integrationId: localIntegrationId,
-          provider: 'archive',
           name: 'Laptop Archive',
           expiresAt: new Date(Date.now() + 300000).toISOString(),
           lifecycle: 'ongoing',
@@ -65,6 +63,7 @@ export function signetKingdom(options: {
                 name: library.name,
                 kind: 'archiveLibrary',
                 integrationId: library.integrationId,
+                provider: 'archive',
               })),
             },
           ],
@@ -105,7 +104,6 @@ export function signetKingdom(options: {
       await writePrivateJson(file, {
         url: origin,
         signetId,
-        integrationId: localIntegrationId,
         keyFile,
         enrollmentId: Bun.randomUUIDv7(),
         lifecycle: 'ongoing',
