@@ -1,0 +1,57 @@
+{
+  "id": "running-the-archive",
+  "title": "Serving, calling and running an Archive",
+  "routing": "Is this about running an Archive or talking to one? \u2014 the HTTP API (POST /api/v1/archive/<action>, bearer token, /health), createArchiveHandler, startArchiveServer, migrate, ArchiveClient, localArchive, ArchiveRequestError, the archive CLI (runCli: up, down, serve, import, collect, list, search, connect, sync, routes), Compose on ports 4700/6132, ARCHIVE_SERVER_TOKEN, ARCHIVE_DATA_DIR, ARCHIVE_VERSION, the ghcr.io/inixiative/archive image on Render or Railway, bun run check and the test database; jobs like starting the server, calling it from another process, deploying a hosted Archive, embedding the API in your own server, running the tests.",
+  "concepts": ["http-api", "cli", "deployment", "development", "product-overview"],
+  "tokens": 12861,
+  "tokenMethod": "chars/4",
+  "files": {
+    "recognise": {
+      "path": "recognise.md",
+      "tokens": 2174,
+      "experimental": true,
+      "note": "a smaller recognise-only document; knowledge.md is the Warden document"
+    },
+    "knowledge": {
+      "path": "knowledge.md",
+      "tokens": 12861
+    }
+  },
+  "runsAgreed": 3,
+  "sources": {
+    "docs": ["README.md", "docs/PROVENANCE.md"],
+    "docUnits": [
+      "doc:README.md#http-api",
+      "doc:README.md#local-setup",
+      "doc:README.md#connect-to-byo-hosting",
+      "doc:README.md#development",
+      "doc:docs/PROVENANCE.md#preface",
+      "doc:README.md#preface",
+      "doc:README.md#what-runs-today",
+      "doc:README.md#limits"
+    ],
+    "catalogClusters": [
+      "cli-archive-command",
+      "client-archive-client",
+      "collector-collect-sessions",
+      "data-schema",
+      "import-transcripts",
+      "kingdom-pairing",
+      "routing-config",
+      "routing-evidence",
+      "routing-planner",
+      "server-http-api",
+      "store-capture-and-head",
+      "store-claims",
+      "store-delete-and-tombstones",
+      "store-read-list-search",
+      "store-settings-and-tags",
+      "sync-destinations",
+      "tagger-suggestions"
+    ],
+    "codeEntries": 9,
+    "docMembers": 44
+  },
+  "bypassLines": 9,
+  "glossaryTerms": 23
+}

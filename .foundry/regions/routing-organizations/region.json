@@ -1,0 +1,43 @@
+{
+  "id": "routing-organizations",
+  "title": "Organizations, evidence and personal-only",
+  "routing": "Is this about which organizations exist and what may reach them? \u2014 destinations.json `organizations` (id, projects, roster), routingSchema/readRouting, setOrganization/removeOrganization, the `publish` go-live switch (setPublish), sessionOrganizations, the evidence a session's tool calls leave (sessionEvidence, evidencedOrganizations, the machine project map, projects/set, formerRoots), and what never publishes (alwaysPersonal for Muse, personalSpans hold|redact, setPersonalSpans, holdPersonalTalk, the `unrouted` project); jobs like declaring an organization and its projects, turning publishing on, deciding which organizations a part may go to, proving a session worked in a repo, keeping career or coworker talk personal.",
+  "concepts": ["routing-policy", "routing-evidence", "personal-only"],
+  "tokens": 11273,
+  "tokenMethod": "chars/4",
+  "files": {
+    "recognise": {
+      "path": "recognise.md",
+      "tokens": 1682,
+      "experimental": true,
+      "note": "a smaller recognise-only document; knowledge.md is the Warden document"
+    },
+    "knowledge": {
+      "path": "knowledge.md",
+      "tokens": 11273
+    }
+  },
+  "runsAgreed": 0,
+  "sources": {
+    "docs": ["README.md", "docs/ROUTING.md"],
+    "docUnits": [
+      "doc:README.md#routing",
+      "doc:README.md#routing/routing-plans",
+      "doc:README.md#routing/former-roots-re-planning-and-scheduling",
+      "doc:docs/ROUTING.md#why-this-shape",
+      "doc:docs/ROUTING.md#personal-only-talk-the-second-check-and-hold-on-detect-aron-2026-11-01",
+      "doc:docs/ROUTING.md#muse-is-personal-only-aron-2026-11-01"
+    ],
+    "catalogClusters": [
+      "agents-units-and-project-map",
+      "routing-config",
+      "routing-evidence",
+      "routing-parts",
+      "routing-planner"
+    ],
+    "codeEntries": 23,
+    "docMembers": 11
+  },
+  "bypassLines": 7,
+  "glossaryTerms": 25
+}

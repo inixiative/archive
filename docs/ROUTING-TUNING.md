@@ -151,6 +151,8 @@ Two runs on the shipped charter (`v0-baseline.txt`, sha `1f99358a`), on this bra
 
 ## Sensitivity pass (experiment, 2026-11-01, `exp/sensitivity-pass`; UNDER EXPERIMENT, not decided)
 
+*Later: the pass shipped, on by default (`route --no-sensitivity` turns it off), with hold on detect; see ROUTING.md, "Personal-only talk".*
+
 **Change.** After the planner proposes, a second Sonnet-low call per work part reads that part's window entries, the organizations they would reach and the roster, and answers with redactions or "hold part". It can only remove: its redactions are added to the planner's, a hold makes the part personal, and an answer it can't read holds the part. The planner is held fixed. Both arms replay the recorded proposals of the `fix a` and `fix b` runs above, so only the pass varies. Controls replay the same proposals with the pass off and match `fix a` / `fix b` case for case (40b206fa84 is excluded: its transcript changed since those runs). Pre-registered design (rev 3, adversarially reviewed, verdict go) and its gates are kept privately with the experiment data.
 
 **Gates.**

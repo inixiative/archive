@@ -1,0 +1,56 @@
+{
+  "id": "what-an-archive-keeps",
+  "title": "What an Archive keeps",
+  "routing": "Is this about what an Archive keeps or drops: its settings (archiveSettingsSchema, defaultSettings, retentionDays, captureRunSessions), run sessions and run tags (run:test|oracle|foundry, ARCHIVE_RUN, .archive-run, stampRunDirectory, exemptRun, droppableRun), deleting old sessions and tombstones (archive_tombstones, head deleted: true), or compaction and background maintenance (maintenance status, maintenance reclaim, MaintenancePending)? Plain jobs: mark test or eval sessions, stop keeping run sessions, delete sessions older than N days, stop a deleted session coming back, keep only the current revision, free disk space.",
+  "concepts": [
+    "archive-settings",
+    "run-exemption",
+    "retention-and-tombstones",
+    "compaction-maintenance",
+    "retention-design"
+  ],
+  "tokens": 17362,
+  "tokenMethod": "chars/4",
+  "files": {
+    "recognise": {
+      "path": "recognise.md",
+      "tokens": 1822,
+      "experimental": true,
+      "note": "a smaller recognise-only document; knowledge.md is the Warden document"
+    },
+    "knowledge": {
+      "path": "knowledge.md",
+      "tokens": 17362
+    }
+  },
+  "runsAgreed": 2,
+  "sources": {
+    "docs": ["README.md", "docs/RETENTION.md"],
+    "docUnits": [
+      "doc:README.md#tags-and-references",
+      "doc:README.md#run-sessions-and-maintenance",
+      "doc:README.md#retention-compaction-and-tool-activity",
+      "doc:docs/RETENTION.md#6-pruning-mechanism",
+      "doc:docs/RETENTION.md#preface",
+      "doc:docs/RETENTION.md#1-intent",
+      "doc:docs/RETENTION.md#3-capture-guarantee",
+      "doc:docs/RETENTION.md#4-what-must-remain-proposal-not-built",
+      "doc:docs/RETENTION.md#5-usefulness-score-muninndb-style-proposal-not-built",
+      "doc:docs/RETENTION.md#7-settings-and-ownership-boundaries-proposal-not-built",
+      "doc:docs/RETENTION.md#8-who-reads-from-archive-instead-of-claude-projects-proposal-not-built"
+    ],
+    "catalogClusters": [
+      "exemption-run-tags",
+      "runner-decision-sessions",
+      "store-capture-and-head",
+      "store-compaction-and-maintenance",
+      "store-delete-and-tombstones",
+      "store-read-list-search",
+      "store-settings-and-tags"
+    ],
+    "codeEntries": 20,
+    "docMembers": 27
+  },
+  "bypassLines": 10,
+  "glossaryTerms": 30
+}

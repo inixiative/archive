@@ -1,0 +1,364 @@
+{
+  "version": 1,
+  "project": "archive",
+  "builtFrom": {
+    "docs": [
+      "README.md",
+      "docs/ROUTING.md",
+      "docs/RETENTION.md",
+      "docs/PROVENANCE.md",
+      "prisma/schema.prisma"
+    ],
+    "excluded": [
+      {
+        "path": "docs/ROUTING-TUNING.md",
+        "kind": "history",
+        "reason": "An experiment record of planner charter tuning (2026-11-01): 'a result, not a decision'. The sensitivity pass it tested has shipped (a note was added); what shipped is in ROUTING.md and README."
+      },
+      {
+        "path": "docs/ROUTING.review.md",
+        "kind": "history",
+        "reason": "The adversarial review of routing spec v2 (verdict REVISE); its changes are in ROUTING.md and the code."
+      },
+      {
+        "path": "docs/ROUTING.code-review.md",
+        "kind": "history",
+        "reason": "The code review record of the agentic-routing branch; its fixes are built and summarized in ROUTING.md's As built."
+      },
+      {
+        "path": "tickets/**/*.md",
+        "kind": "workItem",
+        "reason": "The original goal tickets (ARC-001..013); tickets/README.md says they describe earlier scope and FF labels are not a statement of what is built."
+      },
+      {
+        "path": "tests/**",
+        "kind": "excluded",
+        "reason": "Bun tests against a real Postgres; outside the regions (codeScope is src/)."
+      },
+      {
+        "path": "scripts/**",
+        "kind": "excluded",
+        "reason": "Dev tooling: the planner scorer route-fixtures.ts (its cases are private, outside the repo) and the retired-terms allow list for CI."
+      },
+      {
+        "path": ".github/**",
+        "kind": "excluded",
+        "reason": "CI (check with a pgvector service) and image publishing workflows."
+      },
+      {
+        "path": "docs/ROUTING.md#duplicate-vs-expose-aron-or-i-can-just-expose-my-inixiative-archive-there",
+        "kind": "excluded",
+        "reason": "A proposal for a Kingdom lens `tags` field; deferred (As built: 'B3 (lens) deferred'), not built."
+      },
+      {
+        "path": "docs/ROUTING.md#test-cases-real-sessions-archive-id-expected-plan",
+        "kind": "excluded",
+        "reason": "History: the private test table of archive ids the dry run scored."
+      },
+      {
+        "path": "docs/ROUTING.md#not-in-v1",
+        "kind": "excluded",
+        "reason": "History: v1 scope notes."
+      },
+      {
+        "path": "docs/ROUTING.md#v3-changes-from-the-adversarial-review-routing-review-md-verdict-revise-claims-spot-checked-in-code",
+        "kind": "excluded",
+        "reason": "History: the review's change list, now built and described in As built."
+      },
+      {
+        "path": "docs/ROUTING.md#dry-run-scratch-copy-2026-11-01",
+        "kind": "excluded",
+        "reason": "History: one dry run's results."
+      },
+      {
+        "path": "docs/ROUTING.md#code-review-fixes-2026-11-01-docs-routing-code-review-md",
+        "kind": "excluded",
+        "reason": "History: the code review's fix table."
+      },
+      {
+        "path": "docs/ROUTING.md#re-review-fixes-2026-11-01",
+        "kind": "excluded",
+        "reason": "History: the re-review's fix table."
+      },
+      {
+        "path": "docs/RETENTION.md#2-where-it-stood-measured-2026-10-12-history",
+        "kind": "excluded",
+        "reason": "History: a measured snapshot of the machine's Archive on 2026-10-12."
+      },
+      {
+        "path": "docs/RETENTION.md#9-build-order-history-steps-3-and-4-built-except-coverage-step-5-half-built",
+        "kind": "excluded",
+        "reason": "History: the proposal's build order and its progress."
+      },
+      {
+        "path": "docs/RETENTION.md#10-test-cases-proposal",
+        "kind": "excluded",
+        "reason": "Proposal test cases for unbuilt features."
+      },
+      {
+        "path": "docs/RETENTION.md#11-open-questions-for-aron",
+        "kind": "excluded",
+        "reason": "Open questions for Aron, not facts."
+      }
+    ],
+    "catalog": "code read through the repo's Atlas map when it has one, else the plan's code scope; described with Foundry's catalog describer prompts",
+    "atlas": ".atlas/concepts.ts",
+    "libraries": {},
+    "method": "three independent model proposals, item-level majority vote (2 of 3), seams to the size ceiling, per-region authoring"
+  },
+  "concepts": [
+    {
+      "tag": "snapshot-contract",
+      "atlas": "contract:snapshot",
+      "description": "The portable snapshot schema: entries, actor, runtime, lineage subagent|fork|part, references, coverage, UNROUTED (archiveSnapshotSchema and its parts)",
+      "region": "session-store"
+    },
+    {
+      "tag": "digests-and-chunks",
+      "atlas": "contract:digests-and-chunks",
+      "description": "Session identity and budgets: digest, snapshotDigest, transcriptDigest, archiveKey, tokenCount, chunkArchive, selectChunks",
+      "region": "session-store"
+    },
+    {
+      "tag": "store-api",
+      "atlas": "store:capture-and-head",
+      "description": "ArchiveStore capture/head/read/list/search over Postgres: previousDigest, ArchiveConflict, RevisionCompacted, filters, search",
+      "region": "session-store"
+    },
+    {
+      "tag": "data-schema",
+      "atlas": "data:schema",
+      "description": "prisma/schema.prisma models, columns, indexes, vector and pg_trgm extensions; changes go through Prisma migrations",
+      "region": "session-store"
+    },
+    {
+      "tag": "http-api",
+      "atlas": "server:http-api",
+      "description": "The server and its client: POST /api/v1/archive/<action> with a bearer token, /health, createArchiveHandler, ArchiveClient, localArchive",
+      "region": "running-the-archive"
+    },
+    {
+      "tag": "cli",
+      "atlas": "cli:archive-command",
+      "description": "The archive bin (runCli) and its subcommands, including up/down, serve and migrate",
+      "region": "running-the-archive"
+    },
+    {
+      "tag": "deployment",
+      "atlas": null,
+      "description": "Running an Archive: Compose, ports 4700/6132, the published image, server token, BYO hosting on Render/Railway",
+      "region": "running-the-archive"
+    },
+    {
+      "tag": "development",
+      "atlas": null,
+      "description": "Working on this repo: bun run check, tests against pgvector Postgres, migrations, MIT licence and provenance",
+      "region": "running-the-archive"
+    },
+    {
+      "tag": "product-overview",
+      "atlas": null,
+      "description": "What Archive is and runs today, ownership boundaries, and its stated limits",
+      "region": "running-the-archive"
+    },
+    {
+      "tag": "collectors",
+      "atlas": "collector:collect-sessions",
+      "description": "collectSessions: exact roots, worktrees, subdirectories, catch-all/unrouted, folder include/exclude filters, held/refused, repair",
+      "region": "capturing-sessions"
+    },
+    {
+      "tag": "host-agents",
+      "atlas": "agents:units-and-project-map",
+      "description": "agents.json and the launchd/systemd units that run collectors and the route agent; install and status",
+      "region": "capturing-sessions"
+    },
+    {
+      "tag": "transcript-import",
+      "atlas": "import:transcripts",
+      "description": "Transcript importers: Claude Code, Codex, Muse, ChatGPT text, import-file, preview",
+      "region": "capturing-sessions"
+    },
+    {
+      "tag": "claims",
+      "atlas": "store:claims",
+      "description": "Driver claims (leases) on native sessions: claim, fulfil, claimState, takeover, superseded raw captures",
+      "region": "capturing-sessions"
+    },
+    {
+      "tag": "tool-activity",
+      "atlas": "capture:tool-activity",
+      "description": "captureToolCallsAndResults and the tool-activity strip at ingest; recognisers for what the person said through a tool",
+      "region": "capturing-sessions"
+    },
+    {
+      "tag": "tags-and-references",
+      "atlas": "tags:references-and-paths",
+      "description": "Tags, Atlas tags, project: tags (search only), references and integrations, tag edits and tag definitions, the shell/tool-call path parser",
+      "region": "tags-and-tagger"
+    },
+    {
+      "tag": "tagger",
+      "atlas": "tagger:suggestions",
+      "description": "The tagger: suggestion queue, SUGGEST_PROMPT, junk/category/project suggestions on Haiku, never applied automatically",
+      "region": "tags-and-tagger"
+    },
+    {
+      "tag": "decision-runner",
+      "atlas": "runner:decision-sessions",
+      "description": "The isolated subscription runner for model passes (tagger Haiku, planner Sonnet): primed sessions, pinned login, run sweep, pool",
+      "region": "tags-and-tagger"
+    },
+    {
+      "tag": "routing-policy",
+      "atlas": "routing:config",
+      "description": "The routing rule and organizations: destinations.json organizations, publish switch, sessionOrganizations, parts never whole sessions",
+      "region": "routing-organizations"
+    },
+    {
+      "tag": "routing-evidence",
+      "atlas": "routing:evidence",
+      "description": "Per-entry write/read evidence, the machine project map, projects/set, former roots, organizations allowed by evidence",
+      "region": "routing-organizations"
+    },
+    {
+      "tag": "personal-only",
+      "atlas": null,
+      "description": "What never publishes: career/investor/coworker talk, SENSITIVITY_PROMPT, holdPersonalTalk, personalSpans, Muse and alwaysPersonal",
+      "region": "routing-organizations"
+    },
+    {
+      "tag": "routing-planner",
+      "atlas": "routing:planner",
+      "description": "The planner: ROUTE_PROMPT, parsePlan, validatePlan, scheduling and cadence, re-planning, backfill, plan records and review",
+      "region": "routing-planning"
+    },
+    {
+      "tag": "routing-parts",
+      "atlas": "routing:parts",
+      "description": "Parts: partSnapshot, part ids and lineage, redactText with the closed REDACTION_REASONS set",
+      "region": "routing-planning"
+    },
+    {
+      "tag": "destinations",
+      "atlas": "sync:destinations",
+      "description": "Destination config: direct Archive and Kingdom destinations, connect/remove, token files, cleanup switch, remote search",
+      "region": "destinations-and-sync"
+    },
+    {
+      "tag": "sync-publish",
+      "atlas": "sync:destinations",
+      "description": "The sync loop: syncArchives, publishArchive, receipts and outbox, backoff, routes preview",
+      "region": "destinations-and-sync"
+    },
+    {
+      "tag": "remote-deletion",
+      "atlas": null,
+      "description": "Deleting at destinations: re-plan deletes, leaked whole copies, cleanup/cleanupFor modes, tombstone-queued deletes, deleteRemote",
+      "region": "destinations-and-sync"
+    },
+    {
+      "tag": "kingdom-pairing",
+      "atlas": "kingdom:pairing",
+      "description": "Pairing with Kingdom: pairWithKingdom, held Signets, paired libraries, kingdomArchiveOperation",
+      "region": "destinations-and-sync"
+    },
+    {
+      "tag": "archive-settings",
+      "atlas": "store:settings-and-tags",
+      "description": "The settings row and schema: integrations, retentionDays, captureToolCallsAndResults, captureRunSessions, defaults",
+      "region": "what-an-archive-keeps"
+    },
+    {
+      "tag": "run-exemption",
+      "atlas": "exemption:run-tags",
+      "description": "Run tags run:test|oracle|foundry: ARCHIVE_RUN, .archive-run, stampRunDirectory, inferred run tags, dropping run sessions",
+      "region": "what-an-archive-keeps"
+    },
+    {
+      "tag": "retention-and-tombstones",
+      "atlas": "store:delete-and-tombstones",
+      "description": "retentionDays prune and delete: hard delete leaving an archive_tombstones row, how head and re-capture answer it",
+      "region": "what-an-archive-keeps"
+    },
+    {
+      "tag": "compaction-maintenance",
+      "atlas": "store:compaction-and-maintenance",
+      "description": "Compaction to the current revision, background maintenance, sweeps, reclaim, search index, maintenance status",
+      "region": "what-an-archive-keeps"
+    },
+    {
+      "tag": "retention-design",
+      "atlas": null,
+      "description": "docs/RETENTION.md: capture guarantee and the labelled unbuilt proposal (coverage, usefulness, tiers, citations) that needs a yes before building",
+      "region": "what-an-archive-keeps"
+    }
+  ],
+  "regions": [
+    {
+      "id": "session-store",
+      "tokens": 10288,
+      "recogniseTokens": 1760,
+      "concepts": ["snapshot-contract", "digests-and-chunks", "store-api", "data-schema"],
+      "runsAgreed": 2
+    },
+    {
+      "id": "running-the-archive",
+      "tokens": 12861,
+      "recogniseTokens": 2174,
+      "concepts": ["http-api", "cli", "deployment", "development", "product-overview"],
+      "runsAgreed": 3
+    },
+    {
+      "id": "capturing-sessions",
+      "tokens": 18943,
+      "recogniseTokens": 2869,
+      "concepts": ["collectors", "host-agents", "transcript-import", "claims", "tool-activity"],
+      "runsAgreed": 2
+    },
+    {
+      "id": "tags-and-tagger",
+      "tokens": 10426,
+      "recogniseTokens": 1727,
+      "concepts": ["tags-and-references", "tagger", "decision-runner"],
+      "runsAgreed": 2
+    },
+    {
+      "id": "routing-organizations",
+      "tokens": 11273,
+      "recogniseTokens": 1682,
+      "concepts": ["routing-policy", "routing-evidence", "personal-only"],
+      "runsAgreed": 0
+    },
+    {
+      "id": "routing-planning",
+      "tokens": 14305,
+      "recogniseTokens": 2279,
+      "concepts": ["routing-planner", "routing-parts"],
+      "runsAgreed": 2
+    },
+    {
+      "id": "destinations-and-sync",
+      "tokens": 11054,
+      "recogniseTokens": 1558,
+      "concepts": ["destinations", "sync-publish", "remote-deletion", "kingdom-pairing"],
+      "runsAgreed": 3
+    },
+    {
+      "id": "what-an-archive-keeps",
+      "tokens": 17362,
+      "recogniseTokens": 1822,
+      "concepts": [
+        "archive-settings",
+        "run-exemption",
+        "retention-and-tombstones",
+        "compaction-maintenance",
+        "retention-design"
+      ],
+      "runsAgreed": 2
+    }
+  ],
+  "dropped": {
+    "doc:docs/ROUTING.md#preface": "History line only: says spec v1 is superseded by v2; establishes nothing to reuse or obey (v2 itself is in the other ROUTING.md units)."
+  }
+}

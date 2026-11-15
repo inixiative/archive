@@ -1,0 +1,52 @@
+{
+  "id": "routing-planning",
+  "title": "Routing planner and parts",
+  "routing": "Is this about planning how a session is cut and routed? \u2014 `archive route` (--watch, --backfill [--dry-run], plans, review --id, reset --id, --no-sensitivity, --claude-config-dir), the `route` agent (`archive agents router`, com.inixiative.archive.route), ROUTE_PROMPT, SENSITIVITY_PROMPT, parsePlan, validatePlan, publishedParts, planSession, runRouting, runBackfill, ArchiveStore routingDue/routingInput/recordPlan/applyParts, the routing/due|input|record|plans|review|reset actions, RoutingPlan records, heldForReview, part ids `<sessionId>#part-<first entry id>`, partSnapshot, redactText and REDACTION_REASONS; jobs like splitting a session into per-organization slices, redacting a span, re-planning after new entries, scheduling the planner, reviewing held plans.",
+  "concepts": ["routing-planner", "routing-parts"],
+  "tokens": 14305,
+  "tokenMethod": "chars/4",
+  "files": {
+    "recognise": {
+      "path": "recognise.md",
+      "tokens": 2279,
+      "experimental": true,
+      "note": "a smaller recognise-only document; knowledge.md is the Warden document"
+    },
+    "knowledge": {
+      "path": "knowledge.md",
+      "tokens": 14305
+    }
+  },
+  "runsAgreed": 2,
+  "sources": {
+    "docs": ["README.md", "docs/ROUTING.md"],
+    "docUnits": [
+      "doc:README.md#routing/routing-plans",
+      "doc:README.md#routing/former-roots-re-planning-and-scheduling",
+      "doc:README.md#routing/routing-over-http",
+      "doc:docs/ROUTING.md#the-rule-one-paragraph",
+      "doc:docs/ROUTING.md#why-this-shape",
+      "doc:docs/ROUTING.md#existing-primitives-reused-no-parallel-machinery",
+      "doc:docs/ROUTING.md#cadence-aron-2026-11-01-replaces-after-30-min-idle",
+      "doc:docs/ROUTING.md#as-built-2026-11-01-branch-feat-agentic-routing",
+      "doc:README.md#routing"
+    ],
+    "catalogClusters": [
+      "agents-units-and-project-map",
+      "client-archive-client",
+      "exemption-run-tags",
+      "routing-evidence",
+      "routing-parts",
+      "routing-planner",
+      "routing-plans-in-store",
+      "runner-decision-sessions",
+      "server-http-api",
+      "sync-destinations",
+      "tags-references-and-paths"
+    ],
+    "codeEntries": 26,
+    "docMembers": 49
+  },
+  "bypassLines": 9,
+  "glossaryTerms": 24
+}

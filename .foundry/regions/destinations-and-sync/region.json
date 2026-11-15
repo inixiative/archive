@@ -1,0 +1,40 @@
+{
+  "id": "destinations-and-sync",
+  "title": "Destinations, sync and Kingdom",
+  "routing": "Is this about where parts go and getting them there or removing them? \u2014 destinations.json `destinations` entries (direct Archive with tokenFile/tokenEnv, Kingdom with a Signet), connectDestination/removeDestination, `archive connect` (alias setup), describeDestination, sessionDestinations, syncArchives (`serve --sync`, `archive sync [--dry-run]`), publishArchive, routingPreview (`archive routes`), archiveRequest, searchRemotes (`search --remote`), receipts and outbox, delivery backoff, `cleanup`/`cleanupFor` off|leaked|all (setCleanup, `archive cleanup`), deleteRemote, `archive pair`, Signets, kingdomArchiveOperation, `POST /api/v1/access/execute` with DPoP; jobs like publishing to a company's hosted Archive, previewing or forcing a sync, deleting leaked copies, pairing with Kingdom, searching remote archives.",
+  "concepts": ["destinations", "sync-publish", "remote-deletion", "kingdom-pairing"],
+  "tokens": 11054,
+  "tokenMethod": "chars/4",
+  "files": {
+    "recognise": {
+      "path": "recognise.md",
+      "tokens": 1558,
+      "experimental": true,
+      "note": "a smaller recognise-only document; knowledge.md is the Warden document"
+    },
+    "knowledge": {
+      "path": "knowledge.md",
+      "tokens": 11054
+    }
+  },
+  "runsAgreed": 3,
+  "sources": {
+    "docs": ["README.md"],
+    "docUnits": [
+      "doc:README.md#connect-to-byo-hosting",
+      "doc:README.md#routing/routing-over-http",
+      "doc:README.md#routing/deletion",
+      "doc:README.md#connect-through-kingdom"
+    ],
+    "catalogClusters": [
+      "client-archive-client",
+      "kingdom-pairing",
+      "routing-config",
+      "sync-destinations"
+    ],
+    "codeEntries": 30,
+    "docMembers": 10
+  },
+  "bypassLines": 8,
+  "glossaryTerms": 25
+}

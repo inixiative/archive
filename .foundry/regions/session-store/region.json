@@ -1,0 +1,36 @@
+{
+  "id": "session-store",
+  "title": "Snapshots and the session store",
+  "routing": "Is this about the shape of an archived session or how it is stored? \u2014 archiveSnapshotSchema (entries, actor, runtime, lineage subagent|fork|part, references, coverage, UNROUTED), archiveKey, snapshotDigest, transcriptDigest, chunkArchive, selectChunks, ArchiveStore capture/head/read/list/search, previousDigest, ArchiveConflict, RevisionCompacted, and the Prisma models in prisma/schema.prisma (archives, revisions, chunks, archive_tombstones, routing_plans, claims, outbox, receipts); jobs like validating a snapshot, identifying a session, detecting a changed session, chunking for a token budget, storing or reading a session in Postgres, adding a column.",
+  "concepts": ["snapshot-contract", "digests-and-chunks", "store-api", "data-schema"],
+  "tokens": 10288,
+  "tokenMethod": "chars/4",
+  "files": {
+    "recognise": {
+      "path": "recognise.md",
+      "tokens": 1760,
+      "experimental": true,
+      "note": "a smaller recognise-only document; knowledge.md is the Warden document"
+    },
+    "knowledge": {
+      "path": "knowledge.md",
+      "tokens": 10288
+    }
+  },
+  "runsAgreed": 2,
+  "sources": {
+    "docs": ["README.md", "prisma/schema.prisma"],
+    "docUnits": ["doc:README.md#actors-runtime-and-lineage", "doc:prisma/schema.prisma#preface"],
+    "catalogClusters": [
+      "contract-digests-and-chunks",
+      "contract-snapshot",
+      "data-schema",
+      "store-capture-and-head",
+      "store-read-list-search"
+    ],
+    "codeEntries": 17,
+    "docMembers": 20
+  },
+  "bypassLines": 7,
+  "glossaryTerms": 23
+}

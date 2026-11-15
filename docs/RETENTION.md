@@ -1,6 +1,6 @@
 # Retention: Archive keeps the transcripts
 
-> **PROPOSAL. Needs Aron's yes before anything is built.** It changes what the `retentionDays` setting means and adds a usefulness score, so it falls under "talk the plan through before changing what something means." **Built (Aron, 2026-10-18):** §6.1 compaction, and a `captureToolCallsAndResults` setting that keeps tool calls and results out of the Archive (README, "Tags, references, actors and retention"). The rest is not implemented.
+> **PROPOSAL. Needs Aron's yes before anything is built.** It changes what the `retentionDays` setting means and adds a usefulness score, so it falls under "talk the plan through before changing what something means." **Built (Aron, 2026-10-18):** §6.1 compaction, and a `captureToolCallsAndResults` setting that keeps tool calls and results out of the Archive (README, "Retention, compaction and tool activity"). Built since: catch-all collectors, folder filters and `--subdirectories` (§3.1), lineage from `meta.json` and Codex `session_meta` (§3.3, with a routing `part` kind added), and tombstones for `delete` and `retentionDays` (§6.2). Not built: `archive coverage` (§3.2), capture-time corrections, citations, the usefulness score, tiers, summaries, `retention_log` and the `retention` settings (§4–§8); `retentionDays` is still the setting. Each heading below says which. §2 is a measured snapshot from 2026-10-12, not the current state.
 
 **Basis:** Archive `origin/main` 0.13.0 (`44d97a0`), Foundry `origin/main` (`f040582`; foundry-core `src/feedback/correction.ts` from `e10b2f0`), Oracle `origin/main`, and the live local Archive on Aron's machine, read 2026-10-12. Path prefixes: `ar/` = `archive/src`, `pf/` = `foundry/packages/foundry/src`, `pc/` = `foundry/packages/core/src`, `or/` = `oracle/src`.
 
@@ -14,7 +14,7 @@ So:
 - **Archive is the record.** Foundry, Oracle and the Prospector read sessions from Archive, not from `~/.claude/projects`.
 - **Archive prunes on its own terms.** It keeps what earned its place, summarizes what might still matter, and drops the rest's content.
 
-## 2. Where it stands today (measured 2026-10-12)
+## 2. Where it stood (measured 2026-10-12; history)
 
 ### 2.1 Capture
 
@@ -66,7 +66,7 @@ The collector scans every 30 seconds, so a session whose cwd *is* mapped is capt
 
 **Guarantee:** every Claude Code and Codex session on this machine is in the local Archive at its latest digest, or deliberately excluded, before the harness can delete it.
 
-### 3.1 Machine-wide collection, routed by project
+### 3.1 Machine-wide collection, routed by project (built)
 
 Keep the exact-root collectors (they are the routing map) and add one **catch-all** per source:
 
@@ -76,8 +76,8 @@ archive agents add-collector --name codex.unrouted --source codex --catch-all
 ```
 
 - A catch-all collector captures every session whose cwd no other collector in `agents.json` claims. It gives those sessions the reserved projectId `unrouted`.
-- No destination matches `unrouted`, so by the existing routing rule ("an archive with no matching destination stays local") they never leave the machine. Routing them later is a re-route, not a re-capture.
-- **Folder filters** are declared once in `agents.json` (`include` / `exclude` globs, applied to every match; README, "Collect"), always excluding decision receipts; temp directories stay out of broad matches. Test and fixture sessions stay out.
+- No organization may own the project `unrouted` (`src/config.ts`), so its start project never routes a session; like every session, it publishes only as the parts its routing plan sends to an organization (README, "Routing"). Routing it later is a re-plan, not a re-capture.
+- **Folder filters** are declared once in `agents.json` (`include` / `exclude` globs, applied to every match; README, "Local setup"), always excluding decision receipts; temp directories stay out of broad matches. Test and fixture sessions stay out.
 - Ancestor matching for nested directories (`kingdom/apps/api/…`) is opt-in per collector (`--subdirectories`); the default stays exact so another organization's nested checkout is never swept in.
 
 Collectors to add on this machine (an `agents.json` edit, no code):
@@ -90,7 +90,7 @@ Collectors to add on this machine (an `agents.json` edit, no code):
 
 And remove the `kingdom-workspace` roots.
 
-### 3.2 Coverage check
+### 3.2 Coverage check (proposal, not built)
 
 New command and endpoint, one implementation:
 
@@ -100,12 +100,12 @@ archive coverage            # also: agents status prints its summary
 
 For each harness file it reports one of `captured` (latest digest held), `pending` (file changed since last capture), `excluded`, `unrouted` or `failed`, with the file's age. It flags any file not `captured` or `excluded` whose age passes `cleanupPeriodDays − 7`. Claude's `cleanupPeriodDays` is read from `~/.claude/settings.json` (default 30). Foundry's viewer shows the flag next to the Archive status it already has.
 
-### 3.3 What a capture carries for retention
+### 3.3 What a capture carries for retention (lineage built; corrections not built)
 
-- **Lineage.** One shape, as shipped (0.20.0): `lineage: { kind: 'subagent' | 'fork', parentSessionId, rootSessionId?, parentEntryId?, toolUseId?, agentType?, agentName?, description?, depth? }`. `parentSessionId` is the direct parent's session id; a parent's archive key is `archiveKey({sourceId, source, sessionId: parentSessionId})`. The collector fills it from `agent-<id>.meta.json` and Codex `session_meta`. Foundry writes the trees it drives (Foundry `docs/THREAD-TREE.md` spec A), with `rootSessionId` and `parentEntryId`, and claims those native sessions so the collector does not capture them twice. A Foundry child thread is `subagent`; there is no separate `handoff` kind. Retention treats a lineage tree as one unit (§4).
+- **Lineage.** One shape, as shipped (0.20.0; routing later added `kind: 'part'` with `firstEntryId`/`lastEntryId`): `lineage: { kind: 'subagent' | 'fork', parentSessionId, rootSessionId?, parentEntryId?, toolUseId?, agentType?, agentName?, description?, depth? }`. `parentSessionId` is the direct parent's session id; a parent's archive key is `archiveKey({sourceId, source, sessionId: parentSessionId})`. The collector fills it from `agent-<id>.meta.json` and Codex `session_meta`. Foundry writes the trees it drives (Foundry `docs/THREAD-TREE.md` spec A), with `rootSessionId` and `parentEntryId`, and claims those native sessions so the collector does not capture them twice. A Foundry child thread is `subagent`; there is no separate `handoff` kind. Retention treats a lineage tree as one unit (§4).
 - **Corrections.** At capture, run foundry-core's deterministic `extractCorrections(sessionId, turns)` (`pc/feedback/correction.ts`, MIT, data and pure functions, no model call) over the session's typed prompts (`typedPrompt`, `ar/import.ts`). Store the candidates' ids and signals in the listing summary. The model classification (`CORRECTION_CLASSIFY_PROMPT`) stays with Foundry and Oracle, which report back through citations (§5).
 
-## 4. What must remain
+## 4. What must remain (proposal, not built)
 
 Retention has three tiers:
 
@@ -126,11 +126,11 @@ An archive is **kept** while any of these hold. Each is a *citation* (§5) of a 
 | A subagent or handoff whose parent is kept, or the parent of a kept child | Archive, from lineage | derived, not stored |
 | Pinned by a person | Person (CLI, Foundry, Kingdom) | `pin` |
 
-**Exempt sessions** (`run:test`, `run:oracle`, `run:foundry`; README, "Run tags") are outside this scheme, and an Archive with `captureRunSessions` off does not keep them at all: they get no citations, no usefulness score and no summary, and readers never cite them. They stay until deleted, and a person removing the run tag brings one back under retention. The tagger's `junk` suggestion is evidence for a lower starting confidence, never a deletion.
+**Exempt sessions** (`run:test`, `run:oracle`, `run:foundry`; README, "Tags and references") are outside this scheme, and an Archive with `captureRunSessions` off does not keep them at all: they get no citations, no usefulness score and no summary, and readers never cite them. They stay until deleted, and a person removing the run tag brings one back under retention. The tagger's `junk` suggestion is evidence for a lower starting confidence, never a deletion.
 
 Releasing is deleting the citation (a feedback item is closed, a fixture is retired, a pin is removed). The archive then falls back to its score.
 
-## 5. Usefulness score (MuninnDB style)
+## 5. Usefulness score, MuninnDB style (proposal, not built)
 
 ### 5.1 What MuninnDB does
 
@@ -177,25 +177,25 @@ A fresh, never-read session has `n = 0`, so `B = −0.5 · ln(ageDays)`: about 0
 
 Delete every revision and its chunks except the current one, unless an `outbox` row still names it. A growing session's earlier revisions are prefixes of the current one, so this loses nothing. As built: each capture deletes the revision it replaced; a delivery deletes the revision the outbox held back; the background maintenance at server start and hourly deletes the rest, one revision per statement, so an upgraded Archive compacts what earlier versions kept without a long transaction. `read` of a compacted revision answers 410. Measured 2026-10-18 on this machine: 15,629 of 16,780 revisions superseded; `chunks` 28 GB heap + 23 GB indexes of a 62 GB database. Space returns to the operating system only through `archive maintenance reclaim` (drop the trigram index, `VACUUM FULL`, rebuild the index over current rows). With `captureToolCallsAndResults` off (Aron, 2026-10-18: no tool activity anywhere we own, past captures included), every destination converges to the stripped copies; what the person typed through a tool, references linked from tool output and subagent spawn anchors survive the strip (README).
 
-### 6.2 Summarize before prune
+### 6.2 Summarize before prune (tombstones built; summaries not built)
 
 Moving to **summarized**:
 
-1. Writes a summary into the archive: the goal, decisions, corrections and their outcome, references, files touched (Atlas tags). Generated by a Foundry decision role on a warm subscription session (subscription-only execution); Archive itself calls no model. Archive asks Foundry through the local pairing; with no Foundry, the step waits and the archive stays kept.
+1. Writes a summary into the archive: the goal, decisions, corrections and their outcome, references, files touched (Atlas tags). Generated by a Foundry decision role on a warm subscription session (subscription-only execution); Archive would not run this model call itself (its tagger and planner do run their own subscription sessions today). Archive would ask Foundry through the local pairing; with no Foundry, the step waits and the archive stays kept.
 2. Keeps the typed prompts verbatim. They are small, and they are what the Prospector and `foundry repeats` read.
 3. Stores the summary as a new revision with `coverage.completeness: 'partial'` and an omission "summarized from revision N", then compacts (§6.1). Search keeps working on the summary's chunks.
 
 Moving to **pruned** deletes that revision and its chunks and leaves the tombstone. The tombstone keeps `digest`, so the collector's `head()` sees an unchanged file as unchanged and does not re-import it. *Built for deletions (0.23.0):* `delete` and `retentionDays` leave an `archive_tombstones` row (key, writer's digest, project) that `head` answers with `deleted: true`, by the same digest check. If the session is resumed, the digest differs, a new revision is captured and the archive is back in **keep**.
 
-### 6.3 Schedule
+### 6.3 Schedule (proposal, not built)
 
 The existing hourly job (`ar/server.ts`) runs compaction, then tier transitions, at most `batch` archives per run. Every transition writes a line to a `retention_log` (archive id, from, to, score, reasons) and is listed by `archive retention --dry-run`, which prints what the next run would do. A transition to pruned waits `graceDays` (default 7) after it is first listed, like MuninnDB's 7-day restorable delete. `archive retention restore --id` undoes a summarize while the source file or a destination still has the content.
 
-### 6.4 Deletion
+### 6.4 Deletion (proposal, not built)
 
-`delete` (explicit, per archive) stays a hard delete. The hard age cap that `retentionDays` is today becomes optional `deleteAfterDays`, applied only to tombstones. Deletions still never sync.
+`delete` (explicit, per archive) stays a hard delete. The hard age cap that `retentionDays` is today becomes optional `deleteAfterDays`, applied only to tombstones. Deletions already reach destinations: a deleted session retires its parts and its tombstone queues their deletes, which sync runs once `cleanup` is on (README § Retention, compaction and tool activity).
 
-## 7. Settings and ownership boundaries
+## 7. Settings and ownership boundaries (proposal, not built)
 
 One deployment is one ownership boundary (README). Settings live where they do today, in the deployment's `settings` row:
 
@@ -214,9 +214,9 @@ retention: {
 - **Personal and organization Archives** are separate deployments, so each owner sets its own policy. Kingdom shows and edits the hosted ones through the Archive integration's settings endpoints (`settings/read`, `settings/update`), under a Signet that grants `settings.write`.
 - **The local Archive is multi-project.** Per-project overrides: `retention.projects[projectId]` with the same fields. `unrouted` defaults to `summarizeAfterDays: 14`.
 - **Retention is per copy.** Each Archive prunes its own copy; deletions and tier changes do not sync. A hosted org Archive can keep forever what a laptop prunes.
-- **Zealot / UserEvidence.** Zealot sessions get their own collector and projectId `userevidence`, in the `userevidence` organization, which publishes to the UserEvidence Archive (Render). Routing is per organization (Aron, 2026-10-18: "Projects are tags"): a session that also touched inixiative projects goes to both organizations' archives. They are never summarized by an inixiative-paired Foundry. Summaries are generated under the session's own boundary: Foundry runs the summarizer only with a model account and owner that match the projectId's context. Until that context exists in Foundry, `userevidence` sessions stay **keep** locally and are never summarized.
+- **Zealot / UserEvidence.** Zealot sessions get their own collector and projectId `userevidence`, in the `userevidence` organization, which publishes to the UserEvidence Archive (Render). Routing is per organization (Aron, 2026-10-18: "Projects are tags"); since 0.23.0 a session's routing plan cuts it into parts and sends each part to the organizations whose work it is (README, "Routing"). They are never summarized by an inixiative-paired Foundry. Summaries are generated under the session's own boundary: Foundry runs the summarizer only with a model account and owner that match the projectId's context. Until that context exists in Foundry, `userevidence` sessions stay **keep** locally and are never summarized.
 
-## 8. Who reads from Archive instead of `~/.claude/projects`
+## 8. Who reads from Archive instead of `~/.claude/projects` (proposal, not built)
 
 | Reader | Today | With this |
 |---|---|---|
@@ -248,7 +248,7 @@ Listings gain `tier`, `usefulness` and `citations` (counts per kind), and filter
 
 No parallel store: summaries are revisions, tombstones are Archive rows, settings are the existing `settings` row.
 
-## 9. Build order
+## 9. Build order (history: steps 3 and 4 built except `coverage`, step 5 half built)
 
 1. **Coverage now (no code):** add the inixiative, zealot and per-repo collectors, drop the `kingdom-workspace` roots, `archive agents install`. This captures the 23 + 125 orchestrator sessions and 43 Codex sessions before Claude's cleanup reaches them. Run collectors from the installed package, not the shared checkout.
 2. **Stop test pollution:** Foundry tests and probes must not write to the machine's Archive; delete the `P` captures.
@@ -258,7 +258,7 @@ No parallel store: summaries are revisions, tombstones are Archive rows, setting
 6. **Citations, access counts, score, `retention/plan` dry run.** `mode` stays `off`; the plan is visible but nothing transitions.
 7. **Summarize (Foundry decision role) and tier transitions,** turned on per deployment by Aron. Then Oracle and `foundry repeats` move to Archive-only reads. Hebbian co-citation links after that, if ranking needs them.
 
-## 10. Test cases
+## 10. Test cases (proposal)
 
 Against a real Postgres, as the existing tests do (`tests/db.ts`):
 
@@ -282,7 +282,7 @@ Against a real Postgres, as the existing tests do (`tests/db.ts`):
 1. **Turn it on at all, and where?** Should the local Archive ever prune, or only compact and summarize, with pruning reserved for hosted copies? Disk is the only pressure locally, and compaction removes most of it.
 2. **Defaults.** `keepScore` 1.0, `summarizeAfterDays` 30, `pruneAfterDays` 180, `graceDays` 7: set your own, or approve these.
 3. **Every correction pins?** The deterministic detector over-reports (FEEDBACK-LOOP calls it a prefilter). Pin on any candidate, or only once Foundry/Oracle classify it as feedback?
-4. **Summaries need a model.** Archive is OSS and calls no model. Is a Foundry decision role the right summarizer, and what happens on a machine without Foundry: keep everything, or a deterministic summary (typed prompts + corrections + references only)?
+4. **Summaries need a model.** Archive is OSS; its model calls run on the subscription runner. Is a Foundry decision role the right summarizer, and what happens on a machine without Foundry: keep everything, or a deterministic summary (typed prompts + corrections + references only)?
 5. **"Linked to merged commits":** the references are mentions, not proof (README). Confirm merges through a GitHub integration on the Archive, or only trust Foundry and Oracle links?
 6. **Projects to collect.** Which repos get their own projectId and destination, and which stay `unrouted` (local only)? Does `~/code/inixiative` itself map to `inixiative`?
 7. **`history.jsonl`.** `~/.claude/history.jsonl` holds every typed prompt across sessions and `foundry repeats` reads it. Should Archive capture it (as a `claude-code` history source), or is the per-session capture enough once coverage is complete?
