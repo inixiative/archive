@@ -1,6 +1,6 @@
 {
   "name": "@inixiative/archive",
-  "version": "0.34.0",
+  "version": "0.34.1",
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
@@ -38,7 +38,7 @@
   },
   "dependencies": {
     "@inixiative/agent-session": "^0.12.3",
-    "@inixiative/signet": "^0.18.0",
+    "@inixiative/signet": "^0.19.0",
     "@prisma/client": "^6.6.0",
     "js-tiktoken": "1.0.21",
     "prisma": "^6.6.0",
