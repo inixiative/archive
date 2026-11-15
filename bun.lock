@@ -6,7 +6,7 @@
       "name": "@inixiative/archive",
       "dependencies": {
         "@inixiative/agent-session": "^0.12.0",
-        "@inixiative/signet": "^0.16.0",
+        "@inixiative/signet": "^0.18.0",
         "@prisma/client": "^6.6.0",
         "js-tiktoken": "1.0.21",
         "prisma": "^6.6.0",
@@ -46,7 +46,7 @@
 
     "@inixiative/json-rules": ["@inixiative/json-rules@3.16.0", "", { "dependencies": { "dayjs": "^1.11.13", "fastest-levenshtein": "^1.0.16", "re2js": "^2.8.6" }, "peerDependencies": { "@prisma/client": ">=6.0.0", "typescript": ">=6.0.0" }, "optionalPeers": ["@prisma/client", "typescript"] }, "sha512-97NnUjXwNj0wtyegbBBnkYMilFq0/ya970ckVcOcpGigqqePFDChrH3Vhnej/dbeqXglF0rqEKDSjjDT68VFLQ=="],
 
-    "@inixiative/signet": ["@inixiative/signet@0.16.0", "", { "dependencies": { "jose": "^6.2.3" }, "peerDependencies": { "@inixiative/json-rules": "^3.16.0", "zod": "^4.3.6" } }, "sha512-nmGYhul/lqreax5a0DRkBNWiPDsEkUJvjbB8hCG1RCWHGhCpQTZt03lGkqFUMl6SMvIhELV6HI7bW0oGgZukFg=="],
+    "@inixiative/signet": ["@inixiative/signet@0.18.0", "", { "dependencies": { "jose": "^6.2.3" }, "peerDependencies": { "@inixiative/json-rules": "^3.21.0", "zod": "^4.3.6" } }, "sha512-5B4RCtt1czx3bTawJQWC3QDX7gyxulmggIzjBp10pLqw/iHmxp0vIEXP1njPeKSJvQQVPoP/2njjtwEYxAxtWw=="],
 
     "@muse-code/sdk": ["@muse-code/sdk@1.4.14", "", { "peerDependencies": { "@types/node": ">=20" }, "optionalPeers": ["@types/node"] }, "sha512-LMBcXGhZjBrzO/KhvPAvqLAt5DsJeiESRKmHMDNIKdBO74kUb4aFo4ieM/r7/O5cCee1Alrjn7dL6zXQnIYWJA=="],
 
@@ -163,6 +163,8 @@
     "undici-types": ["undici-types@8.9.0", "", {}, "sha512-KTDyRTYX8sWmKXAikPHHSyc63CRPETMctyjKFupcC6OBLXT3xsN0e9aF7m+mIXutFWpUXuedtowG7iLOzp0kQg=="],
 
     "zod": ["zod@4.6.5", "", {}, "sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q=="],
+
+    "@inixiative/signet/@inixiative/json-rules": ["@inixiative/json-rules@3.22.0", "", { "dependencies": { "dayjs": "^1.11.13", "fastest-levenshtein": "^1.0.16", "re2js": "^2.8.6" }, "peerDependencies": { "@prisma/client": ">=6.0.0", "typescript": ">=6.0.0" }, "optionalPeers": ["@prisma/client", "typescript"] }, "sha512-hNHMXXp1yE4F/n5hDpBwIJzss7tY85OxGG9jiK+DymfpEHFIcq6y/scdXmWSrIsE6lQgppVkV/2fJKlkZabaUQ=="],
 
     "nypm/citty": ["citty@0.2.2", "", {}, "sha512-+6vJA3L98yv+IdfKGZHBNiGW5KHn22e/JwID0Strsz8h4S/csAu/OuICwxrg44k5MRiZHWIo8XXuJgQTriRP4w=="],
 
