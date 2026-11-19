@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import {
   agentStatus,
+  collectionGroups,
   collectorPlan,
   defaultHistoryDirectory,
   defaultHome,
@@ -21,11 +22,13 @@ import { importChatGPTThread } from './chatgpt';
 import { archiveRequest, type SyncBackoff, searchRemotes, syncArchives } from './client';
 import {
   type CollectorCache,
-  collectSessions,
+  type CollectResult,
+  collectSessionsForPeers,
   defaultExclusions,
   excludeGlob,
   type FolderFilters,
   folderGlob,
+  scanIsWorthPrinting,
   sessionMetadata,
   UNROUTED,
 } from './collector';
@@ -142,6 +145,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
         'serve [--port 4700 --hostname 127.0.0.1] [--sync]   (DATABASE_URL; token from ARCHIVE_SERVER_TOKEN or --token-file)\n' +
         'import --file PATH --source codex|claude-code|muse|chatgpt --project-id ID [--tag TAG]\n' +
         'collect --directory HISTORY --source codex|claude-code|muse (--project-root CWD [--project-root ...] --project-id ID [--worktrees] [--subdirectories] | --catch-all) [--include GLOB ...] [--exclude GLOB ...] [--atlas] [--watch]\n' +
+        'collect [--watch]   (every collector agents.json declares, in one process: one walk per history directory, each session to the collector it routes to; agents.json is re-read each scan)\n' +
         'collect --agent NAME [--watch]   (one collector from agents.json, routed against the others, re-read each scan)\n' +
         'repair [--agent NAME]   (every collector once, from the transcripts still on disk: re-captures each session as it routes now, taking over one another project holds only when that row holds another transcript, and reports every session re-imported or refused)\n' +
         'list | search --query TEXT [--remote]   [--project-id ID] [--source S] [--tag T] [--suggested T] [--exempt exclude|include|only] [--provider P] [--model M] [--effort E] [--access-path subscription|api|unknown]\n' +
@@ -705,6 +709,20 @@ export async function runCli(args = Bun.argv.slice(2)) {
     });
   } else if (command === 'list') output(await archive.list(filter));
   else if (command === 'collect') {
+    // No collector named and none described by flags: every collector agents.json declares.
+    const everyCollector =
+      !v.agent &&
+      !v.directory &&
+      !v.source &&
+      !v['project-root'] &&
+      !v['project-id'] &&
+      !v['catch-all'] &&
+      !v.worktrees &&
+      !v.subdirectories &&
+      !v.atlas &&
+      !v.include?.length &&
+      !v.exclude?.length &&
+      !v.tag?.length;
     const flagged = () => {
       const catchAll = v['catch-all'];
       if (
@@ -726,29 +744,39 @@ export async function runCli(args = Bun.argv.slice(2)) {
         atlas: v.atlas,
         tags: v.tag,
       };
-      return {
-        collector,
-        peers: [collector],
-        filters: {
-          ...(v.include?.length ? { include: v.include.map(folderGlob) } : {}),
-          exclude: [...defaultExclusions(), ...(v.exclude ?? []).map(excludeGlob)],
-        } as FolderFilters,
-        projects: [collector],
-        server: undefined as { url: string } | undefined,
-      };
+      return [
+        {
+          names: [v['project-id'] ?? UNROUTED],
+          peers: [collector],
+          only: 0 as number | undefined,
+          filters: {
+            ...(v.include?.length ? { include: v.include.map(folderGlob) } : {}),
+            exclude: [...defaultExclusions(), ...(v.exclude ?? []).map(excludeGlob)],
+          } as FolderFilters,
+          projects: [collector],
+          server: undefined as { url: string } | undefined,
+        },
+      ];
     };
-    // A named collector re-reads agents.json each scan, so its routing follows edits without a restart.
+    // Collectors from agents.json re-read it each scan, so routing follows edits without a restart.
     const plan = () => {
-      if (!v.agent) return flagged();
+      if (!v.agent && !everyCollector) return flagged();
       const config = readAgents(agentsFile);
       if (!config) throw new Error('No agents.json; declare agents first');
-      return collectorPlan(config, v.agent);
+      if (everyCollector)
+        return collectionGroups(config).map((group) => ({ ...group, only: undefined }));
+      const { collector, ...group } = collectorPlan(config, v.agent!);
+      return [{ ...group, only: group.peers.indexOf(collector) }];
     };
     plan();
+    // One cache for every collector: each history file is remembered once.
     const cache: CollectorCache = new Map();
-    // A named collector writes to the server agents.json declares (unless --url), re-read each scan.
+    // Collectors from agents.json write to the server it declares (unless --url), re-read each scan.
     let client = archive;
     let clientUrl = v.url ?? DEFAULT_URL;
+    // A watching collector prints a scan only when it says something new (`scanIsWorthPrinting`).
+    const lastPrinted = new Map<string, CollectResult>();
+    const lastFailure = new Map<string, string>();
     let stopped = false;
     const stop = () => {
       stopped = true;
@@ -756,9 +784,9 @@ export async function runCli(args = Bun.argv.slice(2)) {
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
     do {
-      let current: ReturnType<typeof plan>;
+      let groups: ReturnType<typeof plan>;
       try {
-        current = plan();
+        groups = plan();
       } catch (error) {
         if (!v.watch) throw error;
         console.error(
@@ -767,27 +795,46 @@ export async function runCli(args = Bun.argv.slice(2)) {
         for (let i = 0; !stopped && i < 30; i++) await Bun.sleep(1000);
         continue;
       }
-      try {
-        const { collector, peers, filters, projects, server } = current;
-        const url = v.url ?? server?.url ?? DEFAULT_URL;
-        if (url !== clientUrl) {
-          client = new ArchiveClient({ url, token });
-          clientUrl = url;
+      const started = Date.now();
+      const scanned = new Map<string, CollectResult>();
+      for (const { names, peers, only, filters, projects, server } of groups) {
+        // A history that cannot be read (its directory gone, the server starting) stops only itself.
+        try {
+          const url = v.url ?? server?.url ?? DEFAULT_URL;
+          if (url !== clientUrl) {
+            client = new ArchiveClient({ url, token });
+            clientUrl = url;
+          }
+          const results = await collectSessionsForPeers(client, peers, {
+            ...(only === undefined ? {} : { only }),
+            filters,
+            projects,
+            cache,
+          });
+          results.forEach((result, index) => {
+            if (only === undefined || index === only) scanned.set(names[index]!, result);
+          });
+          lastFailure.delete(names.join());
+        } catch (error) {
+          if (!v.watch) throw error;
+          const failure = JSON.stringify({
+            collect: 'server unavailable',
+            collectors: names,
+            error: (error as Error).message,
+          });
+          if (lastFailure.get(names.join()) !== failure) console.error(failure);
+          lastFailure.set(names.join(), failure);
         }
-        const started = Date.now();
-        const result = await collectSessions(client, collector, {
-          peers,
-          filters,
-          projects,
-          cache,
-        });
-        output({ ...result, ms: Date.now() - started });
-        if (!v.watch && result.failed) process.exitCode = 1;
-      } catch (error) {
-        // The server may be starting; a watching collector retries.
-        if (!v.watch) throw error;
-        console.error(JSON.stringify({ collect: 'server unavailable' }));
       }
+      const ms = Date.now() - started;
+      const print = [...scanned].filter(
+        ([name, result]) => !v.watch || scanIsWorthPrinting(result, lastPrinted.get(name)),
+      );
+      for (const [name, result] of print) lastPrinted.set(name, result);
+      if (everyCollector) {
+        if (print.length) output({ collectors: Object.fromEntries(print), ms });
+      } else for (const [, result] of print) output({ ...result, ms });
+      if (!v.watch && [...scanned.values()].some((result) => result.failed)) process.exitCode = 1;
       // Short waits allow prompt shutdown; network requests have their own timeout.
       for (let i = 0; v.watch && !stopped && i < 30; i++) await Bun.sleep(1000);
     } while (v.watch && !stopped);
@@ -798,23 +845,34 @@ export async function runCli(args = Bun.argv.slice(2)) {
     // holds only when its row holds another transcript (a subagent's, under its parent's key).
     const config = readAgents(agentsFile);
     if (!config) throw new Error('No agents.json; declare agents first');
-    const names = v.agent ? [v.agent] : config.collectors.map((c) => c.name);
+    // One walk per history, as `collect` makes; with --agent, that collector's sessions only.
+    const groups = v.agent
+      ? [collectorPlan(config, v.agent)].map(({ collector, ...group }) => ({
+          ...group,
+          only: group.peers.indexOf(collector),
+        }))
+      : collectionGroups(config).map((group) => ({ ...group, only: undefined }));
     // Sessions whose evidence predates the machine's projects are re-sent, so evidence is current.
     await archive.setProjectMap(machineProjectMap(config));
-    const results = [];
-    for (const name of names) {
-      const { collector, peers, filters, projects, server } = collectorPlan(config, name);
+    const repaired = new Map<string, CollectResult & { ms: number }>();
+    for (const { names, peers, only, filters, projects, server } of groups) {
       const client = new ArchiveClient({ url: v.url ?? server?.url ?? DEFAULT_URL, token });
       const started = Date.now();
-      const result = await collectSessions(client, collector, {
-        peers,
+      const results = await collectSessionsForPeers(client, peers, {
+        ...(only === undefined ? {} : { only }),
         filters,
         projects,
         repair: true,
       });
-      results.push({ collector: name, ...result, ms: Date.now() - started });
-      if (result.failed) process.exitCode = 1;
+      const ms = Date.now() - started;
+      results.forEach((result, index) => {
+        if (only === undefined || index === only) repaired.set(names[index]!, { ...result, ms });
+      });
     }
+    const results = config.collectors
+      .filter((c) => repaired.has(c.name))
+      .map((c) => ({ collector: c.name, ...repaired.get(c.name)! }));
+    if (results.some((result) => result.failed)) process.exitCode = 1;
     output(results);
   } else if (command === 'search')
     output(

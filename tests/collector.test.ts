@@ -1,4 +1,5 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
+import * as fs from 'node:fs';
 import {
   mkdirSync,
   mkdtempSync,
@@ -13,10 +14,13 @@ import { join } from 'node:path';
 import {
   type CollectionSource,
   type CollectorCache,
+  type CollectResult,
   collectionRoots,
   collectSessions,
+  collectSessionsForPeers,
   defaultExclusions,
   routeSession,
+  scanIsWorthPrinting,
 } from '../src/collector';
 import { EmptyTranscript, importTranscript } from '../src/import';
 import { importTranscriptFile } from '../src/import-file';
@@ -975,4 +979,258 @@ test('a driver-claimed session: skipped while the lease is live, captured raw on
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+const claudeSession = (dir: string, id: string, cwd: string, text = 'Work') =>
+  writeFileSync(
+    join(dir, `${id}.jsonl`),
+    JSON.stringify({
+      sessionId: id,
+      cwd,
+      type: 'user',
+      uuid: `${id}-1`,
+      message: { content: text },
+    }),
+  );
+
+test('one scan over a history gives every collector what it gets scanning alone', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'archive-peers-'));
+  const base = { directory: dir, source: 'claude-code' as const, subdirectories: true };
+  const peers: CollectionSource[] = [
+    { ...base, projectId: 'inixiative', projectRoots: ['/w'], tags: ['coding'] },
+    { ...base, projectId: 'kingdom', projectRoots: ['/w/kingdom'] },
+    { ...base, projectId: 'tribe', projectRoots: ['/w/tribe'], subdirectories: false },
+    { ...base, projectId: 'unrouted', projectRoots: [], catchAll: true, subdirectories: false },
+  ];
+  const options = {
+    filters: { exclude: defaultExclusions() },
+    harness: () => 'subscription' as const,
+  };
+  try {
+    claudeSession(dir, 'k', '/w/kingdom/apps/api');
+    claudeSession(dir, 'i', '/w/notes');
+    claudeSession(dir, 't', '/w/tribe');
+    claudeSession(dir, 'tribe-apps', '/w/tribe/apps');
+    claudeSession(dir, 'u', '/elsewhere');
+    claudeSession(dir, 'probe', '/tmp/probe');
+    claudeSession(dir, 'receipt', '/w/foundry/.foundry/decision-receipts/r1');
+    claudeSession(dir, 'held', '/w/kingdom');
+    writeFileSync(
+      join(dir, 'broken.jsonl'),
+      `${JSON.stringify({ sessionId: 'broken', cwd: '/w', type: 'user', uuid: 'b-1', message: {} })}\n{`,
+    );
+    writeFileSync(join(dir, 'silent.jsonl'), JSON.stringify({ type: 'summary' }));
+    const alone = await freshStore('remote');
+    const shared = await freshStore();
+    for (const store of [alone, shared])
+      await store.capture(
+        importTranscriptFile(join(dir, 'held.jsonl'), {
+          source: 'claude-code',
+          sourceId: await store.sourceId(),
+          projectId: 'other',
+        }),
+      );
+    const each: CollectResult[] = [];
+    for (const collector of peers)
+      each.push(await collectSessions(alone, collector, { ...options, peers }));
+    const together = await collectSessionsForPeers(shared, peers, options);
+    expect(together).toEqual(each);
+    expect(together.map((r) => [r.imported, r.held, r.failed])).toEqual([
+      [2, 0, 1],
+      [1, 1, 0],
+      [1, 0, 0],
+      [1, 0, 0],
+    ]);
+    const stored = async (store: typeof shared) =>
+      (await store.list({ exempt: 'include' }))
+        .map((a) => [a.sessionId, a.projectId, a.tags])
+        .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+    expect(await stored(shared)).toEqual(await stored(alone));
+    expect((await stored(shared)).map(([id, project]) => `${id}:${project}`)).toEqual([
+      'held:other',
+      'i:inixiative',
+      'k:kingdom',
+      't:tribe',
+      'tribe-apps:inixiative',
+      'u:unrouted',
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('one scan reads each transcript once for every collector, and an unchanged scan reads and asks nothing', async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'archive-one-walk-')));
+  const base = { directory: dir, source: 'claude-code' as const };
+  const peers: CollectionSource[] = [
+    { ...base, projectId: 'a', projectRoots: ['/w/a'] },
+    { ...base, projectId: 'b', projectRoots: ['/w/b'] },
+    { ...base, projectId: 'c', projectRoots: ['/w/c'] },
+  ];
+  const store = await freshStore();
+  const calls = { head: 0, capture: 0 };
+  const writer = {
+    sourceId: () => store.sourceId(),
+    head: (id: string) => {
+      calls.head++;
+      return store.head(id);
+    },
+    capture: (snapshot: unknown) => {
+      calls.capture++;
+      return store.capture(snapshot);
+    },
+    claimState: (source: ClaimSource, sessionId: string, modifiedAt?: number) =>
+      store.claimState(source, sessionId, modifiedAt),
+  };
+  const cache: CollectorCache = new Map();
+  const options = { cache, harness: () => 'subscription' as const };
+  const opens = spyOn(fs, 'openSync');
+  const reads = () => {
+    const counts = new Map<string, number>();
+    for (const [path] of opens.mock.calls)
+      if (typeof path === 'string' && path.startsWith(dir))
+        counts.set(path, (counts.get(path) ?? 0) + 1);
+    opens.mockClear();
+    return counts;
+  };
+  try {
+    for (const project of ['a', 'b', 'c']) claudeSession(dir, project, `/w/${project}`);
+    claudeSession(dir, 'nobody', '/w/nobody');
+    reads();
+    const first = await collectSessionsForPeers(writer, peers, options);
+    expect(first.map((r) => [r.imported, r.skipped])).toEqual([
+      [1, 3],
+      [1, 3],
+      [1, 3],
+    ]);
+    // Each routed transcript: its head once, then its import; one no collector takes: its head.
+    expect(Object.fromEntries(reads())).toEqual({
+      [join(dir, 'a.jsonl')]: 2,
+      [join(dir, 'b.jsonl')]: 2,
+      [join(dir, 'c.jsonl')]: 2,
+      [join(dir, 'nobody.jsonl')]: 1,
+    });
+    calls.head = calls.capture = 0;
+    const second = await collectSessionsForPeers(writer, peers, options);
+    expect(second.map((r) => [r.unchanged, r.skipped])).toEqual([
+      [1, 3],
+      [1, 3],
+      [1, 3],
+    ]);
+    expect(reads().size).toBe(0);
+    expect(calls).toEqual({ head: 0, capture: 0 });
+  } finally {
+    opens.mockRestore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('worktrees are listed again only when the repository’s worktrees change, so a new one joins on the next scan', async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'archive-worktree-cache-')));
+  const repo = join(dir, 'foundry');
+  const history = join(dir, 'history');
+  const git = (...args: string[]) =>
+    expect(Bun.spawnSync(['git', '-C', repo, ...args], { stderr: 'ignore' }).success).toBe(true);
+  // What the cache keys on: `worktree add`, `remove` and `prune` each change it.
+  const worktreesDirectory = () => {
+    try {
+      const stat = fs.lstatSync(join(repo, '.git', 'worktrees'));
+      return `${stat.mtimeMs}:${stat.ctimeMs}`;
+    } catch {
+      return 'none';
+    }
+  };
+  const store = await freshStore();
+  const spawns = spyOn(Bun, 'spawnSync');
+  const gitCalls = (command: string) => {
+    const count = spawns.mock.calls.filter(([argv]) => {
+      const args = Array.isArray(argv) ? argv : [];
+      return args[0] === 'git' && args.includes(command);
+    }).length;
+    return count;
+  };
+  let clock = Date.now();
+  const config: CollectionSource = {
+    directory: history,
+    source: 'claude-code',
+    projectId: 'foundry',
+    projectRoots: [repo],
+    worktrees: true,
+  };
+  const scan = async () => {
+    spawns.mockClear();
+    const result = await collectSessions(store, config, {
+      harness: () => 'subscription',
+      now: () => clock,
+    });
+    return { ...result, listed: gitCalls('worktree'), resolved: gitCalls('rev-parse') };
+  };
+  try {
+    mkdirSync(repo);
+    mkdirSync(history);
+    git('init', '-q');
+    git('-c', 'user.email=a@b.c', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'i');
+    claudeSession(history, 'main', repo);
+    expect(await scan()).toMatchObject({ imported: 1, listed: 1, resolved: 1 });
+    // Nothing changed: no git at all.
+    expect(await scan()).toMatchObject({ unchanged: 1, listed: 0, resolved: 0 });
+    // A worktree outside the root (the first, so `worktrees/` is created), then its session.
+    let state = worktreesDirectory();
+    git('worktree', 'add', '-q', join(dir, 'feature'));
+    expect(worktreesDirectory()).not.toBe(state);
+    claudeSession(history, 'feature', join(dir, 'feature'));
+    expect(await scan()).toMatchObject({ imported: 1, unchanged: 1, listed: 1, resolved: 0 });
+    // A second worktree changes the directory that now exists.
+    state = worktreesDirectory();
+    git('worktree', 'add', '-q', join(dir, 'second'));
+    expect(worktreesDirectory()).not.toBe(state);
+    claudeSession(history, 'second', join(dir, 'second'));
+    expect(await scan()).toMatchObject({ imported: 1, listed: 1 });
+    expect(await scan()).toMatchObject({ listed: 0 });
+    // Removing one, and pruning one whose directory was deleted, each change it too.
+    state = worktreesDirectory();
+    git('worktree', 'remove', join(dir, 'second'));
+    expect(worktreesDirectory()).not.toBe(state);
+    expect(await scan()).toMatchObject({ listed: 1 });
+    git('worktree', 'add', '-q', join(dir, 'gone'));
+    expect(await scan()).toMatchObject({ listed: 1 });
+    rmSync(join(dir, 'gone'), { recursive: true, force: true });
+    state = worktreesDirectory();
+    git('worktree', 'prune');
+    expect(worktreesDirectory()).not.toBe(state);
+    expect(await scan()).toMatchObject({ listed: 1 });
+    // `worktree move` leaves the directory as it was: ten minutes on, the list is read again.
+    expect(await scan()).toMatchObject({ listed: 0 });
+    clock += 10 * 60_000;
+    expect(await scan()).toMatchObject({ listed: 1, resolved: 1 });
+    expect(new Set((await store.list({ exempt: 'include' })).map((a) => a.projectId))).toEqual(
+      new Set(['foundry']),
+    );
+    expect(await store.list({ exempt: 'include' })).toHaveLength(3);
+  } finally {
+    spawns.mockRestore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a watching collector prints a scan only when it says something new', () => {
+  const scan = (counts: Partial<CollectResult> = {}): CollectResult => ({
+    imported: 0,
+    unchanged: 5,
+    skipped: 40,
+    held: 2,
+    dropped: 0,
+    failed: 1,
+    refused: [],
+    heldBy: [],
+    ...counts,
+  });
+  expect(scanIsWorthPrinting(scan())).toBe(true);
+  // Cached outcomes repeat every scan: the same counts print once.
+  expect(scanIsWorthPrinting(scan(), scan())).toBe(false);
+  expect(scanIsWorthPrinting(scan({ unchanged: 6, skipped: 39 }), scan())).toBe(false);
+  expect(scanIsWorthPrinting(scan({ imported: 1 }), scan({ imported: 1 }))).toBe(true);
+  expect(scanIsWorthPrinting(scan({ held: 3 }), scan())).toBe(true);
+  expect(scanIsWorthPrinting(scan({ failed: 0 }), scan())).toBe(true);
+  expect(scanIsWorthPrinting(scan({ refused: [{ file: 'f', reason: 'r' }] }), scan())).toBe(true);
 });
