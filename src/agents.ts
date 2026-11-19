@@ -17,6 +17,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import {
+  type CollectionGroup,
   type CollectionSource,
   collectionRoots,
   defaultExclusions,
@@ -156,11 +157,6 @@ export interface AgentUnitOptions {
 }
 export const packageCliPath = () => fileURLToPath(new URL('./cli.ts', import.meta.url));
 
-/** A unit runs one named collector; it re-reads agents.json each scan, so edits apply live. */
-export function collectorArgs(c: CollectorAgent) {
-  return ['collect', '--agent', c.name, '--watch'];
-}
-
 const source = (c: CollectorAgent): CollectionSource => ({
   directory: c.directory,
   source: c.source,
@@ -238,37 +234,45 @@ export function machineProjectMap(config: AgentsConfig): ProjectMap {
 }
 
 /**
- * A named collector, the peers it is routed against, the folder filters, every project on the
- * machine (for `project:` tags) and the server, from agents.json.
+ * The collectors of agents.json by history: one group per source and directory, each with its
+ * peers (in declared order), the folder filters, every project on the machine (for `project:`
+ * tags) and the server. Collectors over the same history compete for its sessions; another
+ * directory is another history. With a name, only that collector's group, run for it alone.
  */
-export function collectorPlan(config: AgentsConfig, name: string) {
-  const collector = config.collectors.find((c) => c.name === name);
-  if (!collector) throw new Error(`No collector named ${name} in agents.json`);
-  // Collectors over the same history compete for its sessions; another directory is another history.
-  const named = config.collectors.filter(
-    (c) => c.source === collector.source && resolve(c.directory) === resolve(collector.directory),
-  );
-  const peers = named.map(source);
+export function collectionGroups(config: AgentsConfig, name?: string): CollectionGroup[] {
   const filters: FolderFilters = {
     ...(config.include?.length ? { include: config.include } : {}),
     exclude: [...defaultExclusions(), ...(config.exclude ?? [])],
   };
-  return {
-    collector: peers[named.indexOf(collector)]!,
-    peers,
+  const projects = config.collectors.filter((c) => !c.catchAll).map(source);
+  const histories = new Map<string, CollectorAgent[]>();
+  for (const collector of config.collectors) {
+    const key = JSON.stringify([collector.source, resolve(collector.directory)]);
+    histories.set(key, [...(histories.get(key) ?? []), collector]);
+  }
+  const groups = [...histories.values()].map((named) => ({
+    names: named.map((c) => c.name),
+    peers: named.map(source),
     filters,
-    projects: config.collectors.filter((c) => !c.catchAll).map(source),
-    server: config.server,
-  };
+    projects,
+    ...(config.server ? { server: config.server } : {}),
+  }));
+  if (name === undefined) return groups;
+  const group = groups.find((g) => g.names.includes(name));
+  if (!group) throw new Error(`No collector named ${name} in agents.json`);
+  return [{ ...group, only: group.names.indexOf(name) }];
 }
 
-/** One supervised unit per declared agent. */
 /**
  * Sessions the router plans per wake by default. About 22k tokens a session with the sensitivity
  * pass on (measured 2026-11-01), so a wake stays near 0.7M.
  */
 export const ROUTER_WAKE_LIMIT = 30;
 
+/**
+ * The supervised units: one collector process (`collect --watch`) running every declared
+ * collector, re-reading agents.json each scan so edits apply live, and the router when declared.
+ */
 export function agentUnits(config: AgentsConfig, options: AgentUnitOptions): AgentUnit[] {
   const home = resolve(options.home);
   const claudeBin = config.router
@@ -287,7 +291,7 @@ export function agentUnits(config: AgentsConfig, options: AgentUnitOptions): Age
     };
   };
   return [
-    ...config.collectors.map((c) => unit(`collect.${c.name}`, collectorArgs(c))),
+    ...(config.collectors.length ? [unit('collect', ['collect', '--watch'])] : []),
     ...(config.router
       ? [
           unit('route', [
@@ -366,6 +370,8 @@ const ownedLabel = (label: string) =>
   label === `${AGENT_LABEL_PREFIX}local` ||
   label === `${AGENT_LABEL_PREFIX}sync` ||
   label === `${AGENT_LABEL_PREFIX}route` ||
+  label === `${AGENT_LABEL_PREFIX}collect` ||
+  // One unit per collector, before every collector ran in one process.
   label.startsWith(`${AGENT_LABEL_PREFIX}collect.`);
 /** Labels of Archive units present in a supervisor directory. */
 export function installedLabels(dir: string, platform: AgentPlatform) {

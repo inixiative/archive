@@ -260,7 +260,7 @@ function atlasGraph(cwd: string): AtlasFileConcepts | undefined {
   } catch {}
 }
 
-function worktreesOf(root: string): string[] {
+function listWorktrees(root: string): string[] {
   const listed = Bun.spawnSync(['git', '-C', root, 'worktree', 'list', '--porcelain'], {
     stderr: 'ignore',
     timeout: SPAWN_MS,
@@ -273,8 +273,86 @@ function worktreesOf(root: string): string[] {
     .map((line) => resolve(line.slice('worktree '.length)));
 }
 
-/** Exact directories this collection accepts, re-read each scan so new worktrees join. */
-export function collectionRoots(config: CollectionSource): Set<string> {
+/** A root's worktrees are listed again at least this often, whatever the repository shows. */
+const WORKTREE_LIST_MS = 10 * 60_000;
+const worktreeLists = new Map<
+  string,
+  { commonDirectory: string | null; state: string; listedAt: number; worktrees: string[] }
+>();
+
+/**
+ * The root's git common directory; `null` for a root that is not a repository (missing, or git
+ * says so); `undefined` when git could not answer (a timeout, git itself missing). Plain
+ * `--git-common-dir` (`--path-format` needs git 2.31): a relative answer is relative to the root.
+ */
+function gitCommonDirectory(root: string): string | null | undefined {
+  if (!existsSync(root)) return null;
+  const run = Bun.spawnSync(['git', '-C', root, 'rev-parse', '--git-common-dir'], {
+    stderr: 'pipe',
+    timeout: SPAWN_MS,
+  });
+  if (run.success) return resolve(root, run.stdout.toString().trim());
+  return /not a git repository/i.test(run.stderr.toString()) ? null : undefined;
+}
+
+/**
+ * What the repository's worktrees are now, as `<common dir>/worktrees` records them: each entry's
+ * name, with the times of its directory and of its `gitdir` file. `worktree add`, `remove`,
+ * `prune`, `move` and `repair` each change it, and so does an entry's `gitdir` written after its
+ * directory (git makes the directory first).
+ */
+function worktreesState(commonDirectory: string | null) {
+  if (commonDirectory === null) return 'no repository';
+  const directory = join(commonDirectory, 'worktrees');
+  let names: string[];
+  try {
+    names = readdirSync(directory).sort();
+  } catch {
+    return 'no worktrees';
+  }
+  const stamp = (path: string) => {
+    try {
+      const stat = lstatSync(path);
+      return `${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`;
+    } catch {
+      return 'none';
+    }
+  };
+  return JSON.stringify(
+    names.map((name) => [
+      name,
+      stamp(join(directory, name)),
+      stamp(join(directory, name, 'gitdir')),
+    ]),
+  );
+}
+
+/**
+ * A root's git worktrees, listed again only when its repository's worktrees change (see
+ * `worktreesState`), and at least every ten minutes. The state is read before listing, so a
+ * worktree changed meanwhile is listed again on the next call, never missed. A root git cannot
+ * answer for is listed every call, uncached.
+ */
+function worktreesOf(root: string, now: number): string[] {
+  const known = worktreeLists.get(root);
+  const current = known && now - known.listedAt < WORKTREE_LIST_MS ? known : undefined;
+  const commonDirectory = current ? current.commonDirectory : gitCommonDirectory(root);
+  if (commonDirectory === undefined) {
+    worktreeLists.delete(root);
+    return listWorktrees(root);
+  }
+  const state = worktreesState(commonDirectory);
+  if (current && current.state === state) return current.worktrees;
+  const worktrees = commonDirectory === null ? [] : listWorktrees(root);
+  worktreeLists.set(root, { commonDirectory, state, listedAt: now, worktrees });
+  return worktrees;
+}
+
+/**
+ * Exact directories this collection accepts. Worktrees are listed again whenever the repository's
+ * worktrees change, so a new one joins on the next scan.
+ */
+export function collectionRoots(config: CollectionSource, now = Date.now()): Set<string> {
   // Providers record the real path (macOS /tmp is /private/tmp), so roots match by it too.
   const roots = config.projectRoots.flatMap((root) => {
     try {
@@ -283,7 +361,9 @@ export function collectionRoots(config: CollectionSource): Set<string> {
       return [resolve(root)];
     }
   });
-  return new Set(config.worktrees ? [...roots, ...roots.flatMap(worktreesOf)] : roots);
+  return new Set(
+    config.worktrees ? [...roots, ...roots.flatMap((root) => worktreesOf(root, now))] : roots,
+  );
 }
 
 /**
@@ -367,7 +447,7 @@ export function harnessAccess(
  * What a watching collector remembers between scans: each file's size and mtime with the outcome,
  * so an untouched file is neither re-read nor re-sent. Keyed by the routing and archive it was
  * decided under; a stored session is re-checked against the server now and then, so one deleted
- * there is captured again.
+ * there is captured again. One cache serves every collector of a scan.
  */
 export type CollectorCache = Map<
   string,
@@ -375,6 +455,8 @@ export type CollectorCache = Map<
     size: number;
     mtimeMs: number;
     routing: string;
+    /** The peer (by position) the session routed to; none when no collector takes it. */
+    collector?: number;
     outcome: Outcome;
     meta?: SessionMetadata;
     stored?: { id: string; digest: string; checkedAt: number };
@@ -440,48 +522,109 @@ const deterministic = (error: unknown) => {
   );
 };
 
+/**
+ * Whether a watching collector prints a scan: the first, one that imported or decided something
+ * (a refusal, a held session, a repair), or one whose held, dropped or failed count moved since the
+ * scan it last printed. Those counts include cached outcomes, so a steady count prints once.
+ */
+export function scanIsWorthPrinting(result: CollectResult, lastPrinted?: CollectResult) {
+  return (
+    !lastPrinted ||
+    result.imported > 0 ||
+    result.refused.length > 0 ||
+    result.heldBy.length > 0 ||
+    (result.repaired?.length ?? 0) > 0 ||
+    (['held', 'dropped', 'failed'] as const).some((count) => result[count] !== lastPrinted[count])
+  );
+}
+
+/**
+ * A scan's counts over every collector, for a line short enough to read whole (`agents status`
+ * shows 500 characters). Skips are left out: every peer counts each other peer's sessions.
+ */
+export function scanTotals(results: Iterable<CollectResult>) {
+  const totals = { imported: 0, unchanged: 0, held: 0, dropped: 0, failed: 0 };
+  for (const result of results)
+    for (const count of Object.keys(totals) as (keyof typeof totals)[])
+      totals[count] += result[count];
+  return totals;
+}
+
+const emptyResult = (repair?: boolean): CollectResult => ({
+  imported: 0,
+  unchanged: 0,
+  skipped: 0,
+  held: 0,
+  dropped: 0,
+  failed: 0,
+  ...(repair ? { repaired: [] } : {}),
+  refused: [],
+  heldBy: [],
+});
+
+/** One collector's scan, routed against its peers; the same walk as every peer's, counted for it alone. */
 export async function collectSessions(
   archive: ArchiveWriter,
   config: CollectionSource,
   options: CollectOptions = {},
 ) {
+  const { peers = [config], ...rest } = options;
+  const only = peers.indexOf(config);
+  if (only < 0) throw new Error('A collector is routed against peers it is not one of');
+  return (await collectSessionsForPeers(archive, peers, { ...rest, only }))[only]!;
+}
+
+/**
+ * One scan of one history directory for every collector over it (peers: one source and
+ * directory): each transcript is read once and handed to the collector it routes to. Results line
+ * up with peers, each counted as that collector alone would count it, so a session routed to
+ * another is `skipped` for it. With `only`, sessions routed to any other peer are not imported.
+ */
+export async function collectSessionsForPeers(
+  archive: ArchiveWriter,
+  peers: CollectionSource[],
+  options: Omit<CollectOptions, 'peers'> & { only?: number } = {},
+): Promise<CollectResult[]> {
+  const group = peers[options.only ?? 0];
+  if (!group) return [];
   const sourceId = await archive.sourceId();
   const now = options.now ?? Date.now;
-  const peers = options.peers ?? [config];
   const filters = options.filters ?? {};
   const projects = (options.projects ?? peers).filter((collector) => !collector.catchAll);
   const cache: CollectorCache = options.cache ?? new Map();
-  const routing = JSON.stringify([sourceId, config, peers, filters, projects]);
-  const result: CollectResult = {
-    imported: 0,
-    unchanged: 0,
-    skipped: 0,
-    held: 0,
-    dropped: 0,
-    failed: 0,
-    refused: [],
-    heldBy: [],
-  };
-  if (options.repair) result.repaired = [];
-  const refuse = (file: string, error: unknown) => {
-    result.failed++;
-    result.refused.push({
-      file,
-      reason: error instanceof Error ? error.message : String(error),
+  const routing = JSON.stringify([sourceId, options.only ?? null, peers, filters, projects]);
+  const results = peers.map(() => emptyResult(options.repair));
+  // Every file settles once: its collector counts the outcome, every other peer counts it skipped.
+  const settle = (collector: number | undefined, outcome: Outcome | 'imported') => {
+    results.forEach((result, index) => {
+      result[index === collector ? outcome : 'skipped']++;
     });
   };
-  // Per scan: checkouts change between scans.
-  const rootSets = new Map<CollectionSource, Set<string>>();
-  const roots = (collector: CollectionSource) => {
-    if (!rootSets.has(collector)) rootSets.set(collector, collectionRoots(collector));
-    return rootSets.get(collector)!;
+  // Refused before routing, a file fails for every peer, as each would have read it.
+  const refuse = (collector: number | undefined, file: string, error: unknown) => {
+    const reason = error instanceof Error ? error.message : String(error);
+    results.forEach((result, index) => {
+      if (collector !== undefined && index !== collector) result.skipped++;
+      else {
+        result.failed++;
+        result.refused.push({ file, reason });
+      }
+    });
   };
-  const routes = new Map<string, CollectionSource | undefined>();
+  // Per scan, by root path: checkouts change between scans.
+  const rootSets = new Map<string, Set<string>>();
+  const roots = (collector: CollectionSource) => {
+    const key = JSON.stringify([collector.projectRoots, Boolean(collector.worktrees)]);
+    if (!rootSets.has(key)) rootSets.set(key, collectionRoots(collector, now()));
+    return rootSets.get(key)!;
+  };
+  const routes = new Map<string, number | undefined>();
   const repositories = new Map<string, string | undefined>();
   const graphs = new Map<string, AtlasFileConcepts | undefined>();
   let harness: 'subscription' | 'api' | undefined | null = null;
   const mapKey = (await archive.projectMapKey?.()) ?? null;
-  for (const file of historyFiles(config)) {
+  for (const file of historyFiles(group)) {
+    let collector: number | undefined;
     try {
       const before = lstatSync(file);
       const known = cache.get(file);
@@ -490,20 +633,21 @@ export async function collectSessions(
         known.mtimeMs === before.mtimeMs &&
         known.routing === routing
       ) {
+        collector = known.collector;
         const stored = known.stored;
         const claimed = known.claimedUntil;
         if (claimed !== undefined) {
           // Left to a live lease; once it runs out (the transcript unchanged), ask again below.
           if (now() < claimed) {
-            result.skipped++;
+            settle(known.collector, 'skipped');
             continue;
           }
         } else if (!stored || now() - stored.checkedAt < REVALIDATE_MS) {
-          result[known.outcome]++;
+          settle(known.collector, known.outcome);
           continue;
         } else if ((await archive.head(stored.id))?.digest === stored.digest) {
           stored.checkedAt = now();
-          result.unchanged++;
+          settle(known.collector, 'unchanged');
           continue;
         }
       }
@@ -517,6 +661,7 @@ export async function collectSessions(
           size: before.size,
           mtimeMs: before.mtimeMs,
           routing,
+          ...(collector !== undefined ? { collector } : {}),
           outcome,
           meta,
           ...(stored ? { stored: { ...stored, checkedAt: now() } } : {}),
@@ -526,25 +671,31 @@ export async function collectSessions(
       // once fulfilled with the transcript unchanged since; otherwise (the driver died) it is
       // captured raw. Asked before the transcript is parsed.
       const claimed = async (sessionId: string, meta?: SessionMetadata) => {
-        if (config.source !== 'claude-code' && config.source !== 'codex') return false;
-        const claim = await archive.claimState(config.source, sessionId, before.mtimeMs);
+        if (group.source !== 'claude-code' && group.source !== 'codex') return false;
+        const claim = await archive.claimState(group.source, sessionId, before.mtimeMs);
         if (claim.state === 'live') remember('skipped', meta, undefined, claim.until ?? now());
         else if (claim.state === 'fulfilled') remember('skipped', meta);
         else return false;
-        result.skipped++;
+        settle(collector, 'skipped');
         return true;
       };
       // A transcript's first cwd never changes, so it is read once per file.
-      const meta = known?.meta ?? sessionMetadata(file, config.source);
+      const meta = known?.meta ?? sessionMetadata(file, group.source);
       if (!meta) {
-        result.skipped++;
+        collector = undefined;
+        settle(collector, 'skipped');
         remember('skipped');
         continue;
       }
-      if (!routes.has(meta.cwd))
-        routes.set(meta.cwd, routeSession(meta.cwd, peers, { filters, roots }));
-      if (routes.get(meta.cwd) !== config) {
-        result.skipped++;
+      if (!routes.has(meta.cwd)) {
+        const routed = routeSession(meta.cwd, peers, { filters, roots });
+        routes.set(meta.cwd, routed ? peers.indexOf(routed) : undefined);
+      }
+      collector = routes.get(meta.cwd);
+      const config = collector === undefined ? undefined : peers[collector];
+      const result = collector === undefined ? undefined : results[collector];
+      if (!config || !result || (options.only !== undefined && collector !== options.only)) {
+        settle(collector, 'skipped');
         remember('skipped', meta);
         continue;
       }
@@ -559,18 +710,18 @@ export async function collectSessions(
       } catch (error) {
         // Nothing to capture yet: read again once the file changes.
         if (error instanceof EmptyTranscript) {
-          result.skipped++;
+          settle(collector, 'skipped');
           remember('skipped', meta);
           continue;
         }
         // The same bytes fail the same way; a partial file is retried once it changes.
-        refuse(file, error);
+        refuse(collector, file, error);
         remember('failed', meta);
         continue;
       }
       const after = lstatSync(file);
       if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
-        result.skipped++;
+        settle(collector, 'skipped');
         continue;
       }
       if (snapshot.sessionId !== meta.sessionId && (await claimed(snapshot.sessionId, meta)))
@@ -601,7 +752,7 @@ export async function collectSessions(
       if (references.length) snapshot.references = references;
       if (snapshot.runtime?.accessPath === 'unknown') {
         if (harness === null)
-          harness = (options.harness ?? harnessAccess)(config.source, config.directory);
+          harness = (options.harness ?? harnessAccess)(group.source, group.directory);
         if (harness)
           snapshot.runtime = { ...snapshot.runtime, accessPath: harness, evidence: 'harness' };
       }
@@ -616,7 +767,7 @@ export async function collectSessions(
         // project is sent again, which recomputes the evidence and changes nothing else.
         if (mapKey && old.evidenceKey !== mapKey)
           await archive.capture(snapshot, { cwd, evidenceOnly: true });
-        result.held++;
+        settle(collector, 'held');
         result.heldBy.push({ file, projectId: old.projectId! });
         remember('held', meta);
         continue;
@@ -628,23 +779,23 @@ export async function collectSessions(
         digest = snapshotDigest(archiveSnapshotSchema.parse(snapshot));
       } catch (error) {
         // Over the archive's limits: the same bytes are refused again.
-        refuse(file, error);
+        refuse(collector, file, error);
         remember('failed', meta);
         continue;
       }
       // Unchanged, unless its evidence predates the server's project map (a new worktree or project).
       if (old?.digest === digest && (old.deleted || !mapKey || old.evidenceKey === mapKey))
-        result.unchanged++;
+        settle(collector, 'unchanged');
       else {
         try {
           const captured = await archive.capture(snapshot, { cwd });
           if (captured.dropped) {
-            result.dropped++;
+            settle(collector, 'dropped');
             remember('dropped', meta);
             continue;
           }
           digest = captured.digest;
-          result[captured.changed ? 'imported' : 'unchanged']++;
+          settle(collector, captured.changed ? 'imported' : 'unchanged');
           if (captured.changed)
             result.repaired?.push({
               file,
@@ -653,15 +804,62 @@ export async function collectSessions(
               ...(moved ? { previousProjectId: old.projectId ?? undefined } : {}),
             });
         } catch (error) {
-          refuse(file, error);
+          refuse(collector, file, error);
           if (deterministic(error)) remember('failed', meta);
           continue;
         }
       }
       remember('unchanged', meta, { id, digest });
     } catch (error) {
-      refuse(file, error);
+      refuse(collector, file, error);
     } // Partial/malformed files remain intact and retry on the next scan.
   }
-  return result;
+  return results;
+}
+
+/** The collectors over one history directory, as one scan runs them. */
+export type CollectionGroup = {
+  names: string[];
+  peers: CollectionSource[];
+  /** Run one collector of the peers (by position) alone; every collector when absent. */
+  only?: number;
+  filters: FolderFilters;
+  projects: CollectionSource[];
+  server?: { url: string };
+};
+
+/**
+ * One scan of every group, one walk each. A group that fails (its history directory gone, its
+ * server down) is reported and the rest still run. Results are by collector name.
+ */
+export async function collectSessionsForGroups(
+  groups: CollectionGroup[],
+  writer: (group: CollectionGroup) => ArchiveWriter,
+  options: Omit<CollectOptions, 'peers' | 'filters' | 'projects'> = {},
+) {
+  const results = new Map<string, CollectResult & { ms: number }>();
+  const failures: { names: string[]; error: string }[] = [];
+  for (const group of groups) {
+    const started = Date.now();
+    try {
+      const scanned = await collectSessionsForPeers(writer(group), group.peers, {
+        ...options,
+        ...(group.only === undefined ? {} : { only: group.only }),
+        filters: group.filters,
+        projects: group.projects,
+      });
+      const ms = Date.now() - started;
+      scanned.forEach((result, index) => {
+        const name = group.names[index];
+        if (name !== undefined && (group.only === undefined || index === group.only))
+          results.set(name, { ...result, ms });
+      });
+    } catch (error) {
+      failures.push({
+        names: group.names,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return { results, failures };
 }

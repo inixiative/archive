@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import {
   chmodSync,
   existsSync,
@@ -17,7 +17,7 @@ import {
   agentStatus,
   agentsConfigSchema,
   agentUnits,
-  collectorPlan,
+  collectionGroups,
   defaultHome,
   installAgents,
   machineProjects,
@@ -94,33 +94,20 @@ test('agents schema requires slug names, absolute paths and unique collectors', 
   expect(agentsConfigSchema.safeParse({ collectors: [], extra: 1 }).success).toBe(false);
 });
 
-test('units run this package CLI with the runtime and add --home only when non-default', () => {
+test('one unit runs every collector, with the runtime and --home only when non-default', () => {
   expect(packageCliPath()).toBe(join(import.meta.dir, '..', 'src', 'cli.ts'));
   const home = '/tmp/archive-home';
   const units = agentUnits(config, unitOptions(home));
-  expect(units.map((u) => u.label)).toEqual([
-    'com.inixiative.archive.collect.claude-code.kingdom',
-    'com.inixiative.archive.collect.codex.kingdom',
-  ]);
-  expect(units[0]!.args.slice(2)).toEqual([
-    'collect',
-    '--agent',
-    'claude-code.kingdom',
-    '--watch',
-    '--home',
-    home,
-  ]);
-  expect(units[0]!.stdout).toBe(
-    `${home}/logs/com.inixiative.archive.collect.claude-code.kingdom.out.log`,
-  );
+  expect(units.map((u) => u.label)).toEqual(['com.inixiative.archive.collect']);
+  expect(units[0]!.args.slice(2)).toEqual(['collect', '--watch', '--home', home]);
+  expect(units[0]!.stdout).toBe(`${home}/logs/com.inixiative.archive.collect.out.log`);
   expect(agentUnits({ collectors: [codex] }, unitOptions(defaultHome()))[0]!.args).toEqual([
     '/bin/bun',
     '/pkg/src/cli.ts',
     'collect',
-    '--agent',
-    'codex.kingdom',
     '--watch',
   ]);
+  expect(agentUnits({ collectors: [] }, unitOptions(home))).toEqual([]);
 });
 
 test('plist and systemd unit rendering', () => {
@@ -129,16 +116,14 @@ test('plist and systemd unit rendering', () => {
   expect(renderPlist({ ...unit!, args: [...unit!.args, 'a & <b>'] })).toContain(
     '<string>a &amp; &lt;b&gt;</string>',
   );
-  expect(plist).toContain(
-    '<key>Label</key>\n  <string>com.inixiative.archive.collect.claude-code.kingdom</string>',
-  );
-  expect(plist).toContain('<string>claude-code.kingdom</string>');
+  expect(plist).toContain('<key>Label</key>\n  <string>com.inixiative.archive.collect</string>');
+  expect(plist).toContain('<string>--watch</string>');
   expect(plist).toContain('<key>KeepAlive</key>\n  <true/>');
   expect(plist).toContain('<key>RunAtLoad</key>\n  <true/>');
   expect(plist).toContain('<key>ThrottleInterval</key>\n  <integer>30</integer>');
   expect(plist).toContain('<key>WorkingDirectory</key>\n  <string>/tmp/h</string>');
   expect(plist).toContain(
-    '<key>StandardErrorPath</key>\n  <string>/tmp/h/logs/com.inixiative.archive.collect.claude-code.kingdom.err.log</string>',
+    '<key>StandardErrorPath</key>\n  <string>/tmp/h/logs/com.inixiative.archive.collect.err.log</string>',
   );
   if (process.platform === 'darwin') {
     const file = join(temp(), 'unit.plist');
@@ -150,32 +135,35 @@ test('plist and systemd unit rendering', () => {
   expect(service).toContain('"100%%" "$$HOME" "a\\"b"');
   expect(service).toContain('Restart=always\nRestartSec=30');
   expect(service).toContain(
-    'StandardOutput=append:/tmp/h/logs/com.inixiative.archive.collect.claude-code.kingdom.out.log',
+    'StandardOutput=append:/tmp/h/logs/com.inixiative.archive.collect.out.log',
   );
   expect(service).toContain('WantedBy=default.target');
 });
 
 test('planning writes changed units, keeps identical ones and removes only undeclared Archive units', () => {
-  const units = agentUnits(config, unitOptions('/tmp/h'));
+  const units = agentUnits(
+    { ...config, router: {} },
+    { ...unitOptions('/tmp/h'), claudeBin: '/bin/claude' },
+  );
   const plan = planAgents(
     units,
     [
-      {
-        label: 'com.inixiative.archive.collect.claude-code.kingdom',
-        content: renderPlist(units[0]!),
-      },
-      { label: 'com.inixiative.archive.collect.codex.kingdom', content: 'old' },
-      { label: 'com.inixiative.archive.collect.gone' },
+      { label: 'com.inixiative.archive.collect', content: renderPlist(units[0]!) },
+      { label: 'com.inixiative.archive.route', content: 'old' },
+      // The units of one process per collector, from before every collector ran in one.
+      { label: 'com.inixiative.archive.collect.claude-code.kingdom', content: 'old' },
+      { label: 'com.inixiative.archive.collect.codex.kingdom' },
       { label: 'com.inixiative.foundry' },
     ],
     'darwin',
     '/LA',
   );
-  expect(plan.unchanged).toEqual(['com.inixiative.archive.collect.claude-code.kingdom']);
-  expect(plan.write.map((w) => w.file)).toEqual([
-    '/LA/com.inixiative.archive.collect.codex.kingdom.plist',
+  expect(plan.unchanged).toEqual(['com.inixiative.archive.collect']);
+  expect(plan.write.map((w) => w.file)).toEqual(['/LA/com.inixiative.archive.route.plist']);
+  expect(plan.remove).toEqual([
+    'com.inixiative.archive.collect.claude-code.kingdom',
+    'com.inixiative.archive.collect.codex.kingdom',
   ]);
-  expect(plan.remove).toEqual(['com.inixiative.archive.collect.gone']);
 });
 
 test('launchd install writes plists, reloads with I/O error retry, prunes and uninstalls', () => {
@@ -186,7 +174,7 @@ test('launchd install writes plists, reloads with I/O error retry, prunes and un
   writeFileSync(join(dir, 'com.inixiative.foundry.plist'), 'other');
   let failures = 1;
   const { calls, run } = fakeRunner((argv) => {
-    if (argv[1] === 'bootstrap' && argv[3]!.endsWith('codex.kingdom.plist') && failures-- > 0)
+    if (argv[1] === 'bootstrap' && argv[3]!.endsWith('archive.collect.plist') && failures-- > 0)
       return { code: 5, stderr: 'Bootstrap failed: 5: Input/output error' };
     if (argv[1] === 'print') return { stdout: 'state = running\n\tpid = 4242\n' };
     return {};
@@ -201,34 +189,30 @@ test('launchd install writes plists, reloads with I/O error retry, prunes and un
   };
   const result = installAgents(config, options);
   expect(result.removed).toEqual(['com.inixiative.archive.collect.gone']);
-  expect(result.loaded).toHaveLength(2);
+  expect(result.loaded).toEqual(['com.inixiative.archive.collect']);
   expect(existsSync(join(dir, 'com.inixiative.archive.collect.gone.plist'))).toBe(false);
   expect(existsSync(join(dir, 'com.inixiative.foundry.plist'))).toBe(true);
-  expect(
-    readFileSync(join(dir, 'com.inixiative.archive.collect.codex.kingdom.plist'), 'utf8'),
-  ).toContain('<string>collect</string>');
+  expect(readFileSync(join(dir, 'com.inixiative.archive.collect.plist'), 'utf8')).toContain(
+    '<string>collect</string>',
+  );
   expect(existsSync(join(home, 'logs'))).toBe(true);
   const commands = calls.map((c) => c.slice(0, 3).join(' '));
   expect(commands[0]).toBe('launchctl bootout gui/501/com.inixiative.archive.collect.gone');
-  expect(commands.filter((c) => c === 'launchctl bootstrap gui/501')).toHaveLength(3);
-  expect(calls).toContainEqual([
-    'launchctl',
-    'bootout',
-    'gui/501/com.inixiative.archive.collect.codex.kingdom',
-  ]);
+  expect(commands.filter((c) => c === 'launchctl bootstrap gui/501')).toHaveLength(2);
+  expect(calls).toContainEqual(['launchctl', 'bootout', 'gui/501/com.inixiative.archive.collect']);
 
   calls.length = 0;
   const again = installAgents(config, options);
   expect(again).toMatchObject({ loaded: [], removed: [] });
-  expect(again.unchanged).toHaveLength(2);
+  expect(again.unchanged).toEqual(['com.inixiative.archive.collect']);
   expect(calls.every((c) => c[1] === 'print')).toBe(true);
 
   writeFileSync(
-    join(home, 'logs', 'com.inixiative.archive.collect.codex.kingdom.out.log'),
+    join(home, 'logs', 'com.inixiative.archive.collect.out.log'),
     'one\n{\n  "imported": 1\n}\n',
   );
   const status = agentStatus(config, options);
-  expect(status.find((s) => s.label.endsWith('.codex.kingdom'))).toMatchObject({
+  expect(status.find((s) => s.label === 'com.inixiative.archive.collect')).toMatchObject({
     declared: true,
     installed: true,
     loaded: true,
@@ -245,9 +229,9 @@ test('launchd install writes plists, reloads with I/O error retry, prunes and un
     }),
   ).toThrow('bootstrap failed');
 
-  expect(uninstallAgents(options).removed).toHaveLength(2);
+  expect(uninstallAgents(options).removed).toEqual(['com.inixiative.archive.collect']);
   expect(existsSync(join(dir, 'com.inixiative.foundry.plist'))).toBe(true);
-  expect(existsSync(join(dir, 'com.inixiative.archive.collect.codex.kingdom.plist'))).toBe(false);
+  expect(existsSync(join(dir, 'com.inixiative.archive.collect.plist'))).toBe(false);
 });
 
 test('systemd install reloads the daemon and enables units', () => {
@@ -257,7 +241,7 @@ test('systemd install reloads the daemon and enables units', () => {
     argv[2] === 'show' ? { stdout: 'ActiveState=active\nMainPID=7\n' } : {},
   );
   const options = { dir, run, platform: 'linux' as const, ...unitOptions(home) };
-  const service = 'com.inixiative.archive.collect.codex.kingdom';
+  const service = 'com.inixiative.archive.collect';
   installAgents({ collectors: [codex] }, options);
   expect(existsSync(join(dir, `${service}.service`))).toBe(true);
   expect(calls).toEqual([
@@ -446,10 +430,16 @@ test('a catch-all collector is unrouted with no roots; a named collector is rout
   expect(
     agentsConfigSchema.safeParse({ collectors: [{ ...collector, projectId: 'unrouted' }] }).success,
   ).toBe(false);
-  const plan = collectorPlan(withCatchAll, 'claude-code.unrouted');
-  expect(plan.collector).toMatchObject({ catchAll: true, projectId: 'unrouted' });
+  const [plan] = collectionGroups(withCatchAll, 'claude-code.unrouted');
+  if (!plan) throw new Error('Expected a group');
+  expect(plan.only).toBe(1);
+  expect(plan.peers[1]).toMatchObject({ catchAll: true, projectId: 'unrouted' });
   expect(plan.peers.map((p) => p.projectId)).toEqual(['kingdom', 'unrouted']);
-  expect(plan.peers[1]).toBe(plan.collector);
+  // Without a name, every history is a group, run for every collector.
+  expect(collectionGroups(withCatchAll).map((g) => [g.names, g.only])).toEqual([
+    [['claude-code.kingdom', 'claude-code.unrouted'], undefined],
+    [['codex.kingdom'], undefined],
+  ]);
   expect(plan.filters.exclude).toContain('/Users/me/scratch');
   expect(plan.filters.exclude).toContain('**/decision-receipts');
   expect(plan.projects.map((p) => p.projectId)).toEqual(['kingdom', 'kingdom']);
@@ -461,11 +451,12 @@ test('a catch-all collector is unrouted with no roots; a named collector is rout
     directory: '/Users/me/.claude-work/projects',
   };
   expect(
-    collectorPlan({ collectors: [collector, elsewhere, catchAll] }, 'claude-code.work').peers.map(
-      (p) => p.directory,
-    ),
+    collectionGroups(
+      { collectors: [collector, elsewhere, catchAll] },
+      'claude-code.work',
+    )[0]!.peers.map((p) => p.directory),
   ).toEqual(['/Users/me/.claude-work/projects']);
-  expect(() => collectorPlan(withCatchAll, 'missing')).toThrow('No collector named missing');
+  expect(() => collectionGroups(withCatchAll, 'missing')).toThrow('No collector named missing');
   expect(
     archiveDestinationSchema.safeParse({
       kind: 'archive',
@@ -480,15 +471,15 @@ test('a unit that fails to load does not stop the others, and is reloaded by the
   const home = temp(),
     dir = join(temp(), 'LaunchAgents');
   mkdirSync(dir);
-  const codexFile = join(dir, 'com.inixiative.archive.collect.codex.kingdom.plist');
-  const claudeFile = join(dir, 'com.inixiative.archive.collect.claude-code.kingdom.plist');
+  const collectFile = join(dir, 'com.inixiative.archive.collect.plist');
+  const routeFile = join(dir, 'com.inixiative.archive.route.plist');
   // Both units run an older version.
-  writeFileSync(codexFile, 'old codex');
-  writeFileSync(claudeFile, 'old claude');
-  const running = new Set(['codex.kingdom', 'claude-code.kingdom']);
-  const failing = new Set(['claude-code.kingdom']);
+  writeFileSync(collectFile, 'old collect');
+  writeFileSync(routeFile, 'old route');
+  const running = new Set(['collect', 'route']);
+  const failing = new Set(['route']);
   const run: AgentRunner = (argv) => {
-    const name = (argv.at(-1) ?? '').replace(/.*collect\.|\.plist$/g, '');
+    const name = (argv.at(-1) ?? '').replace(/.*com\.inixiative\.archive\.|\.plist$/g, '');
     if (argv[1] === 'print') return { code: running.has(name) ? 0 : 1, stdout: '', stderr: '' };
     if (argv[1] === 'bootout') running.delete(name);
     if (argv[1] === 'bootstrap') {
@@ -505,15 +496,16 @@ test('a unit that fails to load does not stop the others, and is reloaded by the
     platform: 'darwin' as const,
     ...unitOptions(home),
   };
-  expect(() => installAgents(config, options)).toThrow('claude-code.kingdom');
+  const routed = { ...config, router: {} };
+  expect(() => installAgents(routed, options)).toThrow('com.inixiative.archive.route');
   // The unit that loaded runs the new file; the one that failed keeps its old file.
-  expect(readFileSync(codexFile, 'utf8')).toContain('<string>--agent</string>');
-  expect(readFileSync(claudeFile, 'utf8')).toBe('old claude');
+  expect(readFileSync(collectFile, 'utf8')).toContain('<string>--watch</string>');
+  expect(readFileSync(routeFile, 'utf8')).toBe('old route');
   failing.clear();
-  const again = installAgents(config, options);
-  expect(again.loaded).toEqual(['com.inixiative.archive.collect.claude-code.kingdom']);
-  expect(again.unchanged).toEqual(['com.inixiative.archive.collect.codex.kingdom']);
-  expect(readFileSync(claudeFile, 'utf8')).toContain('<string>--agent</string>');
+  const again = installAgents(routed, options);
+  expect(again.loaded).toEqual(['com.inixiative.archive.route']);
+  expect(again.unchanged).toEqual(['com.inixiative.archive.collect']);
+  expect(readFileSync(routeFile, 'utf8')).toContain('<string>route</string>');
 });
 
 test('machineProjects: every non-catch-all project and its checkout roots', () => {
@@ -534,3 +526,177 @@ test('machineProjects: every non-catch-all project and its checkout roots', () =
     }),
   ).toEqual([{ projectId: 'template', roots: new Set(['/nonexistent/template']) }]);
 });
+
+test('collect with no flags runs every collector; a failing history stops only itself; --watch re-reads agents.json, says when a failure clears and beats hourly', async () => {
+  const token = 'synthetic-archive-collect-token-00000000';
+  await freshStore('serve');
+  const instance = await startArchiveServer({
+    databaseUrl: testDatabaseUrl('serve'),
+    token,
+    port: 0,
+  });
+  const home = temp();
+  const claude = join(temp(), 'projects');
+  const codexHistory = join(temp(), 'sessions');
+  const museHistory = join(temp(), 'muse');
+  mkdirSync(claude);
+  mkdirSync(codexHistory);
+  writeFileSync(join(home, 'server.token'), `${token}\n`);
+  const session = (id: string, cwd: string) =>
+    writeFileSync(
+      join(claude, `${id}.jsonl`),
+      JSON.stringify({
+        sessionId: id,
+        cwd,
+        type: 'user',
+        uuid: `${id}-1`,
+        message: { content: 'Work' },
+      }),
+    );
+  session('k', '/w/kingdom');
+  session('t', '/w/tribe');
+  writeFileSync(
+    join(codexHistory, 'c.jsonl'),
+    [
+      { type: 'session_meta', payload: { id: 'c', cwd: '/w/kingdom' } },
+      {
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Hi' }] },
+      },
+    ]
+      .map((row) => JSON.stringify(row))
+      .join('\n'),
+  );
+  const collector = (
+    name: string,
+    projectId: string,
+    source: 'claude-code' | 'codex' | 'muse' = 'claude-code',
+    directory = claude,
+  ) => ({ name, source, directory, projectId, projectRoots: [`/w/${projectId}`] });
+  const kingdom = collector('claude-code.kingdom', 'kingdom');
+  const codexKingdom = collector('codex.kingdom', 'kingdom', 'codex', codexHistory);
+  // Declared first: its history directory does not exist yet.
+  const muse = collector('muse.kingdom', 'kingdom', 'muse', museHistory);
+  const file = join(home, 'agents.json');
+  const agents = (collectors: AgentsConfig['collectors']) =>
+    writeFileSync(file, JSON.stringify({ server: { url: instance.server.url.href }, collectors }));
+  agents([muse, kingdom, codexKingdom]);
+  // The CLI's output, one JSON value a write; anything else written passes through.
+  const printed: unknown[] = [];
+  const passThrough = process.stdout.write.bind(process.stdout);
+  const write = spyOn(process.stdout, 'write').mockImplementation((chunk, ...rest) => {
+    const text = String(chunk);
+    if (!/^[[{]/.test(text)) return passThrough(chunk, ...(rest as []));
+    printed.push(JSON.parse(text));
+    return true;
+  });
+  const errors: unknown[] = [];
+  const error = spyOn(console, 'error').mockImplementation((line: unknown) => {
+    errors.push(JSON.parse(String(line)));
+  });
+  const totals = (counts: Record<string, number>) => ({
+    imported: 0,
+    unchanged: 0,
+    held: 0,
+    dropped: 0,
+    failed: 0,
+    ...counts,
+  });
+  const museFailed = {
+    collect: 'failed',
+    collectors: ['muse.kingdom'],
+    error: expect.stringContaining('no such file or directory'),
+  };
+  try {
+    // One run: the missing history is reported, the others still run, and the run fails.
+    await runCli(['collect', '--home', home]);
+    expect(process.exitCode).toBe(1);
+    process.exitCode = 0;
+    expect(errors).toEqual([museFailed]);
+    expect(printed).toEqual([
+      {
+        ms: expect.any(Number),
+        totals: totals({ imported: 2 }),
+        collectors: {
+          'claude-code.kingdom': expect.objectContaining({ imported: 1, skipped: 1 }),
+          'codex.kingdom': expect.objectContaining({ imported: 1 }),
+        },
+      },
+    ]);
+    const projects = async () =>
+      (await instance.store.list({ exempt: 'include' }))
+        .map((a) => `${a.source}:${a.sessionId}:${a.projectId}`)
+        .sort();
+    expect(await projects()).toEqual(['claude-code:k:kingdom', 'codex:c:kingdom']);
+    // A repair runs every history too, and reports the one it could not read.
+    printed.length = errors.length = 0;
+    await runCli(['repair', '--home', home]);
+    expect(process.exitCode).toBe(1);
+    process.exitCode = 0;
+    const { collect: _, ...repairFailed } = museFailed;
+    expect(errors).toEqual([{ repair: 'failed', ...repairFailed }]);
+    expect(printed).toEqual([
+      [
+        expect.objectContaining({ collector: 'claude-code.kingdom', unchanged: 1 }),
+        expect.objectContaining({ collector: 'codex.kingdom', unchanged: 1 }),
+      ],
+    ]);
+
+    // Watching, 30 one-second waits a scan:
+    // 1 prints everything and the failure; 2 prints nothing; before 3 the muse history appears
+    // and a collector is declared: 3 prints the recovery and the new collector's import; 4 prints
+    // nothing; before 5 an hour passes: 5 prints the heartbeat.
+    printed.length = errors.length = 0;
+    let waits = 0;
+    let offset = 0;
+    const wait = Bun.sleep;
+    const realNow = Date.now;
+    const clock = spyOn(Date, 'now').mockImplementation(() => realNow() + offset);
+    const sleep = spyOn(Bun, 'sleep').mockImplementation(async (ms) => {
+      if (ms !== 1000) return wait(ms);
+      waits++;
+      if (waits === 31) {
+        mkdirSync(museHistory);
+        agents([muse, kingdom, collector('claude-code.tribe', 'tribe'), codexKingdom]);
+      }
+      if (waits === 91) offset = 61 * 60_000;
+      if (waits >= 121) process.emit('SIGTERM');
+    });
+    try {
+      await runCli(['collect', '--watch', '--home', home]);
+    } finally {
+      sleep.mockRestore();
+      clock.mockRestore();
+    }
+    expect(errors).toEqual([museFailed, { collect: 'recovered', collectors: ['muse.kingdom'] }]);
+    expect(printed).toEqual([
+      {
+        ms: expect.any(Number),
+        totals: totals({ unchanged: 2 }),
+        collectors: {
+          'claude-code.kingdom': expect.objectContaining({ unchanged: 1, skipped: 1 }),
+          'codex.kingdom': expect.objectContaining({ unchanged: 1 }),
+        },
+      },
+      {
+        ms: expect.any(Number),
+        totals: totals({ imported: 1, unchanged: 2 }),
+        collectors: {
+          'muse.kingdom': expect.objectContaining({ imported: 0 }),
+          'claude-code.tribe': expect.objectContaining({ imported: 1 }),
+        },
+      },
+      { heartbeat: true, ms: expect.any(Number), collectors: 4, totals: totals({ unchanged: 3 }) },
+    ]);
+    expect(await projects()).toEqual([
+      'claude-code:k:kingdom',
+      'claude-code:t:tribe',
+      'codex:c:kingdom',
+    ]);
+  } finally {
+    process.exitCode = 0;
+    write.mockRestore();
+    error.mockRestore();
+    await instance.close();
+  }
+}, 60_000);

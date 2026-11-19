@@ -18,7 +18,7 @@ So:
 
 ### 2.1 Capture
 
-The local Archive runs: Compose project `archive`, image `ghcr.io/inixiative/archive:0.12.1` (healthy), `pgvector/pgvector:pg17` on loopback 6132, `/health` ok. Seven launchd collectors are loaded (`com.inixiative.archive.collect.*`) with empty error logs. They run `bun …/code/inixiative/archive/src/cli.ts`, the **shared main checkout**, so they run whatever that checkout holds (today `origin/main` plus one local commit).
+The local Archive runs as Compose project `archive` (`pgvector/pgvector:pg17` on loopback 6132). One launchd unit, `com.inixiative.archive.collect`, runs every collector `agents.json` declares in one process, from the released npm package (`bun add -g @inixiative/archive@<version>`), not a checkout. This section was first written when seven per-collector units (`com.inixiative.archive.collect.*`) ran the shared main checkout on image 0.12.1; the table below is that snapshot of roots.
 
 Each collector captures only sessions whose recorded `cwd` exactly equals one of its roots (or a git worktree of one). `agents.json` declares:
 
