@@ -17,6 +17,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import {
+  type CollectionGroup,
   type CollectionSource,
   collectionRoots,
   defaultExclusions,
@@ -236,9 +237,9 @@ export function machineProjectMap(config: AgentsConfig): ProjectMap {
  * The collectors of agents.json by history: one group per source and directory, each with its
  * peers (in declared order), the folder filters, every project on the machine (for `project:`
  * tags) and the server. Collectors over the same history compete for its sessions; another
- * directory is another history.
+ * directory is another history. With a name, only that collector's group, run for it alone.
  */
-export function collectionGroups(config: AgentsConfig) {
+export function collectionGroups(config: AgentsConfig, name?: string): CollectionGroup[] {
   const filters: FolderFilters = {
     ...(config.include?.length ? { include: config.include } : {}),
     exclude: [...defaultExclusions(), ...(config.exclude ?? [])],
@@ -249,20 +250,17 @@ export function collectionGroups(config: AgentsConfig) {
     const key = JSON.stringify([collector.source, resolve(collector.directory)]);
     histories.set(key, [...(histories.get(key) ?? []), collector]);
   }
-  return [...histories.values()].map((named) => ({
+  const groups = [...histories.values()].map((named) => ({
     names: named.map((c) => c.name),
     peers: named.map(source),
     filters,
     projects,
-    server: config.server,
+    ...(config.server ? { server: config.server } : {}),
   }));
-}
-
-/** A named collector and its group from agents.json. */
-export function collectorPlan(config: AgentsConfig, name: string) {
-  const group = collectionGroups(config).find((g) => g.names.includes(name));
+  if (name === undefined) return groups;
+  const group = groups.find((g) => g.names.includes(name));
   if (!group) throw new Error(`No collector named ${name} in agents.json`);
-  return { ...group, collector: group.peers[group.names.indexOf(name)]! };
+  return [{ ...group, only: group.names.indexOf(name) }];
 }
 
 /**

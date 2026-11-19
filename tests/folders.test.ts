@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { agentsConfigSchema, collectorPlan } from '../src/agents';
+import { agentsConfigSchema, collectionGroups } from '../src/agents';
 import {
   type CollectionSource,
   collectSessions,
@@ -130,7 +130,8 @@ test('agents.json filters reach every collector through its plan', () => {
       },
     ],
   });
-  const plan = collectorPlan(config, 'claude-code.w');
+  const [plan] = collectionGroups(config, 'claude-code.w');
+  if (!plan) throw new Error('Expected a group');
   expect(plan.filters).toEqual({
     include: ['/w'],
     exclude: ['**/decision-receipts', '/w/scratch'],

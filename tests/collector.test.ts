@@ -12,11 +12,13 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  type CollectionGroup,
   type CollectionSource,
   type CollectorCache,
   type CollectResult,
   collectionRoots,
   collectSessions,
+  collectSessionsForGroups,
   collectSessionsForPeers,
   defaultExclusions,
   routeSession,
@@ -993,7 +995,7 @@ const claudeSession = (dir: string, id: string, cwd: string, text = 'Work') =>
     }),
   );
 
-test('one scan over a history gives every collector what it gets scanning alone', async () => {
+test('routing over a shared history lands each session where main did, alone or in one scan, by values written out by hand', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'archive-peers-'));
   const base = { directory: dir, source: 'claude-code' as const, subdirectories: true };
   const peers: CollectionSource[] = [
@@ -1030,30 +1032,61 @@ test('one scan over a history gives every collector what it gets scanning alone'
           projectId: 'other',
         }),
       );
+    // Ten transcripts. Written out from the routing rules, not from either function's output.
+    const counts = (n: Partial<CollectResult>): CollectResult => ({
+      imported: 0,
+      unchanged: 0,
+      skipped: 0,
+      held: 0,
+      dropped: 0,
+      failed: 0,
+      refused: [],
+      heldBy: [],
+      ...n,
+    });
+    const expected = [
+      // i and tribe-apps (tribe's root is exact, so /w/tribe/apps is /w's); broken refused.
+      counts({
+        imported: 2,
+        skipped: 7,
+        failed: 1,
+        refused: [
+          {
+            file: join(dir, 'broken.jsonl'),
+            reason: expect.stringContaining('Invalid transcript'),
+          },
+        ],
+      }),
+      // k below its root; held stays with the project that holds it.
+      counts({
+        imported: 1,
+        skipped: 8,
+        held: 1,
+        heldBy: [{ file: join(dir, 'held.jsonl'), projectId: 'other' }],
+      }),
+      counts({ imported: 1, skipped: 9 }),
+      // u; the /tmp probe, the excluded receipt and the file with no cwd go to nobody.
+      counts({ imported: 1, skipped: 9 }),
+    ];
     const each: CollectResult[] = [];
     for (const collector of peers)
       each.push(await collectSessions(alone, collector, { ...options, peers }));
-    const together = await collectSessionsForPeers(shared, peers, options);
-    expect(together).toEqual(each);
-    expect(together.map((r) => [r.imported, r.held, r.failed])).toEqual([
-      [2, 0, 1],
-      [1, 1, 0],
-      [1, 0, 0],
-      [1, 0, 0],
-    ]);
-    const stored = async (store: typeof shared) =>
-      (await store.list({ exempt: 'include' }))
-        .map((a) => [a.sessionId, a.projectId, a.tags])
-        .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
-    expect(await stored(shared)).toEqual(await stored(alone));
-    expect((await stored(shared)).map(([id, project]) => `${id}:${project}`)).toEqual([
+    expect(each).toEqual(expected);
+    expect(await collectSessionsForPeers(shared, peers, options)).toEqual(expected);
+    const projects = [
       'held:other',
       'i:inixiative',
       'k:kingdom',
       't:tribe',
       'tribe-apps:inixiative',
       'u:unrouted',
-    ]);
+    ];
+    for (const store of [alone, shared]) {
+      const listed = await store.list({ exempt: 'include' });
+      expect(listed.map((a) => `${a.sessionId}:${a.projectId}`).sort()).toEqual(projects);
+      for (const archive of listed)
+        expect(archive.tags.includes('coding')).toBe(archive.projectId === 'inixiative');
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1233,4 +1266,186 @@ test('a watching collector prints a scan only when it says something new', () =>
   expect(scanIsWorthPrinting(scan({ held: 3 }), scan())).toBe(true);
   expect(scanIsWorthPrinting(scan({ failed: 0 }), scan())).toBe(true);
   expect(scanIsWorthPrinting(scan({ refused: [{ file: 'f', reason: 'r' }] }), scan())).toBe(true);
+});
+
+test('two histories share one cache, and a history that cannot be read stops only itself', async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'archive-groups-')));
+  const claude = join(dir, 'projects');
+  const codex = join(dir, 'sessions');
+  mkdirSync(claude);
+  mkdirSync(codex);
+  claudeSession(claude, 'k', '/w/kingdom');
+  writeFileSync(
+    join(codex, 'c.jsonl'),
+    [
+      { type: 'session_meta', payload: { id: 'c', cwd: '/w/kingdom' } },
+      {
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Hi' }] },
+      },
+    ]
+      .map((row) => JSON.stringify(row))
+      .join('\n'),
+  );
+  const store = await freshStore();
+  let captures = 0;
+  const writer = {
+    sourceId: () => store.sourceId(),
+    head: (id: string) => store.head(id),
+    capture: (snapshot: unknown) => {
+      captures++;
+      return store.capture(snapshot);
+    },
+    claimState: (source: ClaimSource, sessionId: string, modifiedAt?: number) =>
+      store.claimState(source, sessionId, modifiedAt),
+  };
+  const kingdom = (source: CollectionSource['source'], directory: string): CollectionSource => ({
+    directory,
+    source,
+    projectId: 'kingdom',
+    projectRoots: ['/w/kingdom'],
+  });
+  const group = (name: string, peer: CollectionSource): CollectionGroup => ({
+    names: [name],
+    peers: [peer],
+    filters: {},
+    projects: [peer],
+  });
+  const groups = [
+    group('muse.kingdom', kingdom('muse', join(dir, 'missing'))),
+    group('claude-code.kingdom', kingdom('claude-code', claude)),
+    group('codex.kingdom', kingdom('codex', codex)),
+  ];
+  const cache: CollectorCache = new Map();
+  const options = { cache, harness: () => 'subscription' as const };
+  try {
+    const first = await collectSessionsForGroups(groups, () => writer, options);
+    expect(first.failures).toEqual([
+      { names: ['muse.kingdom'], error: expect.stringContaining('no such file or directory') },
+    ]);
+    expect([...first.results].map(([name, r]) => [name, r.imported])).toEqual([
+      ['claude-code.kingdom', 1],
+      ['codex.kingdom', 1],
+    ]);
+    expect(cache.size).toBe(2);
+    captures = 0;
+    const second = await collectSessionsForGroups(groups, () => writer, options);
+    expect([...second.results].map(([name, r]) => [name, r.unchanged])).toEqual([
+      ['claude-code.kingdom', 1],
+      ['codex.kingdom', 1],
+    ]);
+    expect(captures).toBe(0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('collectors reordered, and one added, between scans over one cache route as a fresh scan does', async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'archive-reorder-')));
+  const base = { directory: dir, source: 'claude-code' as const };
+  const a: CollectionSource = { ...base, projectId: 'a', projectRoots: ['/w/a'] };
+  const b: CollectionSource = { ...base, projectId: 'b', projectRoots: ['/w/b'] };
+  const c: CollectionSource = { ...base, projectId: 'c', projectRoots: ['/w/c'] };
+  const unrouted: CollectionSource = {
+    ...base,
+    projectId: 'unrouted',
+    projectRoots: [],
+    catchAll: true,
+  };
+  for (const project of ['a', 'b', 'c']) claudeSession(dir, project, `/w/${project}`);
+  const store = await freshStore();
+  const cache: CollectorCache = new Map();
+  const options = { cache, harness: () => 'subscription' as const };
+  const counted = (results: CollectResult[]) =>
+    results.map((r) => [r.imported, r.unchanged, r.skipped]);
+  try {
+    expect(counted(await collectSessionsForPeers(store, [a, b, unrouted], options))).toEqual([
+      [1, 0, 2],
+      [1, 0, 2],
+      [1, 0, 2],
+    ]);
+    // c is declared, in front of a: c's session moves from the catch-all to c.
+    const peers = [b, c, a, unrouted];
+    expect(counted(await collectSessionsForPeers(store, peers, options))).toEqual([
+      [0, 1, 2],
+      [1, 0, 2],
+      [0, 1, 2],
+      [0, 0, 3],
+    ]);
+    // From the cache, each file is counted for the peer a fresh routing gives it.
+    const cached = await collectSessionsForPeers(store, peers, options);
+    const fresh = await collectSessionsForPeers(store, peers, {
+      harness: () => 'subscription' as const,
+    });
+    expect(counted(cached)).toEqual(counted(fresh));
+    expect(counted(cached)).toEqual([
+      [0, 1, 2],
+      [0, 1, 2],
+      [0, 1, 2],
+      [0, 0, 3],
+    ]);
+    expect((await store.list({ exempt: 'include' })).map((x) => x.projectId).sort()).toEqual([
+      'a',
+      'b',
+      'c',
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a moved worktree, and one whose gitdir is written after it was listed, are listed again', async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'archive-worktree-move-')));
+  const repo = join(dir, 'foundry');
+  const history = join(dir, 'history');
+  const git = (...args: string[]) =>
+    expect(Bun.spawnSync(['git', '-C', repo, ...args], { stderr: 'ignore' }).success).toBe(true);
+  const store = await freshStore();
+  const spawns = spyOn(Bun, 'spawnSync');
+  const config: CollectionSource = {
+    directory: history,
+    source: 'claude-code',
+    projectId: 'foundry',
+    projectRoots: [repo],
+    worktrees: true,
+  };
+  const scan = async () => {
+    spawns.mockClear();
+    const result = await collectSessions(store, config, { harness: () => 'subscription' });
+    const listed = spawns.mock.calls.filter(([argv]) => {
+      const args = Array.isArray(argv) ? argv : [];
+      return args[0] === 'git' && args.includes('worktree');
+    }).length;
+    return { ...result, listed };
+  };
+  try {
+    mkdirSync(repo);
+    mkdirSync(history);
+    git('init', '-q');
+    git('-c', 'user.email=a@b.c', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'i');
+    git('worktree', 'add', '-q', join(dir, 'feature'));
+    claudeSession(history, 'main', repo);
+    expect(await scan()).toMatchObject({ imported: 1, listed: 1 });
+    expect(await scan()).toMatchObject({ listed: 0 });
+    // A move rewrites only the entry's gitdir.
+    git('worktree', 'move', join(dir, 'feature'), join(dir, 'moved'));
+    claudeSession(history, 'moved', join(dir, 'moved'));
+    expect(await scan()).toMatchObject({ imported: 1, listed: 1 });
+    // git makes the entry before its gitdir: a listing between the two misses the worktree.
+    git('worktree', 'add', '-q', join(dir, 'late'));
+    const gitdir = join(repo, '.git', 'worktrees', 'late', 'gitdir');
+    const recorded = fs.readFileSync(gitdir, 'utf8');
+    rmSync(gitdir);
+    expect(await scan()).toMatchObject({ listed: 1 });
+    expect(await scan()).toMatchObject({ listed: 0 });
+    writeFileSync(gitdir, recorded);
+    claudeSession(history, 'late', join(dir, 'late'));
+    expect(await scan()).toMatchObject({ imported: 1, listed: 1 });
+    expect(
+      (await store.list({ exempt: 'include' })).map((x) => `${x.sessionId}:${x.projectId}`).sort(),
+    ).toEqual(['late:foundry', 'main:foundry', 'moved:foundry']);
+  } finally {
+    spawns.mockRestore();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

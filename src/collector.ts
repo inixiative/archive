@@ -273,38 +273,78 @@ function listWorktrees(root: string): string[] {
     .map((line) => resolve(line.slice('worktree '.length)));
 }
 
-/** A root's worktree list is listed again at least this often: `worktree move` leaves `worktrees/` as it was. */
+/** A root's worktrees are listed again at least this often, whatever the repository shows. */
 const WORKTREE_LIST_MS = 10 * 60_000;
 const worktreeLists = new Map<
   string,
-  { commonDirectory?: string; worktreesDirectory: string; listedAt: number; worktrees: string[] }
+  { commonDirectory: string | null; state: string; listedAt: number; worktrees: string[] }
 >();
-/** When `<git common dir>/worktrees` last changed: `worktree add`, `remove` and `prune` change it. */
-function worktreesDirectoryState(commonDirectory: string | undefined) {
-  if (!commonDirectory) return 'no repository';
-  try {
-    const stat = lstatSync(join(commonDirectory, 'worktrees'));
-    return `${stat.mtimeMs}:${stat.ctimeMs}`;
-  } catch {
-    return 'no worktrees';
-  }
+
+/**
+ * The root's git common directory; `null` for a root that is not a repository (missing, or git
+ * says so); `undefined` when git could not answer (a timeout, git itself missing). Plain
+ * `--git-common-dir` (`--path-format` needs git 2.31): a relative answer is relative to the root.
+ */
+function gitCommonDirectory(root: string): string | null | undefined {
+  if (!existsSync(root)) return null;
+  const run = Bun.spawnSync(['git', '-C', root, 'rev-parse', '--git-common-dir'], {
+    stderr: 'pipe',
+    timeout: SPAWN_MS,
+  });
+  if (run.success) return resolve(root, run.stdout.toString().trim());
+  return /not a git repository/i.test(run.stderr.toString()) ? null : undefined;
 }
 
 /**
- * A root's git worktrees, listed again only when its repository's `worktrees` directory changes
- * or ten minutes have passed. Read before listing, so a worktree added meanwhile is listed again
- * on the next call, never missed.
+ * What the repository's worktrees are now, as `<common dir>/worktrees` records them: each entry's
+ * name, with the times of its directory and of its `gitdir` file. `worktree add`, `remove`,
+ * `prune`, `move` and `repair` each change it, and so does an entry's `gitdir` written after its
+ * directory (git makes the directory first).
+ */
+function worktreesState(commonDirectory: string | null) {
+  if (commonDirectory === null) return 'no repository';
+  const directory = join(commonDirectory, 'worktrees');
+  let names: string[];
+  try {
+    names = readdirSync(directory).sort();
+  } catch {
+    return 'no worktrees';
+  }
+  const stamp = (path: string) => {
+    try {
+      const stat = lstatSync(path);
+      return `${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`;
+    } catch {
+      return 'none';
+    }
+  };
+  return JSON.stringify(
+    names.map((name) => [
+      name,
+      stamp(join(directory, name)),
+      stamp(join(directory, name, 'gitdir')),
+    ]),
+  );
+}
+
+/**
+ * A root's git worktrees, listed again only when its repository's worktrees change (see
+ * `worktreesState`), and at least every ten minutes. The state is read before listing, so a
+ * worktree changed meanwhile is listed again on the next call, never missed. A root git cannot
+ * answer for is listed every call, uncached.
  */
 function worktreesOf(root: string, now: number): string[] {
   const known = worktreeLists.get(root);
   const current = known && now - known.listedAt < WORKTREE_LIST_MS ? known : undefined;
-  const commonDirectory = current
-    ? current.commonDirectory
-    : git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir');
-  const worktreesDirectory = worktreesDirectoryState(commonDirectory);
-  if (current && current.worktreesDirectory === worktreesDirectory) return current.worktrees;
-  const worktrees = commonDirectory ? listWorktrees(root) : [];
-  worktreeLists.set(root, { commonDirectory, worktreesDirectory, listedAt: now, worktrees });
+  const commonDirectory = current ? current.commonDirectory : gitCommonDirectory(root);
+  if (commonDirectory === undefined) {
+    worktreeLists.delete(root);
+    return listWorktrees(root);
+  }
+  const state = worktreesState(commonDirectory);
+  if (current && current.state === state) return current.worktrees;
+  const worktrees = commonDirectory === null ? [] : listWorktrees(root);
+  worktreeLists.set(root, { commonDirectory, state, listedAt: now, worktrees });
   return worktrees;
 }
 
@@ -496,6 +536,18 @@ export function scanIsWorthPrinting(result: CollectResult, lastPrinted?: Collect
     (result.repaired?.length ?? 0) > 0 ||
     (['held', 'dropped', 'failed'] as const).some((count) => result[count] !== lastPrinted[count])
   );
+}
+
+/**
+ * A scan's counts over every collector, for a line short enough to read whole (`agents status`
+ * shows 500 characters). Skips are left out: every peer counts each other peer's sessions.
+ */
+export function scanTotals(results: Iterable<CollectResult>) {
+  const totals = { imported: 0, unchanged: 0, held: 0, dropped: 0, failed: 0 };
+  for (const result of results)
+    for (const count of Object.keys(totals) as (keyof typeof totals)[])
+      totals[count] += result[count];
+  return totals;
 }
 
 const emptyResult = (repair?: boolean): CollectResult => ({
@@ -763,4 +815,51 @@ export async function collectSessionsForPeers(
     } // Partial/malformed files remain intact and retry on the next scan.
   }
   return results;
+}
+
+/** The collectors over one history directory, as one scan runs them. */
+export type CollectionGroup = {
+  names: string[];
+  peers: CollectionSource[];
+  /** Run one collector of the peers (by position) alone; every collector when absent. */
+  only?: number;
+  filters: FolderFilters;
+  projects: CollectionSource[];
+  server?: { url: string };
+};
+
+/**
+ * One scan of every group, one walk each. A group that fails (its history directory gone, its
+ * server down) is reported and the rest still run. Results are by collector name.
+ */
+export async function collectSessionsForGroups(
+  groups: CollectionGroup[],
+  writer: (group: CollectionGroup) => ArchiveWriter,
+  options: Omit<CollectOptions, 'peers' | 'filters' | 'projects'> = {},
+) {
+  const results = new Map<string, CollectResult & { ms: number }>();
+  const failures: { names: string[]; error: string }[] = [];
+  for (const group of groups) {
+    const started = Date.now();
+    try {
+      const scanned = await collectSessionsForPeers(writer(group), group.peers, {
+        ...options,
+        ...(group.only === undefined ? {} : { only: group.only }),
+        filters: group.filters,
+        projects: group.projects,
+      });
+      const ms = Date.now() - started;
+      scanned.forEach((result, index) => {
+        const name = group.names[index];
+        if (name !== undefined && (group.only === undefined || index === group.only))
+          results.set(name, { ...result, ms });
+      });
+    } catch (error) {
+      failures.push({
+        names: group.names,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return { results, failures };
 }

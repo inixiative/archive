@@ -17,7 +17,7 @@ import {
   agentStatus,
   agentsConfigSchema,
   agentUnits,
-  collectorPlan,
+  collectionGroups,
   defaultHome,
   installAgents,
   machineProjects,
@@ -430,10 +430,16 @@ test('a catch-all collector is unrouted with no roots; a named collector is rout
   expect(
     agentsConfigSchema.safeParse({ collectors: [{ ...collector, projectId: 'unrouted' }] }).success,
   ).toBe(false);
-  const plan = collectorPlan(withCatchAll, 'claude-code.unrouted');
-  expect(plan.collector).toMatchObject({ catchAll: true, projectId: 'unrouted' });
+  const [plan] = collectionGroups(withCatchAll, 'claude-code.unrouted');
+  if (!plan) throw new Error('Expected a group');
+  expect(plan.only).toBe(1);
+  expect(plan.peers[1]).toMatchObject({ catchAll: true, projectId: 'unrouted' });
   expect(plan.peers.map((p) => p.projectId)).toEqual(['kingdom', 'unrouted']);
-  expect(plan.peers[1]).toBe(plan.collector);
+  // Without a name, every history is a group, run for every collector.
+  expect(collectionGroups(withCatchAll).map((g) => [g.names, g.only])).toEqual([
+    [['claude-code.kingdom', 'claude-code.unrouted'], undefined],
+    [['codex.kingdom'], undefined],
+  ]);
   expect(plan.filters.exclude).toContain('/Users/me/scratch');
   expect(plan.filters.exclude).toContain('**/decision-receipts');
   expect(plan.projects.map((p) => p.projectId)).toEqual(['kingdom', 'kingdom']);
@@ -445,11 +451,12 @@ test('a catch-all collector is unrouted with no roots; a named collector is rout
     directory: '/Users/me/.claude-work/projects',
   };
   expect(
-    collectorPlan({ collectors: [collector, elsewhere, catchAll] }, 'claude-code.work').peers.map(
-      (p) => p.directory,
-    ),
+    collectionGroups(
+      { collectors: [collector, elsewhere, catchAll] },
+      'claude-code.work',
+    )[0]!.peers.map((p) => p.directory),
   ).toEqual(['/Users/me/.claude-work/projects']);
-  expect(() => collectorPlan(withCatchAll, 'missing')).toThrow('No collector named missing');
+  expect(() => collectionGroups(withCatchAll, 'missing')).toThrow('No collector named missing');
   expect(
     archiveDestinationSchema.safeParse({
       kind: 'archive',
@@ -520,7 +527,7 @@ test('machineProjects: every non-catch-all project and its checkout roots', () =
   ).toEqual([{ projectId: 'template', roots: new Set(['/nonexistent/template']) }]);
 });
 
-test('collect with no flags runs every collector in agents.json; --watch re-reads it each scan', async () => {
+test('collect with no flags runs every collector; a failing history stops only itself; --watch re-reads agents.json, says when a failure clears and beats hourly', async () => {
   const token = 'synthetic-archive-collect-token-00000000';
   await freshStore('serve');
   const instance = await startArchiveServer({
@@ -531,6 +538,7 @@ test('collect with no flags runs every collector in agents.json; --watch re-read
   const home = temp();
   const claude = join(temp(), 'projects');
   const codexHistory = join(temp(), 'sessions');
+  const museHistory = join(temp(), 'muse');
   mkdirSync(claude);
   mkdirSync(codexHistory);
   writeFileSync(join(home, 'server.token'), `${token}\n`);
@@ -559,38 +567,60 @@ test('collect with no flags runs every collector in agents.json; --watch re-read
       .map((row) => JSON.stringify(row))
       .join('\n'),
   );
-  const collector = (name: string, projectId: string, directory = claude) => ({
-    name,
-    source: name.startsWith('codex') ? ('codex' as const) : ('claude-code' as const),
-    directory,
-    projectId,
-    projectRoots: [`/w/${projectId}`],
-  });
+  const collector = (
+    name: string,
+    projectId: string,
+    source: 'claude-code' | 'codex' | 'muse' = 'claude-code',
+    directory = claude,
+  ) => ({ name, source, directory, projectId, projectRoots: [`/w/${projectId}`] });
+  const kingdom = collector('claude-code.kingdom', 'kingdom');
+  const codexKingdom = collector('codex.kingdom', 'kingdom', 'codex', codexHistory);
+  // Declared first: its history directory does not exist yet.
+  const muse = collector('muse.kingdom', 'kingdom', 'muse', museHistory);
   const file = join(home, 'agents.json');
   const agents = (collectors: AgentsConfig['collectors']) =>
     writeFileSync(file, JSON.stringify({ server: { url: instance.server.url.href }, collectors }));
-  agents([
-    collector('claude-code.kingdom', 'kingdom'),
-    collector('codex.kingdom', 'kingdom', codexHistory),
-  ]);
+  agents([muse, kingdom, codexKingdom]);
   // The CLI's output, one JSON value a write; anything else written passes through.
   const printed: unknown[] = [];
   const passThrough = process.stdout.write.bind(process.stdout);
   const write = spyOn(process.stdout, 'write').mockImplementation((chunk, ...rest) => {
     const text = String(chunk);
-    if (!text.startsWith('{')) return passThrough(chunk, ...(rest as []));
+    if (!/^[[{]/.test(text)) return passThrough(chunk, ...(rest as []));
     printed.push(JSON.parse(text));
     return true;
   });
+  const errors: unknown[] = [];
+  const error = spyOn(console, 'error').mockImplementation((line: unknown) => {
+    errors.push(JSON.parse(String(line)));
+  });
+  const totals = (counts: Record<string, number>) => ({
+    imported: 0,
+    unchanged: 0,
+    held: 0,
+    dropped: 0,
+    failed: 0,
+    ...counts,
+  });
+  const museFailed = {
+    collect: 'failed',
+    collectors: ['muse.kingdom'],
+    error: expect.stringContaining('no such file or directory'),
+  };
   try {
+    // One run: the missing history is reported, the others still run, and the run fails.
     await runCli(['collect', '--home', home]);
+    expect(process.exitCode).toBe(1);
+    process.exitCode = 0;
+    expect(errors).toEqual([museFailed]);
     expect(printed).toEqual([
       {
+        ms: expect.any(Number),
+        totals: totals({ imported: 2 }),
         collectors: {
           'claude-code.kingdom': expect.objectContaining({ imported: 1, skipped: 1 }),
           'codex.kingdom': expect.objectContaining({ imported: 1 }),
         },
-        ms: expect.any(Number),
       },
     ]);
     const projects = async () =>
@@ -598,41 +628,65 @@ test('collect with no flags runs every collector in agents.json; --watch re-read
         .map((a) => `${a.source}:${a.sessionId}:${a.projectId}`)
         .sort();
     expect(await projects()).toEqual(['claude-code:k:kingdom', 'codex:c:kingdom']);
+    // A repair runs every history too, and reports the one it could not read.
+    printed.length = errors.length = 0;
+    await runCli(['repair', '--home', home]);
+    expect(process.exitCode).toBe(1);
+    process.exitCode = 0;
+    const { collect: _, ...repairFailed } = museFailed;
+    expect(errors).toEqual([{ repair: 'failed', ...repairFailed }]);
+    expect(printed).toEqual([
+      [
+        expect.objectContaining({ collector: 'claude-code.kingdom', unchanged: 1 }),
+        expect.objectContaining({ collector: 'codex.kingdom', unchanged: 1 }),
+      ],
+    ]);
 
-    // Watching: a collector declared between scans takes its sessions on the next scan, and a
-    // scan with nothing new prints nothing.
-    printed.length = 0;
-    // Only the collector's one-second waits between scans are skipped and counted, 30 a scan.
+    // Watching, 30 one-second waits a scan:
+    // 1 prints everything and the failure; 2 prints nothing; before 3 the muse history appears
+    // and a collector is declared: 3 prints the recovery and the new collector's import; 4 prints
+    // nothing; before 5 an hour passes: 5 prints the heartbeat.
+    printed.length = errors.length = 0;
     let waits = 0;
+    let offset = 0;
     const wait = Bun.sleep;
+    const realNow = Date.now;
+    const clock = spyOn(Date, 'now').mockImplementation(() => realNow() + offset);
     const sleep = spyOn(Bun, 'sleep').mockImplementation(async (ms) => {
       if (ms !== 1000) return wait(ms);
       waits++;
-      if (waits === 31)
-        agents([
-          collector('claude-code.kingdom', 'kingdom'),
-          collector('claude-code.tribe', 'tribe'),
-          collector('codex.kingdom', 'kingdom', codexHistory),
-        ]);
-      if (waits >= 91) process.emit('SIGTERM');
+      if (waits === 31) {
+        mkdirSync(museHistory);
+        agents([muse, kingdom, collector('claude-code.tribe', 'tribe'), codexKingdom]);
+      }
+      if (waits === 91) offset = 61 * 60_000;
+      if (waits >= 121) process.emit('SIGTERM');
     });
     try {
       await runCli(['collect', '--watch', '--home', home]);
     } finally {
       sleep.mockRestore();
+      clock.mockRestore();
     }
+    expect(errors).toEqual([museFailed, { collect: 'recovered', collectors: ['muse.kingdom'] }]);
     expect(printed).toEqual([
       {
+        ms: expect.any(Number),
+        totals: totals({ unchanged: 2 }),
         collectors: {
           'claude-code.kingdom': expect.objectContaining({ unchanged: 1, skipped: 1 }),
           'codex.kingdom': expect.objectContaining({ unchanged: 1 }),
         },
-        ms: expect.any(Number),
       },
       {
-        collectors: { 'claude-code.tribe': expect.objectContaining({ imported: 1 }) },
         ms: expect.any(Number),
+        totals: totals({ imported: 1, unchanged: 2 }),
+        collectors: {
+          'muse.kingdom': expect.objectContaining({ imported: 0 }),
+          'claude-code.tribe': expect.objectContaining({ imported: 1 }),
+        },
       },
+      { heartbeat: true, ms: expect.any(Number), collectors: 4, totals: totals({ unchanged: 3 }) },
     ]);
     expect(await projects()).toEqual([
       'claude-code:k:kingdom',
@@ -640,7 +694,9 @@ test('collect with no flags runs every collector in agents.json; --watch re-read
       'codex:c:kingdom',
     ]);
   } finally {
+    process.exitCode = 0;
     write.mockRestore();
+    error.mockRestore();
     await instance.close();
   }
-}, 30_000);
+}, 60_000);

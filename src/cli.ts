@@ -8,7 +8,6 @@ import { parseArgs } from 'node:util';
 import {
   agentStatus,
   collectionGroups,
-  collectorPlan,
   defaultHistoryDirectory,
   defaultHome,
   installAgents,
@@ -21,14 +20,16 @@ import {
 import { importChatGPTThread } from './chatgpt';
 import { archiveRequest, type SyncBackoff, searchRemotes, syncArchives } from './client';
 import {
+  type CollectionGroup,
   type CollectorCache,
   type CollectResult,
-  collectSessionsForPeers,
+  collectSessionsForGroups,
   defaultExclusions,
   excludeGlob,
   type FolderFilters,
   folderGlob,
   scanIsWorthPrinting,
+  scanTotals,
   sessionMetadata,
   UNROUTED,
 } from './collector';
@@ -61,6 +62,10 @@ export function migrate(databaseUrl: string) {
   );
   if (!run.success) throw new Error(`Archive migration failed: ${run.stderr.toString().trim()}`);
 }
+
+/** A watching collector with nothing new to say still prints a line this often. */
+const HEARTBEAT_MS = 60 * 60_000;
+const omitMs = ({ ms: _, ...result }: CollectResult & { ms: number }) => result;
 
 export async function runCli(args = Bun.argv.slice(2)) {
   const { values: v, positionals } = parseArgs({
@@ -486,6 +491,13 @@ export async function runCli(args = Bun.argv.slice(2)) {
   if (!token) throw new Error('No Archive token: run `archive init` or set ARCHIVE_TOKEN');
   const agentsFile = join(home, 'agents.json');
   const archive = new ArchiveClient({ url: v.url ?? DEFAULT_URL, token });
+  // Collectors from agents.json write to the server it declares, unless --url; one client a URL.
+  const clients = new Map<string, ArchiveClient>([[v.url ?? DEFAULT_URL, archive]]);
+  const writer = (group: Pick<CollectionGroup, 'server'>) => {
+    const url = v.url ?? group.server?.url ?? DEFAULT_URL;
+    if (!clients.has(url)) clients.set(url, new ArchiveClient({ url, token }));
+    return clients.get(url)!;
+  };
   if ((command === 'list' || command === 'search') && (v.tag?.length ?? 0) > 1)
     throw new Error('Filter by one --tag at a time');
   const filter = {
@@ -633,7 +645,8 @@ export async function runCli(args = Bun.argv.slice(2)) {
     try {
       do {
         try {
-          // Evidence follows the machine's projects as they are now (new worktrees included).
+          // Evidence follows the machine's projects as they are now: worktree lists are cached
+          // only until a repository's worktrees change.
           const agents = readAgents(agentsFile);
           if (agents) await archive.setProjectMap(machineProjectMap(agents));
           const report = await runRouting(archive, model, {
@@ -744,39 +757,33 @@ export async function runCli(args = Bun.argv.slice(2)) {
         atlas: v.atlas,
         tags: v.tag,
       };
-      return [
-        {
-          names: [v['project-id'] ?? UNROUTED],
-          peers: [collector],
-          only: 0 as number | undefined,
-          filters: {
-            ...(v.include?.length ? { include: v.include.map(folderGlob) } : {}),
-            exclude: [...defaultExclusions(), ...(v.exclude ?? []).map(excludeGlob)],
-          } as FolderFilters,
-          projects: [collector],
-          server: undefined as { url: string } | undefined,
+      const group: CollectionGroup = {
+        names: [v['project-id'] ?? UNROUTED],
+        peers: [collector],
+        only: 0,
+        filters: {
+          ...(v.include?.length ? { include: v.include.map(folderGlob) } : {}),
+          exclude: [...defaultExclusions(), ...(v.exclude ?? []).map(excludeGlob)],
         },
-      ];
+        projects: [collector],
+      };
+      return [group];
     };
     // Collectors from agents.json re-read it each scan, so routing follows edits without a restart.
     const plan = () => {
       if (!v.agent && !everyCollector) return flagged();
       const config = readAgents(agentsFile);
       if (!config) throw new Error('No agents.json; declare agents first');
-      if (everyCollector)
-        return collectionGroups(config).map((group) => ({ ...group, only: undefined }));
-      const { collector, ...group } = collectorPlan(config, v.agent!);
-      return [{ ...group, only: group.peers.indexOf(collector) }];
+      return collectionGroups(config, v.agent);
     };
     plan();
     // One cache for every collector: each history file is remembered once.
     const cache: CollectorCache = new Map();
-    // Collectors from agents.json write to the server it declares (unless --url), re-read each scan.
-    let client = archive;
-    let clientUrl = v.url ?? DEFAULT_URL;
-    // A watching collector prints a scan only when it says something new (`scanIsWorthPrinting`).
+    // A watching collector prints a scan only when it says something new (`scanIsWorthPrinting`),
+    // a failure when it starts or changes and again when it clears, and a heartbeat hourly.
     const lastPrinted = new Map<string, CollectResult>();
-    const lastFailure = new Map<string, string>();
+    const failing = new Map<string, string>();
+    let printedAt = 0;
     let stopped = false;
     const stop = () => {
       stopped = true;
@@ -784,7 +791,7 @@ export async function runCli(args = Bun.argv.slice(2)) {
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
     do {
-      let groups: ReturnType<typeof plan>;
+      let groups: CollectionGroup[];
       try {
         groups = plan();
       } catch (error) {
@@ -796,45 +803,41 @@ export async function runCli(args = Bun.argv.slice(2)) {
         continue;
       }
       const started = Date.now();
-      const scanned = new Map<string, CollectResult>();
-      for (const { names, peers, only, filters, projects, server } of groups) {
-        // A history that cannot be read (its directory gone, the server starting) stops only itself.
-        try {
-          const url = v.url ?? server?.url ?? DEFAULT_URL;
-          if (url !== clientUrl) {
-            client = new ArchiveClient({ url, token });
-            clientUrl = url;
-          }
-          const results = await collectSessionsForPeers(client, peers, {
-            ...(only === undefined ? {} : { only }),
-            filters,
-            projects,
-            cache,
-          });
-          results.forEach((result, index) => {
-            if (only === undefined || index === only) scanned.set(names[index]!, result);
-          });
-          lastFailure.delete(names.join());
-        } catch (error) {
-          if (!v.watch) throw error;
-          const failure = JSON.stringify({
-            collect: 'server unavailable',
-            collectors: names,
-            error: (error as Error).message,
-          });
-          if (lastFailure.get(names.join()) !== failure) console.error(failure);
-          lastFailure.set(names.join(), failure);
+      const { results, failures } = await collectSessionsForGroups(groups, writer, { cache });
+      const ms = Date.now() - started;
+      const failed = new Set<string>();
+      for (const { names, error } of failures) {
+        const key = names.join();
+        const line = JSON.stringify({ collect: 'failed', collectors: names, error });
+        failed.add(key);
+        if (!v.watch || failing.get(key) !== line) console.error(line);
+        failing.set(key, line);
+      }
+      for (const { names } of groups) {
+        const key = names.join();
+        if (failing.has(key) && !failed.has(key)) {
+          console.error(JSON.stringify({ collect: 'recovered', collectors: names }));
+          failing.delete(key);
         }
       }
-      const ms = Date.now() - started;
-      const print = [...scanned].filter(
+      const print = [...results].filter(
         ([name, result]) => !v.watch || scanIsWorthPrinting(result, lastPrinted.get(name)),
       );
       for (const [name, result] of print) lastPrinted.set(name, result);
-      if (everyCollector) {
-        if (print.length) output({ collectors: Object.fromEntries(print), ms });
-      } else for (const [, result] of print) output({ ...result, ms });
-      if (!v.watch && [...scanned.values()].some((result) => result.failed)) process.exitCode = 1;
+      const totals = scanTotals(results.values());
+      const heartbeat = v.watch && !print.length && Date.now() - printedAt >= HEARTBEAT_MS;
+      // `agents status` shows a line's first 500 characters: totals come first.
+      if (heartbeat) output({ heartbeat: true, ms, collectors: results.size, totals });
+      else if (print.length && everyCollector)
+        output({
+          ms,
+          totals,
+          collectors: Object.fromEntries(print.map(([name, result]) => [name, omitMs(result)])),
+        });
+      else for (const [, result] of print) output({ ...result, ms });
+      if (heartbeat || print.length) printedAt = Date.now();
+      if (!v.watch && (failures.length || [...results.values()].some((r) => r.failed)))
+        process.exitCode = 1;
       // Short waits allow prompt shutdown; network requests have their own timeout.
       for (let i = 0; v.watch && !stopped && i < 30; i++) await Bun.sleep(1000);
     } while (v.watch && !stopped);
@@ -846,34 +849,17 @@ export async function runCli(args = Bun.argv.slice(2)) {
     const config = readAgents(agentsFile);
     if (!config) throw new Error('No agents.json; declare agents first');
     // One walk per history, as `collect` makes; with --agent, that collector's sessions only.
-    const groups = v.agent
-      ? [collectorPlan(config, v.agent)].map(({ collector, ...group }) => ({
-          ...group,
-          only: group.peers.indexOf(collector),
-        }))
-      : collectionGroups(config).map((group) => ({ ...group, only: undefined }));
+    const groups = collectionGroups(config, v.agent);
     // Sessions whose evidence predates the machine's projects are re-sent, so evidence is current.
-    await archive.setProjectMap(machineProjectMap(config));
-    const repaired = new Map<string, CollectResult & { ms: number }>();
-    for (const { names, peers, only, filters, projects, server } of groups) {
-      const client = new ArchiveClient({ url: v.url ?? server?.url ?? DEFAULT_URL, token });
-      const started = Date.now();
-      const results = await collectSessionsForPeers(client, peers, {
-        ...(only === undefined ? {} : { only }),
-        filters,
-        projects,
-        repair: true,
-      });
-      const ms = Date.now() - started;
-      results.forEach((result, index) => {
-        if (only === undefined || index === only) repaired.set(names[index]!, { ...result, ms });
-      });
-    }
-    const results = config.collectors
-      .filter((c) => repaired.has(c.name))
-      .map((c) => ({ collector: c.name, ...repaired.get(c.name)! }));
-    if (results.some((result) => result.failed)) process.exitCode = 1;
-    output(results);
+    await writer(config).setProjectMap(machineProjectMap(config));
+    const { results, failures } = await collectSessionsForGroups(groups, writer, { repair: true });
+    for (const { names, error } of failures)
+      console.error(JSON.stringify({ repair: 'failed', collectors: names, error }));
+    const repaired = config.collectors
+      .filter((c) => results.has(c.name))
+      .map((c) => ({ collector: c.name, ...results.get(c.name)! }));
+    if (failures.length || repaired.some((result) => result.failed)) process.exitCode = 1;
+    output(repaired);
   } else if (command === 'search')
     output(
       await archive.search({
