@@ -5,7 +5,7 @@
     "": {
       "name": "@inixiative/archive",
       "dependencies": {
-        "@inixiative/agent-session": "^0.20.0",
+        "@inixiative/agent-session": "^0.21.0",
         "@inixiative/signet": "^0.25.0",
         "@prisma/client": "^6.6.0",
         "js-tiktoken": "1.0.21",
@@ -14,7 +14,7 @@
       },
       "devDependencies": {
         "@biomejs/biome": "2.5.2",
-        "@inixiative/config": "^0.5.234",
+        "@inixiative/config": "^0.5.235",
         "@types/bun": "1.4.4",
         "lefthook": "2.1.9",
         "typescript": "6.0.3",
@@ -40,9 +40,9 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.5.2", "", { "os": "win32", "cpu": "x64" }, "sha512-4InchVpdVmdkkkgjQqKpgvyu+VPnoF/7RPSw5YATgEVpt2j72wcCAeV5TwaE9ZGJUZWZn7v2CwSAj6CrMJEx8A=="],
 
-    "@inixiative/agent-session": ["@inixiative/agent-session@0.20.0", "", { "dependencies": { "@inixiative/json-rules": "^3.23.0", "@muse-code/sdk": "1.4.20" } }, "sha512-ZyqFKENLepym+xDn9wNptA4IZmRSAqQ2zydyKZBeHRH3nMlfjaZl5sXwLurrJZZERYUtxG4jB6EeXCAprJNMEA=="],
+    "@inixiative/agent-session": ["@inixiative/agent-session@0.21.0", "", { "dependencies": { "@inixiative/json-rules": "^3.23.0", "@muse-code/sdk": "1.4.20" } }, "sha512-o0hsbAljZq13Sr3rqJ7ouNOIU4IwQuG2BJ01Dr+dgVQDDkwvX5QZx2tK9BfcqDLKOJ8+DMEEjmxYYo4BgwALIQ=="],
 
-    "@inixiative/config": ["@inixiative/config@0.5.234", "", { "peerDependencies": { "@biomejs/biome": ">=2.5.0", "tsup": ">=8.5.0", "typescript": ">=6.0.0" }, "optionalPeers": ["@biomejs/biome", "tsup", "typescript"], "bin": { "inixiative-config": "dist/cli.js" } }, "sha512-OxOSuB26AGL8tZyXVXPPl9pbPq+YPujIAN3ZZQgxzjslIRZskZk5KaFjlMREy1LeioEq3nzapM+Era7sV6c2WA=="],
+    "@inixiative/config": ["@inixiative/config@0.5.235", "", { "peerDependencies": { "@biomejs/biome": ">=2.5.0", "tsup": ">=8.5.0", "typescript": ">=6.0.0" }, "optionalPeers": ["@biomejs/biome", "tsup", "typescript"], "bin": { "inixiative-config": "dist/cli.js" } }, "sha512-S09d3vYJz/9DwuMPmPh0bBsIGqOw3Vouuw3OxgPBKiFFrdmflhFaXOTuIzlGgAGIa0y4JKCJQSFDszR+o4X6og=="],
 
     "@inixiative/field-map": ["@inixiative/field-map@0.1.2", "", { "bin": { "field-map": "dist/cli.js" } }, "sha512-mOwd1xs26s/0kKWbE/+6WWkQKw+zfXHdqGQhFf0B35laaYertFS1FF1TH8/8i/RnYmjLW33BkBsjg78yBpXOsw=="],
 
