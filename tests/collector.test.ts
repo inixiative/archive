@@ -23,6 +23,7 @@ import {
   defaultExclusions,
   routeSession,
   scanIsWorthPrinting,
+  transcriptFiles,
 } from '../src/collector';
 import { EmptyTranscript, importTranscript } from '../src/import';
 import { importTranscriptFile } from '../src/import-file';
@@ -1448,4 +1449,21 @@ test('a moved worktree, and one whose gitdir is written after it was listed, are
     spawns.mockRestore();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('a history walk skips an entry removed on its way to it; a history that is not there still fails', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'archive-walk-'));
+  mkdirSync(join(directory, 'kept'));
+  writeFileSync(join(directory, 'kept', 'a.jsonl'), '');
+  const read = fs.readdirSync;
+  const listed = spyOn(fs, 'readdirSync').mockImplementation(((path: string) => {
+    const names = read(path) as string[];
+    return path === directory ? [...names, 'removed', 'removed.jsonl'] : names;
+  }) as typeof fs.readdirSync);
+  try {
+    expect(transcriptFiles(directory)).toEqual([join(directory, 'kept', 'a.jsonl')]);
+  } finally {
+    listed.mockRestore();
+  }
+  expect(() => transcriptFiles(join(directory, 'missing'))).toThrow('ENOENT');
 });
