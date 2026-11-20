@@ -134,16 +134,26 @@ export function historyFiles(config: Pick<CollectionSource, 'directory' | 'sourc
   ];
 }
 
-/** Every transcript (`.jsonl`) under a directory, in order, without following links. */
+/**
+ * Every transcript (`.jsonl`) under a directory, in order, without following links. An entry
+ * removed while the walk is on its way to it is skipped; the directory itself must be there.
+ */
 export function transcriptFiles(directory: string): string[] {
   const result: string[] = [];
+  const root = resolve(directory);
   const visit = (path: string) => {
-    const stat = lstatSync(path);
-    if (stat.isSymbolicLink()) return;
-    if (stat.isDirectory()) for (const name of readdirSync(path).sort()) visit(join(path, name));
-    else if (stat.isFile() && path.endsWith('.jsonl')) result.push(path);
+    let names: string[] = [];
+    try {
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink()) return;
+      if (stat.isFile() && path.endsWith('.jsonl')) result.push(path);
+      if (stat.isDirectory()) names = readdirSync(path).sort();
+    } catch (error) {
+      if (path === root || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    for (const name of names) visit(join(path, name));
   };
-  visit(resolve(directory));
+  visit(root);
   return result;
 }
 
