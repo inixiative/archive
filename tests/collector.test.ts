@@ -1462,8 +1462,10 @@ test('a history walk skips an entry removed on its way to it; a history that is 
   }) as typeof fs.readdirSync);
   try {
     expect(transcriptFiles(directory)).toEqual([join(directory, 'kept', 'a.jsonl')]);
+    expect(listed).toHaveBeenCalledWith(directory);
   } finally {
     listed.mockRestore();
   }
   expect(() => transcriptFiles(join(directory, 'missing'))).toThrow('ENOENT');
+  rmSync(directory, { recursive: true });
 });
