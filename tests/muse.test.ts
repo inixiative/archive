@@ -324,6 +324,8 @@ test('the muse collector finds sessions and their subagents, which run in the pa
       sessionId: GRANDCHILD,
     });
     expect(previewImports(dir, 'muse')).toMatchObject({ ready: 3, rejected: 1 });
+    const firstTwo = previewImports(dir, 'muse', 2);
+    expect([firstTwo.truncated, firstTwo.sessions.length]).toEqual([true, 2]);
 
     const store = await freshStore();
     const config = {

@@ -1,5 +1,4 @@
-import { lstatSync, readdirSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { transcriptFiles } from './collector';
 import type { TranscriptSource } from './import';
 import { importTranscriptFile } from './import-file';
 
@@ -7,24 +6,8 @@ import { importTranscriptFile } from './import-file';
 export function previewImports(path: string, source: TranscriptSource, limit = 100) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 1000)
     throw new Error('Preview limit must be between 1 and 1000');
-  const files: string[] = [];
-  let truncated = false;
-  const visit = (candidate: string) => {
-    if (files.length > limit) {
-      truncated = true;
-      return;
-    }
-    const stat = lstatSync(candidate);
-    if (stat.isSymbolicLink()) return;
-    if (stat.isDirectory()) {
-      for (const entry of readdirSync(candidate).sort()) {
-        visit(join(candidate, entry));
-        if (files.length > limit) break;
-      }
-    } else if (stat.isFile() && candidate.endsWith('.jsonl')) files.push(candidate);
-  };
-  visit(resolve(path));
-  truncated ||= files.length > limit;
+  const files = transcriptFiles(path);
+  const truncated = files.length > limit;
   const sessions = files.slice(0, limit).map((file) => {
     try {
       const snapshot = importTranscriptFile(file, {
