@@ -31,7 +31,8 @@
     "typecheck": "tsc --noEmit",
     "archive": "bun run src/cli.ts",
     "start": "bun run src/cli.ts serve",
-    "check": "bun run typecheck && bun run lint && bun run test",
+    "check:all": "bun run typecheck && bun run lint && bun run test",
+    "check": "inixiative-config bounded -- bun run check:all",
     "prepublishOnly": "bun run check",
     "lint": "biome check .",
     "prepare": "if git rev-parse --git-dir >/dev/null 2>&1; then lefthook install; fi && prisma generate"
@@ -46,7 +47,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
-    "@inixiative/config": "^0.5.235",
+    "@inixiative/config": "^0.5.239",
     "@types/bun": "1.4.4",
     "lefthook": "2.1.9",
     "typescript": "6.0.3"
