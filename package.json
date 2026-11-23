@@ -1,6 +1,6 @@
 {
   "name": "@inixiative/archive",
-  "version": "0.35.1",
+  "version": "0.35.2",
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
@@ -38,8 +38,8 @@
     "prepare": "if git rev-parse --git-dir >/dev/null 2>&1; then lefthook install; fi && prisma generate"
   },
   "dependencies": {
-    "@inixiative/agent-session": "^0.21.0",
-    "@inixiative/signet": "^0.25.0",
+    "@inixiative/agent-session": "^0.22.3",
+    "@inixiative/signet": "^0.28.0",
     "@prisma/client": "^6.6.0",
     "js-tiktoken": "1.0.21",
     "prisma": "^6.6.0",
